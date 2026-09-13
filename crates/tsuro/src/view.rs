@@ -13,9 +13,9 @@ use crate::kiri::{self, Theme, Tokens};
 use crate::page::{MediaBox, PageNo};
 use crate::print::{PrintOrientation, MAX_COPIES};
 use crate::session::{
-    display_rect, page_pt_at, AnnotKind, Message, NavCmd, PrintDialog, RangeMode, Ready, Session,
-    ViewMode, Zoom, ZoomFactor, DOC_GAP, DOC_PAD_BOTTOM, DOC_PAD_TOP, DOC_PAD_X, PAGES_PANEL_W,
-    SIG_PANEL_W, THUMB_ROW,
+    display_rect, page_pt_at, AnnotKind, Message, NavCmd, NoteDraft, PrintDialog, RangeMode, Ready,
+    Session, ViewMode, Zoom, ZoomFactor, DOC_GAP, DOC_PAD_BOTTOM, DOC_PAD_TOP, DOC_PAD_X,
+    PAGES_PANEL_W, SIG_PANEL_W, THUMB_ROW,
 };
 
 /// Altura do chrome Kiri: toolbar 36px + progresso 2px + respiro.
@@ -70,6 +70,13 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
             let dialog = ready.print_dialog.as_ref().expect("checked above");
             stack![main, print_layer(ready, dialog, t)].into()
         }
+        // Popover de nota (issue #30): captura tudo, como o modal de impressão.
+        Session::Ready(ready) if ready.note_draft.is_some() => {
+            let draft = ready.note_draft.as_ref().expect("checked above");
+            stack![main, note_layer(draft, t)].into()
+        }
+        // Aviso de documento assinado (⋯ → Salvar cópia): captura tudo.
+        Session::Ready(ready) if ready.save_warning => stack![main, save_warning_layer(t)].into(),
         // Overlay visual: só os botões capturam clique, o resto atravessa.
         Session::Ready(ready) if ready.overflow_open => {
             stack![main, overflow_layer(ready, t)].into()
@@ -351,6 +358,14 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                         ),
                         "Riscar (S)"
                     ),
+                    tip(
+                        control_seg(
+                            t,
+                            button(text("Nota (N)").size(12))
+                                .on_press(Message::Annotate(AnnotKind::Note))
+                        ),
+                        "Nota (N)"
+                    ),
                 ]
                 .spacing(0)
                 .align_y(Alignment::Center),
@@ -451,6 +466,13 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     }
     if ready.can_annot_redo() {
         items = items.push(menu_item(t, "Refazer marcação", Message::AnnotRedo));
+    }
+    if !ready.annotations.is_empty() {
+        items = items.push(menu_item(
+            t,
+            "Salvar cópia com marcações…",
+            Message::SaveCopyRequested,
+        ));
     }
     items = items.push(menu_item(t, "Fechar documento", Message::Close));
     items = items.push(
@@ -719,6 +741,112 @@ fn print_footer(dialog: &PrintDialog, t: Tokens) -> Element<'static, Message> {
     .into()
 }
 
+/// Popover de nota (issue #30): mesmo padrão do modal de impressão — fundo
+/// escurece e cancela no clique, cartão engole o clique (`PrintNop` é no-op).
+fn note_layer(draft: &NoteDraft, t: Tokens) -> Element<'_, Message> {
+    let dim = container(Space::with_width(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.25))),
+            ..container::Style::default()
+        });
+    let card = container(mouse_area(note_card(draft, t)).on_press(Message::PrintNop))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center);
+    stack![mouse_area(dim).on_press(Message::NoteCancel), card,].into()
+}
+
+/// Campo de texto + Salvar/Cancelar; rótulo diz se cria ou edita.
+fn note_card(draft: &NoteDraft, t: Tokens) -> Element<'_, Message> {
+    let title = if draft.editing.is_some() {
+        "Editar nota"
+    } else {
+        "Nova nota"
+    };
+    let can_save = !draft.text.trim().is_empty();
+    let secondary = |label: &'static str, message: Message| {
+        button(text(label).size(13))
+            .padding(Padding::from([8, 12]))
+            .style(kiri::menu_item_style(t))
+            .on_press(message)
+    };
+    container(
+        column![
+            text(title).size(16),
+            text_input("Escreva a nota…", &draft.text)
+                .on_input(Message::NoteInput)
+                .on_submit(Message::NoteSave)
+                .width(Length::Fill),
+            row![
+                Space::with_width(Length::Fill),
+                secondary("Cancelar", Message::NoteCancel),
+                button(text("Salvar").size(13))
+                    .padding(Padding::from([8, 12]))
+                    .style(kiri::menu_item_style(t))
+                    .on_press_maybe(can_save.then_some(Message::NoteSave)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(12),
+    )
+    .width(Length::Fixed(440.0))
+    .padding(16)
+    .style(kiri::menu_style(t))
+    .into()
+}
+
+/// Aviso de documento assinado antes de salvar a cópia (⋯ → Salvar cópia):
+/// mesmo padrão do popover de nota — fundo escurece e cancela no clique,
+/// cartão engole o clique (`PrintNop` é no-op).
+fn save_warning_layer(t: Tokens) -> Element<'static, Message> {
+    let dim = container(Space::with_width(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.25))),
+            ..container::Style::default()
+        });
+    let card = container(mouse_area(save_warning_card(t)).on_press(Message::PrintNop))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center);
+    stack![mouse_area(dim).on_press(Message::SaveCopyCancelled), card,].into()
+}
+
+/// Pergunta sim/não do aviso de assinatura; "Salvar mesmo assim" segue para o
+/// diálogo de destino.
+fn save_warning_card(t: Tokens) -> Element<'static, Message> {
+    let secondary = |label: &'static str, message: Message| {
+        button(text(label).size(13))
+            .padding(Padding::from([8, 12]))
+            .style(kiri::menu_item_style(t))
+            .on_press(message)
+    };
+    container(
+        column![
+            text("Documento assinado").size(16),
+            text("Salvar marcações invalida a assinatura digital. Continuar?").size(13),
+            row![
+                Space::with_width(Length::Fill),
+                secondary("Voltar", Message::SaveCopyCancelled),
+                secondary("Salvar mesmo assim", Message::SaveCopyConfirmed),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(12),
+    )
+    .width(Length::Fixed(440.0))
+    .padding(16)
+    .style(kiri::menu_style(t))
+    .into()
+}
+
 fn menu_theme_button(
     t: Tokens,
     label: &'static str,
@@ -884,8 +1012,8 @@ fn ready_body(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     if ready.signatures_open {
         panes = panes.push(signatures_panel(ready, t));
     }
-    // Status pós-envio ("Enviado para …"): 1 linha no topo do corpo.
-    if let Some(status) = &ready.print_status {
+    // Status pós-ação ("Enviado para …", "Cópia salva em …"): 1 linha no topo.
+    if let Some(status) = ready.save_status.as_ref().or(ready.print_status.as_ref()) {
         column![text(status).size(13).color(t.muted), panes,]
             .spacing(8)
             .height(Length::Fill)
@@ -1175,12 +1303,14 @@ fn doc_cell(ready: &Ready, page: PageNo, cw: f32, t: Tokens) -> Element<'_, Mess
 }
 
 /// Retângulo desenhável (px CSS, espaço exibido); `kind: None` = seleção ativa.
+/// `marker: true` = quadrado compacto de nota (não segue o traço do kind).
 struct DrawMark {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
     kind: Option<AnnotKind>,
+    marker: bool,
 }
 
 /// Camada transparente sobre a folha (issue #30): desenha marcações/seleção
@@ -1284,6 +1414,19 @@ impl Program<Message> for MarkLayer {
         let mut frame = Frame::new(renderer, self.size);
         for m in &self.marks {
             let rect = Path::rectangle(Point::new(m.x, m.y), Size::new(m.w, m.h));
+            // Nota: amarelo fixo — a folha é sempre branca, o tema não se aplica.
+            if m.marker {
+                frame.fill(&rect, Color::from_rgb(0.99, 0.80, 0.20));
+                frame.stroke(
+                    &rect,
+                    Stroke {
+                        style: Style::Solid(Color::from_rgb(0.42, 0.30, 0.02)),
+                        width: 1.0,
+                        ..Stroke::default()
+                    },
+                );
+                continue;
+            }
             match m.kind {
                 None => frame.fill(&rect, Color::from_rgba(0.25, 0.45, 1.0, 0.30)),
                 Some(AnnotKind::Highlight) => {
@@ -1297,6 +1440,18 @@ impl Program<Message> for MarkLayer {
                     Stroke {
                         style: Style::Solid(Color::from_rgb(0.1, 0.35, 0.9)),
                         width: 2.0,
+                        ..Stroke::default()
+                    },
+                ),
+                // Nota: sublinhado sutil só para ancorar o trecho na folha.
+                Some(AnnotKind::Note) => frame.stroke(
+                    &Path::line(
+                        Point::new(m.x, m.y + m.h - 1.0),
+                        Point::new(m.x + m.w, m.y + m.h - 1.0),
+                    ),
+                    Stroke {
+                        style: Style::Solid(Color::from_rgba(0.85, 0.62, 0.05, 0.75)),
+                        width: 1.5,
                         ..Stroke::default()
                     },
                 ),
@@ -1349,12 +1504,13 @@ fn with_marks<'a>(
                     w,
                     h,
                     kind: None,
+                    marker: false,
                 });
             }
         }
     }
     for a in ready.annotations.iter().filter(|a| a.page == page) {
-        for quad in &a.quads {
+        for (i, quad) in a.quads.iter().enumerate() {
             let [x, y, w, h] = display_rect(*quad, media, ready.view_rotation, cw, ch);
             marks.push(DrawMark {
                 x,
@@ -1362,7 +1518,20 @@ fn with_marks<'a>(
                 w,
                 h,
                 kind: Some(a.kind),
+                marker: false,
             });
+            // Nota: marcador compacto na origem do primeiro quad.
+            if a.kind == AnnotKind::Note && i == 0 {
+                let side = h.clamp(6.0, 14.0);
+                marks.push(DrawMark {
+                    x,
+                    y,
+                    w: side,
+                    h: side,
+                    kind: Some(AnnotKind::Note),
+                    marker: true,
+                });
+            }
         }
     }
     let layer = MarkLayer {

@@ -71,6 +71,17 @@ impl OpenSource {
     }
 }
 
+/// Nome sugerido da cópia marcada: `contrato.pdf` → `contrato (marcado).pdf`.
+/// Sem extensão o sufixo é o mesmo; a última extensão é a única trocada
+/// (`ata.v1.tar.gz` → `ata.v1.tar (marcado).pdf`).
+pub fn suggested_marked_name(source: &std::path::Path) -> String {
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "documento".into());
+    format!("{stem} (marcado).pdf")
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ZoomFactor(f32);
 
@@ -401,6 +412,8 @@ pub enum AnnotKind {
     Highlight,
     Underline,
     Strikeout,
+    /// Nota ancorada a um trecho: `Annotation.text` guarda o conteúdo.
+    Note,
 }
 
 /// Marcação sobre um trecho: um retângulo por linha do texto (nunca um
@@ -412,12 +425,26 @@ pub struct Annotation {
     pub range: TextRange,
     pub quads: Vec<Quad>,
     pub kind: AnnotKind,
+    /// Texto da nota ("" para highlight/underline/strikeout).
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
 enum AnnotAction {
     Add(Annotation),
     Remove(Annotation),
+}
+
+/// Rascunho de nota em edição (issue #30): ancorado a um trecho, com o
+/// texto digitado e (`editing: Some(id)`) a nota que está sendo editada —
+/// `None` = criando uma nova. Some junto com `annotations` ao abrir.
+#[derive(Debug, Clone)]
+pub struct NoteDraft {
+    pub page: PageNo,
+    pub range: TextRange,
+    pub quads: Vec<Quad>,
+    pub text: String,
+    pub editing: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,6 +504,8 @@ pub struct Ready {
     press_anchor: Option<PressAnchor>,
     annot_undo: Vec<AnnotAction>,
     annot_redo: Vec<AnnotAction>,
+    /// Rascunho de nota aberto (issue #30); zera ao abrir. Sem persistência na v1.
+    pub note_draft: Option<NoteDraft>,
     pub signatures_open: bool,
     pub pages_open: bool,
     /// Aba Sumário ativa no painel de Páginas (só existe se houver outline).
@@ -494,6 +523,12 @@ pub struct Ready {
     pub print_dialog: Option<PrintDialog>,
     /// Linha de status pós-envio ("Enviado para …"); limpa ao reabrir o diálogo.
     pub print_status: Option<String>,
+    /// Linha de status do salvamento de cópia ("Cópia salva em …"); limpa ao
+    /// abrir/trocar de documento e ao reabrir o fluxo.
+    pub save_status: Option<String>,
+    /// Aviso de documento assinado aberto (Salvar mesmo assim / Voltar).
+    /// Só o modal fecha; o estado zera ao escolher qualquer um dos botões.
+    pub save_warning: bool,
     pub pages_scroll_y: f32,
     /// Offset Y do painel do documento (só contínuo); deriva `visible`.
     pub doc_scroll_y: f32,
@@ -605,6 +640,70 @@ fn print_job_title(ready: &Ready) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or("documento")
         .to_string()
+}
+
+/// Puro: o documento tem assinatura digital que a cópia marcada invalidaria?
+/// (Decisão separada do modal para poder testar sem rfd.)
+fn needs_sign_warning(signatures: &PdfAnalysis) -> bool {
+    !signatures.signatures.is_empty()
+}
+
+/// Puro: o destino é o próprio original? O original nunca é sobrescrito —
+/// canonicaliza quando dá (caminhos relativos, symlinks) e cai para a
+/// comparação direta quando não (arquivo ainda inexistente).
+fn is_same_file(dest: &std::path::Path, src: &std::path::Path) -> bool {
+    if dest == src {
+        return true;
+    }
+    match (dest.canonicalize(), src.canonicalize()) {
+        (Ok(dest), Ok(src)) => dest == src,
+        _ => false,
+    }
+}
+
+/// Aplica as marcações ao documento aberto na worker e grava a cópia em
+/// `dest`. `PdfiumEngine` é `Clone + Send + Sync` (só um `Arc<Shared>` com
+/// canal `mpsc`), então atravessa o `spawn_blocking` como na impressão.
+async fn save_copy_file(
+    engine: PdfiumEngine,
+    annotations: Vec<Annotation>,
+    dest: PathBuf,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let bytes = engine.save_copy(&annotations).map_err(|e| e.to_string())?;
+        std::fs::write(&dest, bytes).map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|join| Err(join.to_string()))
+}
+
+/// Diálogo nativo de destino da cópia (bloqueante, como o do abrir).
+/// Cancelado não escreve nada; escolhido dispara `save_copy_file`.
+fn start_save_dialog(ready: &mut Ready) -> Task<Message> {
+    let source = ready.source.path().to_path_buf();
+    let Some(dest) = rfd::FileDialog::new()
+        .add_filter("PDF", &["pdf"])
+        .set_file_name(suggested_marked_name(&source))
+        .save_file()
+    else {
+        return Task::none();
+    };
+    if is_same_file(&dest, &source) {
+        ready.save_status = Some("Escolha outro nome — o original nunca é sobrescrito.".into());
+        return Task::none();
+    }
+    ready.save_status = None;
+    let annotations = ready.annotations.clone();
+    let doc_gen = ready.open_gen;
+    let engine = ready.engine.clone();
+    Task::perform(
+        save_copy_file(engine, annotations, dest.clone()),
+        move |result| Message::SaveCopyDone {
+            doc_gen,
+            path: dest.clone(),
+            result,
+        },
+    )
 }
 
 fn parse_1based(input: &str, page_count: u32) -> Result<u32, String> {
@@ -815,6 +914,13 @@ pub enum Message {
     DragCancelled,
     AnnotUndo,
     AnnotRedo,
+    /// Digitação no rascunho de nota aberto (`NoteDraft.text`).
+    NoteInput(String),
+    /// Salva o rascunho como nota (cria nova ou substitui a que está em
+    /// edição); texto vazio/só-espaço descarta sem criar.
+    NoteSave,
+    /// Fecha o rascunho sem criar/alterar nada.
+    NoteCancel,
     Rendered {
         page: PageNo,
         scale: Scale,
@@ -864,6 +970,20 @@ pub enum Message {
     },
     /// Captura cliques no cartão do modal (sem efeito); o fundo fecha o diálogo.
     PrintNop,
+    /// ⋯ → Salvar cópia com marcações…: abre o diálogo de destino (ou o aviso
+    /// de documento assinado antes dele).
+    SaveCopyRequested,
+    /// "Salvar mesmo assim" no aviso de documento assinado: segue para o
+    /// diálogo de destino.
+    SaveCopyConfirmed,
+    /// "Voltar" (ou clique no fundo/Esc) no aviso de documento assinado.
+    SaveCopyCancelled,
+    /// Resultado da cópia assíncrona; `doc_gen` precisa casar na volta.
+    SaveCopyDone {
+        doc_gen: u64,
+        path: PathBuf,
+        result: Result<(), String>,
+    },
     SetTheme(Theme),
     /// Janela informou tamanho + identidade: ajusta viewport e reconsulta o DPR.
     WindowMetrics {
@@ -1172,7 +1292,11 @@ impl Session {
                     if let Some(anchor) = ready.press_anchor.clone() {
                         if Some(anchor.sel.clone()) == ready.selection {
                             if let Some(id) = ready.annotation_at(page, page_pt) {
-                                ready.remove_annotation(id);
+                                // Clique sobre nota abre a edição dela; as
+                                // demais marcações o clique remove.
+                                if !ready.open_note_draft_for_id(id) {
+                                    ready.remove_annotation(id);
+                                }
                             } else if !anchor.exact {
                                 ready.selection = None;
                             }
@@ -1194,7 +1318,11 @@ impl Session {
             Message::Annotate(kind) => {
                 if let Session::Ready(ready) = self {
                     ready.overflow_open = false;
-                    if ready.annotate_selection(kind) {
+                    if kind == AnnotKind::Note {
+                        // Nota: abre o rascunho da seleção e mantém a
+                        // seleção (âncora do draft); sem seleção ignora.
+                        ready.open_note_draft();
+                    } else if ready.annotate_selection(kind) {
                         // Pós-marcação limpa a seleção (padrão dos leitores).
                         ready.selection = None;
                         ready.press_anchor = None;
@@ -1219,6 +1347,26 @@ impl Session {
                 if let Session::Ready(ready) = self {
                     ready.overflow_open = false;
                     ready.annot_redo_once();
+                }
+                Task::none()
+            }
+            Message::NoteInput(text) => {
+                if let Session::Ready(ready) = self {
+                    if let Some(draft) = ready.note_draft.as_mut() {
+                        draft.text = text;
+                    }
+                }
+                Task::none()
+            }
+            Message::NoteSave => {
+                if let Session::Ready(ready) = self {
+                    ready.save_note_draft();
+                }
+                Task::none()
+            }
+            Message::NoteCancel => {
+                if let Session::Ready(ready) = self {
+                    ready.note_draft = None;
                 }
                 Task::none()
             }
@@ -1368,6 +1516,13 @@ impl Session {
             }
             Message::ClosePrintDialog => {
                 if let Session::Ready(ready) = self {
+                    // Esc com rascunho de nota aberto também o fecha: o
+                    // popover de nota não tem subscription própria e a
+                    // função pura de teclas não vê estado (Esc → este
+                    // diálogo); a guarda de foco é o `status` do iced.
+                    ready.note_draft = None;
+                    // Idem para o aviso de documento assinado.
+                    ready.save_warning = false;
                     // Enviando: ignora (Esc) para não perder o resultado na volta.
                     if ready
                         .print_dialog
@@ -1598,6 +1753,66 @@ impl Session {
                             dialog.busy = false;
                             if let Err(err) = result {
                                 dialog.error = Some(err);
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SaveCopyRequested => {
+                let Session::Ready(ready) = self else {
+                    return Task::none();
+                };
+                ready.overflow_open = false;
+                ready.save_status = None;
+                if ready.annotations.is_empty() {
+                    ready.save_status = Some("Nada para salvar — marque o texto primeiro.".into());
+                    return Task::none();
+                }
+                // Assinado: o aviso vem antes do diálogo (a cópia com
+                // marcações invalida a assinatura).
+                if needs_sign_warning(&ready.signatures) {
+                    ready.save_warning = true;
+                    return Task::none();
+                }
+                start_save_dialog(ready)
+            }
+            Message::SaveCopyConfirmed => {
+                let Session::Ready(ready) = self else {
+                    return Task::none();
+                };
+                ready.save_warning = false;
+                start_save_dialog(ready)
+            }
+            Message::SaveCopyCancelled => {
+                if let Session::Ready(ready) = self {
+                    ready.save_warning = false;
+                }
+                Task::none()
+            }
+            Message::SaveCopyDone {
+                doc_gen,
+                path,
+                result,
+            } => {
+                if let Session::Ready(ready) = self {
+                    if doc_gen == ready.open_gen {
+                        match result {
+                            Ok(()) => {
+                                // Registra a cópia nos recentes, mas não a abre:
+                                // abrir descartaria o estado da sessão atual.
+                                let recents = merge_recents(ready.recents.clone(), read_recents());
+                                let recents = push_recent(recents, path.clone());
+                                let _ = save_recents(&recents);
+                                ready.recents = recents;
+                                let name = path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                ready.save_status = Some(format!("Cópia salva em {name}"));
+                            }
+                            Err(err) => {
+                                ready.save_status = Some(format!("Falha ao salvar: {err}"));
                             }
                         }
                     }
@@ -2034,6 +2249,9 @@ pub(crate) fn keyboard_message(
         Key::Character("h" | "H") => Some(Message::Annotate(AnnotKind::Highlight)),
         Key::Character("u" | "U") => Some(Message::Annotate(AnnotKind::Underline)),
         Key::Character("s" | "S") => Some(Message::Annotate(AnnotKind::Strikeout)),
+        // N abre o rascunho de nota da seleção (handler ignora sem seleção
+        // com texto; com draft já aberto é no-op para não apagar o digitado).
+        Key::Character("n" | "N") => Some(Message::Annotate(AnnotKind::Note)),
         // Sem diálogo aberto o handler ignora; com foco em campo, o iced captura antes.
         Key::Named(Named::Escape) => Some(Message::ClosePrintDialog),
         _ => None,
@@ -2271,6 +2489,8 @@ impl Ready {
             range: sel.range,
             quads,
             kind,
+            // H/U/S não carregam texto; apenas notas (`save_note_draft`).
+            text: String::new(),
         };
         self.next_annot_id += 1;
         self.apply_annot_action(AnnotAction::Add(annot.clone()));
@@ -2279,7 +2499,107 @@ impl Ready {
         true
     }
 
-    /// Remove por id (clique sobre a marcação); `false` se não existe.
+    /// Abre o rascunho de nota da seleção atual (N / menu ⋯); `false` sem
+    /// seleção com texto, ou com draft já aberto (no-op — não apaga o texto
+    /// digitado). Sobre o trecho de uma nota existente, reabre em modo de
+    /// edição com o texto dela.
+    pub(crate) fn open_note_draft(&mut self) -> bool {
+        if self.note_draft.is_some() {
+            return false;
+        }
+        let Some(sel) = self.selection.clone() else {
+            return false;
+        };
+        let quads = match self
+            .pages
+            .text
+            .get(sel.page.index() as usize)
+            .and_then(|l| l.as_ref())
+        {
+            Some(layer) if !layer.slice(sel.range).trim().is_empty() => {
+                quads_for_range_by_line(&layer.glyphs, sel.range.start, sel.range.end)
+            }
+            _ => return false,
+        };
+        if quads.is_empty() {
+            return false;
+        }
+        let existing = self
+            .annotations
+            .iter()
+            .find(|a| a.kind == AnnotKind::Note && a.page == sel.page && a.range == sel.range);
+        let (editing, text) = match existing {
+            Some(a) => (Some(a.id), a.text.clone()),
+            None => (None, String::new()),
+        };
+        self.note_draft = Some(NoteDraft {
+            page: sel.page,
+            range: sel.range,
+            quads,
+            text,
+            editing,
+        });
+        true
+    }
+
+    /// Abre a edição de uma nota existente (clique sobre o marcador): ancora
+    /// o draft no trecho dela com o texto atual. `false` se não é nota ou com
+    /// draft já aberto (o clique então não remove a nota — vira no-op).
+    fn open_note_draft_for_id(&mut self, id: u64) -> bool {
+        let Some(annot) = self
+            .annotations
+            .iter()
+            .find(|a| a.id == id && a.kind == AnnotKind::Note)
+            .cloned()
+        else {
+            return false;
+        };
+        if self.note_draft.is_some() {
+            return false;
+        }
+        // Âncora do draft = o trecho da nota, não a palavra do clique.
+        self.selection = Some(Selection {
+            page: annot.page,
+            range: annot.range,
+        });
+        self.open_note_draft()
+    }
+
+    /// Salva o rascunho como nota (`kind: Note`, texto do draft) via pilha
+    /// de undo (limpa o redo, como `annotate_selection`). Texto vazio ou
+    /// só-espaço descarta sem criar (sem undo entry). Edição de nota
+    /// existente vira `Remove(antiga)` + `Add(nova)` na pilha — desfazer os
+    /// dois passos restaura o texto antigo. `false` sem draft ou descartado.
+    pub(crate) fn save_note_draft(&mut self) -> bool {
+        let Some(draft) = self.note_draft.take() else {
+            return false;
+        };
+        if draft.text.trim().is_empty() {
+            return false;
+        }
+        if let Some(old) = draft
+            .editing
+            .and_then(|id| self.annotations.iter().find(|a| a.id == id).cloned())
+        {
+            self.apply_annot_action(AnnotAction::Remove(old.clone()));
+            self.annot_undo.push(AnnotAction::Remove(old));
+        }
+        let annot = Annotation {
+            id: self.next_annot_id,
+            page: draft.page,
+            range: draft.range,
+            quads: draft.quads,
+            kind: AnnotKind::Note,
+            text: draft.text,
+        };
+        self.next_annot_id += 1;
+        self.apply_annot_action(AnnotAction::Add(annot.clone()));
+        self.annot_undo.push(AnnotAction::Add(annot));
+        self.annot_redo.clear();
+        true
+    }
+
+    /// Remove por id (clique sobre nota abre edição, não remove); `false` se não existe.
     pub(crate) fn remove_annotation(&mut self, id: u64) -> bool {
         let Some(annot) = self.annotations.iter().find(|a| a.id == id).cloned() else {
             return false;
@@ -2788,6 +3108,7 @@ impl Document {
             press_anchor: None,
             annot_undo: Vec::new(),
             annot_redo: Vec::new(),
+            note_draft: None,
             signatures_open: false,
             pages_open: false,
             outline_open: false,
@@ -2802,6 +3123,8 @@ impl Document {
             overflow_open: false,
             print_dialog: None,
             print_status: None,
+            save_status: None,
+            save_warning: false,
             open_gen: 0,
             render_gen: 1,
             surfaces: SurfaceCache::default(),
@@ -3476,6 +3799,21 @@ mod tests {
             keyboard_message(Key::Character("s".into()), plain, Status::Ignored),
             Some(Message::Annotate(AnnotKind::Strikeout))
         ));
+        assert!(matches!(
+            keyboard_message(Key::Character("n".into()), plain, Status::Ignored),
+            Some(Message::Annotate(AnnotKind::Note))
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("N".into()), plain, Status::Ignored),
+            Some(Message::Annotate(AnnotKind::Note))
+        ));
+        // Com modificador o atalho não dispara (mesma guarda de H/U/S).
+        assert!(keyboard_message(
+            Key::Character("n".into()),
+            Modifiers::SHIFT,
+            Status::Ignored
+        )
+        .is_none());
         #[cfg(target_os = "macos")]
         let cmd = Modifiers::LOGO;
         #[cfg(not(target_os = "macos"))]
@@ -3650,6 +3988,159 @@ mod tests {
             Session::Ready(ready) => assert!(ready.annotations.is_empty()),
             _ => unreachable!(),
         }
+    }
+
+    /// Draft de teste: âncora na página 1, trecho 0..2, sem depender do
+    /// texto extraído do PDF (os testes de nota mexem só no estado).
+    fn dummy_draft() -> NoteDraft {
+        NoteDraft {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+            quads: vec![Quad::from_rect(0.0, 0.0, 10.0, 10.0)],
+            text: String::new(),
+            editing: None,
+        }
+    }
+
+    #[test]
+    fn note_draft_save_creates_note_with_text() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        assert!(!ready.can_annot_undo());
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "olá mundo".into();
+        assert!(ready.save_note_draft());
+        // Draft fechou e a nota entrou no estado com o texto digitado.
+        assert!(ready.note_draft.is_none());
+        assert_eq!(ready.annotations.len(), 1);
+        assert_eq!(ready.annotations[0].kind, AnnotKind::Note);
+        assert_eq!(ready.annotations[0].text, "olá mundo");
+        assert!(ready.can_annot_undo());
+    }
+
+    #[test]
+    fn note_draft_save_whitespace_discards_without_undo_entry() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "   \n".into();
+        assert!(!ready.save_note_draft());
+        // Fecha o draft mas não cria nada nem suja a pilha de undo.
+        assert!(ready.note_draft.is_none());
+        assert!(ready.annotations.is_empty());
+        assert!(!ready.can_annot_undo());
+        assert!(!ready.can_annot_redo());
+    }
+
+    #[test]
+    fn note_add_undo_redo() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "nota".into();
+        assert!(ready.save_note_draft());
+        assert_eq!(ready.annotations.len(), 1);
+        // Undo remove a nota; redo a devolve com o texto.
+        assert!(ready.annot_undo_once());
+        assert!(ready.annotations.is_empty());
+        assert!(!ready.can_annot_undo());
+        assert!(ready.can_annot_redo());
+        assert!(ready.annot_redo_once());
+        assert_eq!(ready.annotations.len(), 1);
+        assert_eq!(ready.annotations[0].kind, AnnotKind::Note);
+        assert_eq!(ready.annotations[0].text, "nota");
+    }
+
+    #[test]
+    fn note_edit_undo_restores_old_text() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        // Nota existente.
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "antiga".into();
+        assert!(ready.save_note_draft());
+        let id = ready.annotations[0].id;
+        // Edição (draft com editing = Some(id)): Remove(antiga) + Add(nova).
+        let mut draft = dummy_draft();
+        draft.editing = Some(id);
+        draft.text = "nova".into();
+        ready.note_draft = Some(draft);
+        assert!(ready.save_note_draft());
+        assert_eq!(ready.annotations.len(), 1);
+        assert_ne!(ready.annotations[0].id, id);
+        assert_eq!(ready.annotations[0].text, "nova");
+        // Desfaz a edição: primeiro some, segundo restaura o texto antigo.
+        assert!(ready.annot_undo_once());
+        assert!(ready.annotations.is_empty());
+        assert!(ready.annot_undo_once());
+        assert_eq!(ready.annotations.len(), 1);
+        assert_eq!(ready.annotations[0].id, id);
+        assert_eq!(ready.annotations[0].text, "antiga");
+    }
+
+    #[test]
+    fn note_draft_requires_selection() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        // Sem seleção: ignorado, como `annotate_selection`.
+        ready.selection = None;
+        assert!(!ready.open_note_draft());
+        assert!(ready.note_draft.is_none());
+        assert!(ready.annotations.is_empty());
+        // Com draft aberto, reabrir é no-op (não apaga o texto digitado).
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        let mut draft = dummy_draft();
+        draft.text = "digitando...".into();
+        ready.note_draft = Some(draft);
+        assert!(!ready.open_note_draft());
+        assert_eq!(ready.note_draft.as_ref().unwrap().text, "digitando...");
+    }
+
+    #[test]
+    fn note_draft_reopens_existing_note_in_editing_mode() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let len = match ready.pages.text.first() {
+            Some(Some(layer)) => layer.plain.len(),
+            _ => return,
+        };
+        if len < 2 {
+            return;
+        }
+        // Cria uma nota no trecho 0..2 via save direto.
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "anotação".into();
+        assert!(ready.save_note_draft());
+        let id = ready.annotations[0].id;
+        // N com a seleção sobre o trecho da nota reabre em edição com o texto.
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        assert!(ready.open_note_draft());
+        let draft = ready.note_draft.as_ref().unwrap();
+        assert_eq!(draft.editing, Some(id));
+        assert_eq!(draft.text, "anotação");
+        // Clique sobre o marcador (âncora no trecho da nota) idem.
+        ready.note_draft = None;
+        ready.selection = None;
+        assert!(ready.open_note_draft_for_id(id));
+        let draft = ready.note_draft.as_ref().unwrap();
+        assert_eq!(draft.page, PageNo::first());
+        assert_eq!(draft.range, TextRange { start: 0, end: 2 });
+        assert_eq!(draft.editing, Some(id));
+        assert_eq!(draft.text, "anotação");
+        // Id de marcação que não é nota: falso (o clique remove no handler).
+        assert!(!ready.open_note_draft_for_id(u64::MAX));
     }
 
     fn glyph_at(cluster: &str, x0: f32, y0: f32, x1: f32, y1: f32) -> Glyph {
@@ -5055,5 +5546,165 @@ mod tests {
         ready.render_inflight.clear();
         let _ = ready.request_thumb_render();
         assert!(ready.render_inflight.contains(&key));
+    }
+
+    #[test]
+    fn suggested_marked_name_replaces_only_the_last_extension() {
+        use std::path::Path;
+        assert_eq!(
+            suggested_marked_name(Path::new("/tmp/contrato.pdf")),
+            "contrato (marcado).pdf"
+        );
+        assert_eq!(
+            suggested_marked_name(Path::new("/tmp/contrato")),
+            "contrato (marcado).pdf"
+        );
+        assert_eq!(
+            suggested_marked_name(Path::new("/tmp/ata.v1.tar.gz")),
+            "ata.v1.tar (marcado).pdf"
+        );
+    }
+
+    /// Assinatura de mentira: o fluxo só olha a lista estar vazia ou não.
+    fn one_signature() -> tsuro_sign::SignatureInfo {
+        tsuro_sign::SignatureInfo {
+            field_name: None,
+            signer_name: None,
+            reason: None,
+            location: None,
+            contact_info: None,
+            signing_time: None,
+            filter: None,
+            sub_filter: None,
+            byte_range: None,
+            covers_whole_document: true,
+            status: tsuro_sign::SignatureStatus::IntactButUntrusted,
+            status_detail: String::new(),
+            certificate: None,
+            digest_algorithm: None,
+            signature_algorithm: None,
+        }
+    }
+
+    #[test]
+    fn sign_warning_only_for_signed_documents() {
+        let analysis = |signatures| PdfAnalysis {
+            page_count_hint: Some(1),
+            has_acro_form: false,
+            signatures,
+        };
+        assert!(!needs_sign_warning(&analysis(Vec::new())));
+        assert!(needs_sign_warning(&analysis(vec![one_signature()])));
+    }
+
+    #[test]
+    fn same_file_detects_original_through_path_aliases() {
+        let dir = std::env::temp_dir().join(format!(
+            "tsuro-save-same-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("doc.pdf");
+        std::fs::write(&src, b"%PDF-1.4").unwrap();
+        assert!(is_same_file(&src, &src));
+        assert!(is_same_file(&dir.join(".").join("doc.pdf"), &src));
+        // Destino novo (ainda inexistente) nunca é o original.
+        assert!(!is_same_file(&dir.join("doc (marcado).pdf"), &src));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_without_annotations_sets_status_and_opens_nothing() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        apply(&mut session, Message::SaveCopyRequested);
+        let Session::Ready(ready) = &session else {
+            panic!("expected Ready, got {session:?}");
+        };
+        assert_eq!(
+            ready.save_status.as_deref(),
+            Some("Nada para salvar — marque o texto primeiro.")
+        );
+        assert!(!ready.save_warning);
+    }
+
+    #[test]
+    fn save_done_ok_records_copy_in_recents() {
+        isolated(|| {
+            let Some(ready) = sample_ready() else {
+                return;
+            };
+            let dest = std::env::temp_dir().join("contrato (marcado).pdf");
+            let doc_gen = ready.open_gen;
+            let mut session = Session::Ready(ready);
+            apply(
+                &mut session,
+                Message::SaveCopyDone {
+                    doc_gen,
+                    path: dest.clone(),
+                    result: Ok(()),
+                },
+            );
+            let Session::Ready(ready) = &session else {
+                panic!("expected Ready, got {session:?}");
+            };
+            assert_eq!(
+                ready.save_status.as_deref(),
+                Some("Cópia salva em contrato (marcado).pdf")
+            );
+            assert_eq!(ready.recents.first(), Some(&dest));
+            assert_eq!(read_recents().first(), Some(&dest));
+        });
+    }
+
+    #[test]
+    fn save_done_err_sets_failure_status() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let doc_gen = ready.open_gen;
+        let mut session = Session::Ready(ready);
+        apply(
+            &mut session,
+            Message::SaveCopyDone {
+                doc_gen,
+                path: std::env::temp_dir().join("x.pdf"),
+                result: Err("disco cheio".into()),
+            },
+        );
+        let Session::Ready(ready) = &session else {
+            panic!("expected Ready, got {session:?}");
+        };
+        assert_eq!(
+            ready.save_status.as_deref(),
+            Some("Falha ao salvar: disco cheio")
+        );
+    }
+
+    #[test]
+    fn save_done_with_stale_doc_gen_is_ignored() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let stale = ready.open_gen.wrapping_add(1);
+        let mut session = Session::Ready(ready);
+        apply(
+            &mut session,
+            Message::SaveCopyDone {
+                doc_gen: stale,
+                path: std::env::temp_dir().join("x.pdf"),
+                result: Ok(()),
+            },
+        );
+        let Session::Ready(ready) = &session else {
+            panic!("expected Ready, got {session:?}");
+        };
+        assert!(ready.save_status.is_none());
     }
 }
