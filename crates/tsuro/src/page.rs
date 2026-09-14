@@ -150,6 +150,40 @@ impl TextLayer {
         self.glyphs.iter().position(|g| g.quad.contains(x, y))
     }
 
+    /// Glifo mais próximo do ponto (distância ao retângulo; 0 se dentro).
+    /// Para o arrasto acompanhar o cursor mesmo no vão entre linhas —
+    /// equivale ao `FPDFText_GetCharIndexAtPos` com tolerância.
+    pub fn hit_nearest(&self, page_pt: [f32; 2]) -> Option<usize> {
+        let [x, y] = page_pt;
+        let mut best: Option<(f32, usize)> = None;
+        for (i, glyph) in self.glyphs.iter().enumerate() {
+            let q = glyph.quad;
+            let min_x = q.x0.min(q.x1).min(q.x2).min(q.x3);
+            let max_x = q.x0.max(q.x1).max(q.x2).max(q.x3);
+            let min_y = q.y0.min(q.y1).min(q.y2).min(q.y3);
+            let max_y = q.y0.max(q.y1).max(q.y2).max(q.y3);
+            let dx = if x < min_x {
+                min_x - x
+            } else if x > max_x {
+                x - max_x
+            } else {
+                0.0
+            };
+            let dy = if y < min_y {
+                min_y - y
+            } else if y > max_y {
+                y - max_y
+            } else {
+                0.0
+            };
+            let dist = dx * dx + dy * dy;
+            if best.is_none_or(|(bd, _)| dist < bd) {
+                best = Some((dist, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+
     pub fn slice(&self, range: crate::session::TextRange) -> String {
         let start = next_char_boundary(&self.plain, range.start.min(self.plain.len()));
         let end = next_char_boundary(&self.plain, range.end.min(self.plain.len()));
@@ -213,3 +247,44 @@ pub trait PageEngine: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct EngineError(pub String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_glyphs() -> TextLayer {
+        TextLayer {
+            page: PageNo::first(),
+            plain: "ab".to_string(),
+            glyphs: vec![
+                Glyph {
+                    cluster: "a".to_string(),
+                    quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+                },
+                Glyph {
+                    cluster: "b".to_string(),
+                    quad: Quad::from_rect(20.0, 0.0, 30.0, 10.0),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn hit_nearest_snaps_to_closest_glyph() {
+        let layer = two_glyphs();
+        // Dentro: o próprio.
+        assert_eq!(layer.hit_nearest([5.0, 5.0]), Some(0));
+        // No vão 10..20: o mais próximo (14 está a 4 de `a`, 6 de `b`).
+        assert_eq!(layer.hit_nearest([14.0, 5.0]), Some(0));
+        assert_eq!(layer.hit_nearest([16.0, 5.0]), Some(1));
+        // Longe: ainda o mais próximo (sem teto, como os leitores).
+        assert_eq!(layer.hit_nearest([1000.0, -500.0]), Some(1));
+        // Vazio: nada.
+        let empty = TextLayer {
+            page: PageNo::first(),
+            plain: String::new(),
+            glyphs: Vec::new(),
+        };
+        assert_eq!(empty.hit_nearest([0.0, 0.0]), None);
+    }
+}

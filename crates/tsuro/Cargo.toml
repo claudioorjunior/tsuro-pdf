@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 tsuro-sign = { path = "../tsuro-sign" }
-iced = { version = "0.13", features = ["image", "svg", "tokio"] }
+iced = { version = "0.13", features = ["image", "svg", "tokio", "canvas"] }
 pdfium-render = "0.8"
 rfd = "0.15"
 thiserror = "2"

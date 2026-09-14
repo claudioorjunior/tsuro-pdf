@@ -71,6 +71,17 @@ impl OpenSource {
     }
 }
 
+/// Nome sugerido da cópia marcada: `contrato.pdf` → `contrato (marcado).pdf`.
+/// Sem extensão o sufixo é o mesmo; a última extensão é a única trocada
+/// (`ata.v1.tar.gz` → `ata.v1.tar (marcado).pdf`).
+pub fn suggested_marked_name(source: &std::path::Path) -> String {
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "documento".into());
+    format!("{stem} (marcado).pdf")
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ZoomFactor(f32);
 
@@ -262,6 +273,112 @@ fn quads_for_range_monotonic(
     acc.unwrap_or(Quad::from_rect(0.0, 0.0, 0.0, 0.0))
 }
 
+/// Quad de um range arbitrário (mesma origem dos hits de busca).
+pub(crate) fn quad_for_range(glyphs: &[Glyph], start: usize, end: usize) -> Quad {
+    let mut glyph_idx = 0usize;
+    let mut byte_cursor = 0usize;
+    quads_for_range_monotonic(glyphs, start, end, &mut glyph_idx, &mut byte_cursor)
+}
+
+/// Um retângulo por linha do range (padrão dos leitores: nunca pintar o vão
+/// entre linhas). Agrupa glifos vizinhos com sobreposição vertical; x que
+/// volta para trás abre nova linha (colunas). Texto não-horizontal degrada
+/// para um grupo só (equivale ao union antigo).
+/// ponytail: heurística LTR por bbox; segmentação por baseline se precisar.
+pub(crate) fn quads_for_range_by_line(glyphs: &[Glyph], start: usize, end: usize) -> Vec<Quad> {
+    let mut cursor = 0usize;
+    let mut lines: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for glyph in glyphs {
+        let next = cursor + glyph.cluster.len();
+        if cursor < end && next > start {
+            let (x0, y0, x1, y1) = quad_bbox(glyph.quad);
+            let merge = match lines.last() {
+                Some(last) => y0 <= last.3 && y1 >= last.1 && x0 >= last.0,
+                None => false,
+            };
+            if merge {
+                let last = lines.last_mut().expect("checked above");
+                last.0 = last.0.min(x0);
+                last.1 = last.1.min(y0);
+                last.2 = last.2.max(x1);
+                last.3 = last.3.max(y1);
+            } else {
+                lines.push((x0, y0, x1, y1));
+            }
+        }
+        cursor = next;
+        if cursor >= end {
+            break;
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(x0, y0, x1, y1)| Quad::from_rect(x0, y0, x1, y1))
+        .collect()
+}
+
+fn quad_bbox(quad: Quad) -> (f32, f32, f32, f32) {
+    let xs = [quad.x0, quad.x1, quad.x2, quad.x3];
+    let ys = [quad.y0, quad.y1, quad.y2, quad.y3];
+    (
+        xs.iter().fold(f32::INFINITY, |a, &b| a.min(b)),
+        ys.iter().fold(f32::INFINITY, |a, &b| a.min(b)),
+        xs.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)),
+        ys.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)),
+    )
+}
+
+/// Retângulo exibido `[x, y, w, h]` (px CSS, Y para baixo) de um quad da
+/// mídia original (espaço PDF, Y para cima), desfazendo a rotação da vista
+/// (`rotation` em quartos horários, como vista na tela).
+pub(crate) fn display_rect(
+    quad: Quad,
+    media: MediaBox,
+    rotation: u8,
+    dw: f32,
+    dh: f32,
+) -> [f32; 4] {
+    let (x0, y0, x1, y1) = quad_bbox(quad);
+    let w = media.width.max(1.0);
+    let h = media.height.max(1.0);
+    let (rx0, ry0, rx1, ry1) = match rotation & 3 {
+        0 => (x0, h - y1, x1, h - y0),
+        1 => (y0, x0, y1, x1),
+        2 => (w - x1, y0, w - x0, y1),
+        _ => (h - y1, w - x1, h - y0, w - x0),
+    };
+    let rw = if rotation & 1 == 1 { h } else { w };
+    let rh = if rotation & 1 == 1 { w } else { h };
+    [
+        rx0 / rw * dw,
+        ry0 / rh * dh,
+        (rx1 - rx0) / rw * dw,
+        (ry1 - ry0) / rh * dh,
+    ]
+}
+
+/// Inverso: ponto exibido (px CSS, Y para baixo) → ponto da mídia original
+/// (espaço PDF, Y para cima).
+pub(crate) fn page_pt_at(
+    point: [f32; 2],
+    media: MediaBox,
+    rotation: u8,
+    dw: f32,
+    dh: f32,
+) -> [f32; 2] {
+    let w = media.width.max(1.0);
+    let h = media.height.max(1.0);
+    let (rw, rh) = if rotation & 1 == 1 { (h, w) } else { (w, h) };
+    let dx = point[0] / dw * rw;
+    let dy = point[1] / dh * rh;
+    match rotation & 3 {
+        0 => [dx, h - dy],
+        1 => [dy, dx],
+        2 => [w - dx, dy],
+        _ => [w - dy, h - dx],
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Hit {
     pub page: PageNo,
@@ -269,16 +386,65 @@ pub struct Hit {
     pub quad: Quad,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextRange {
     pub start: usize,
     pub end: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
     pub page: PageNo,
     pub range: TextRange,
+}
+
+/// Âncora do press (click-vs-drag no PointerUp); `exact=false` = press no
+/// vazio com snap no glifo mais próximo (clique solto desseleciona).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PressAnchor {
+    sel: Selection,
+    exact: bool,
+}
+
+/// Tipo de marcação de texto (issue #30, v1 sem persistência).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotKind {
+    Highlight,
+    Underline,
+    Strikeout,
+    /// Nota ancorada a um trecho: `Annotation.text` guarda o conteúdo.
+    Note,
+}
+
+/// Marcação sobre um trecho: um retângulo por linha do texto (nunca um
+/// bloco único — padrão dos leitores), em espaço da mídia original.
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub id: u64,
+    pub page: PageNo,
+    pub range: TextRange,
+    pub quads: Vec<Quad>,
+    pub kind: AnnotKind,
+    /// Texto da nota ("" para highlight/underline/strikeout).
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+enum AnnotAction {
+    Add(Annotation),
+    Remove(Annotation),
+}
+
+/// Rascunho de nota em edição (issue #30): ancorado a um trecho, com o
+/// texto digitado e (`editing: Some(id)`) a nota que está sendo editada —
+/// `None` = criando uma nova. Some junto com `annotations` ao abrir.
+#[derive(Debug, Clone)]
+pub struct NoteDraft {
+    pub page: PageNo,
+    pub range: TextRange,
+    pub quads: Vec<Quad>,
+    pub text: String,
+    pub editing: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +497,15 @@ pub struct Ready {
     page_input: String,
     pub search: Search,
     pub selection: Option<Selection>,
+    /// Marcações da sessão (issue #30); zera ao abrir. Sem persistência na v1.
+    pub annotations: Vec<Annotation>,
+    next_annot_id: u64,
+    /// Âncora do press (click-vs-drag no PointerUp); zera ao trocar de documento.
+    press_anchor: Option<PressAnchor>,
+    annot_undo: Vec<AnnotAction>,
+    annot_redo: Vec<AnnotAction>,
+    /// Rascunho de nota aberto (issue #30); zera ao abrir. Sem persistência na v1.
+    pub note_draft: Option<NoteDraft>,
     pub signatures_open: bool,
     pub pages_open: bool,
     /// Aba Sumário ativa no painel de Páginas (só existe se houver outline).
@@ -348,6 +523,12 @@ pub struct Ready {
     pub print_dialog: Option<PrintDialog>,
     /// Linha de status pós-envio ("Enviado para …"); limpa ao reabrir o diálogo.
     pub print_status: Option<String>,
+    /// Linha de status do salvamento de cópia ("Cópia salva em …"); limpa ao
+    /// abrir/trocar de documento e ao reabrir o fluxo.
+    pub save_status: Option<String>,
+    /// Aviso de documento assinado aberto (Salvar mesmo assim / Voltar).
+    /// Só o modal fecha; o estado zera ao escolher qualquer um dos botões.
+    pub save_warning: bool,
     pub pages_scroll_y: f32,
     /// Offset Y do painel do documento (só contínuo); deriva `visible`.
     pub doc_scroll_y: f32,
@@ -459,6 +640,70 @@ fn print_job_title(ready: &Ready) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or("documento")
         .to_string()
+}
+
+/// Puro: o documento tem assinatura digital que a cópia marcada invalidaria?
+/// (Decisão separada do modal para poder testar sem rfd.)
+fn needs_sign_warning(signatures: &PdfAnalysis) -> bool {
+    !signatures.signatures.is_empty()
+}
+
+/// Puro: o destino é o próprio original? O original nunca é sobrescrito —
+/// canonicaliza quando dá (caminhos relativos, symlinks) e cai para a
+/// comparação direta quando não (arquivo ainda inexistente).
+fn is_same_file(dest: &std::path::Path, src: &std::path::Path) -> bool {
+    if dest == src {
+        return true;
+    }
+    match (dest.canonicalize(), src.canonicalize()) {
+        (Ok(dest), Ok(src)) => dest == src,
+        _ => false,
+    }
+}
+
+/// Aplica as marcações ao documento aberto na worker e grava a cópia em
+/// `dest`. `PdfiumEngine` é `Clone + Send + Sync` (só um `Arc<Shared>` com
+/// canal `mpsc`), então atravessa o `spawn_blocking` como na impressão.
+async fn save_copy_file(
+    engine: PdfiumEngine,
+    annotations: Vec<Annotation>,
+    dest: PathBuf,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let bytes = engine.save_copy(&annotations).map_err(|e| e.to_string())?;
+        std::fs::write(&dest, bytes).map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|join| Err(join.to_string()))
+}
+
+/// Diálogo nativo de destino da cópia (bloqueante, como o do abrir).
+/// Cancelado não escreve nada; escolhido dispara `save_copy_file`.
+fn start_save_dialog(ready: &mut Ready) -> Task<Message> {
+    let source = ready.source.path().to_path_buf();
+    let Some(dest) = rfd::FileDialog::new()
+        .add_filter("PDF", &["pdf"])
+        .set_file_name(suggested_marked_name(&source))
+        .save_file()
+    else {
+        return Task::none();
+    };
+    if is_same_file(&dest, &source) {
+        ready.save_status = Some("Escolha outro nome — o original nunca é sobrescrito.".into());
+        return Task::none();
+    }
+    ready.save_status = None;
+    let annotations = ready.annotations.clone();
+    let doc_gen = ready.open_gen;
+    let engine = ready.engine.clone();
+    Task::perform(
+        save_copy_file(engine, annotations, dest.clone()),
+        move |result| Message::SaveCopyDone {
+            doc_gen,
+            path: dest.clone(),
+            result,
+        },
+    )
 }
 
 fn parse_1based(input: &str, page_count: u32) -> Result<u32, String> {
@@ -657,8 +902,25 @@ pub enum Message {
         page: PageNo,
         page_pt: [f32; 2],
     },
-    PointerUp,
+    PointerUp {
+        page: PageNo,
+        page_pt: [f32; 2],
+    },
     CopySelection,
+    /// Marca a seleção atual (H/U/S ou menu ⋯); ignora sem seleção.
+    Annotate(AnnotKind),
+    /// Janela perdeu o foco no meio do drag: o Up nunca chega, então a
+    /// âncora morre aqui (senão o hover passa a estender a seleção).
+    DragCancelled,
+    AnnotUndo,
+    AnnotRedo,
+    /// Digitação no rascunho de nota aberto (`NoteDraft.text`).
+    NoteInput(String),
+    /// Salva o rascunho como nota (cria nova ou substitui a que está em
+    /// edição); texto vazio/só-espaço descarta sem criar.
+    NoteSave,
+    /// Fecha o rascunho sem criar/alterar nada.
+    NoteCancel,
     Rendered {
         page: PageNo,
         scale: Scale,
@@ -708,6 +970,20 @@ pub enum Message {
     },
     /// Captura cliques no cartão do modal (sem efeito); o fundo fecha o diálogo.
     PrintNop,
+    /// ⋯ → Salvar cópia com marcações…: abre o diálogo de destino (ou o aviso
+    /// de documento assinado antes dele).
+    SaveCopyRequested,
+    /// "Salvar mesmo assim" no aviso de documento assinado: segue para o
+    /// diálogo de destino.
+    SaveCopyConfirmed,
+    /// "Voltar" (ou clique no fundo/Esc) no aviso de documento assinado.
+    SaveCopyCancelled,
+    /// Resultado da cópia assíncrona; `doc_gen` precisa casar na volta.
+    SaveCopyDone {
+        doc_gen: u64,
+        path: PathBuf,
+        result: Result<(), String>,
+    },
     SetTheme(Theme),
     /// Janela informou tamanho + identidade: ajusta viewport e reconsulta o DPR.
     WindowMetrics {
@@ -950,13 +1226,34 @@ impl Session {
             }
             Message::PointerDown { page, page_pt } => {
                 if let Session::Ready(ready) = self {
-                    if let Some(Some(layer)) = ready.pages.text.get(page.index() as usize) {
-                        if let Some(i) = layer.hit(page_pt) {
-                            let (start, end) = glyph_byte_range(layer, i);
-                            ready.selection = Some(Selection {
-                                page,
-                                range: TextRange { start, end },
-                            });
+                    match ready.pages.text.get(page.index() as usize) {
+                        Some(Some(layer)) => {
+                            // Press ancora até no vazio (snap no mais próximo);
+                            // só o clique solto no vazio desseleciona (Up).
+                            let exact = layer.hit(page_pt);
+                            let snapped = exact.or_else(|| layer.hit_nearest(page_pt));
+                            match snapped {
+                                Some(i) => {
+                                    let (start, end) = glyph_byte_range(layer, i);
+                                    let sel = Selection {
+                                        page,
+                                        range: TextRange { start, end },
+                                    };
+                                    ready.press_anchor = Some(PressAnchor {
+                                        sel: sel.clone(),
+                                        exact: exact.is_some(),
+                                    });
+                                    ready.selection = Some(sel);
+                                }
+                                None => {
+                                    ready.selection = None;
+                                    ready.press_anchor = None;
+                                }
+                            }
+                        }
+                        _ => {
+                            ready.selection = None;
+                            ready.press_anchor = None;
                         }
                     }
                 }
@@ -967,10 +1264,19 @@ impl Session {
                     if let Some(sel) = ready.selection.as_mut() {
                         if sel.page == page {
                             if let Some(Some(layer)) = ready.pages.text.get(page.index() as usize) {
-                                if let Some(i) = layer.hit(page_pt) {
-                                    let (start, end) = glyph_byte_range(layer, i);
-                                    sel.range.start = sel.range.start.min(start);
-                                    sel.range.end = sel.range.end.max(end);
+                                // Snap ao glifo mais próximo: o arrasto segue
+                                // o cursor mesmo no vão (o clique usa `hit`
+                                // exato e desseleciona no vazio).
+                                if let Some(i) = layer.hit_nearest(page_pt) {
+                                    let cursor = glyph_byte_range(layer, i);
+                                    let anchor = ready
+                                        .press_anchor
+                                        .as_ref()
+                                        .filter(|a| a.sel.page == page)
+                                        .map(|a| a.sel.range);
+                                    // Âncora fixa no press: puxar de volta
+                                    // encolhe (padrão dos leitores).
+                                    sel.range = extend_range(anchor, cursor);
                                 }
                             }
                         }
@@ -978,13 +1284,89 @@ impl Session {
                 }
                 Task::none()
             }
-            Message::PointerUp => Task::none(),
+            Message::PointerUp { page, page_pt } => {
+                if let Session::Ready(ready) = self {
+                    // Clique (press+release sem arrasto): sobre marcação
+                    // remove; no vazio desseleciona; em glifo mantém a palavra.
+                    // Arrasto só estende (já feito no PointerMove).
+                    if let Some(anchor) = ready.press_anchor.clone() {
+                        if Some(anchor.sel.clone()) == ready.selection {
+                            if let Some(id) = ready.annotation_at(page, page_pt) {
+                                // Clique sobre nota abre a edição dela; as
+                                // demais marcações o clique remove.
+                                if !ready.open_note_draft_for_id(id) {
+                                    ready.remove_annotation(id);
+                                }
+                            } else if !anchor.exact {
+                                ready.selection = None;
+                            }
+                        }
+                    }
+                    ready.press_anchor = None;
+                }
+                Task::none()
+            }
             Message::CopySelection => {
                 if let Session::Ready(ready) = self {
                     ready.overflow_open = false;
                     if let Some(text) = ready.selection_plain_text() {
                         return clipboard::write(text);
                     }
+                }
+                Task::none()
+            }
+            Message::Annotate(kind) => {
+                if let Session::Ready(ready) = self {
+                    ready.overflow_open = false;
+                    if kind == AnnotKind::Note {
+                        // Nota: abre o rascunho da seleção e mantém a
+                        // seleção (âncora do draft); sem seleção ignora.
+                        ready.open_note_draft();
+                    } else if ready.annotate_selection(kind) {
+                        // Pós-marcação limpa a seleção (padrão dos leitores).
+                        ready.selection = None;
+                        ready.press_anchor = None;
+                    }
+                }
+                Task::none()
+            }
+            Message::DragCancelled => {
+                if let Session::Ready(ready) = self {
+                    ready.press_anchor = None;
+                }
+                Task::none()
+            }
+            Message::AnnotUndo => {
+                if let Session::Ready(ready) = self {
+                    ready.overflow_open = false;
+                    ready.annot_undo_once();
+                }
+                Task::none()
+            }
+            Message::AnnotRedo => {
+                if let Session::Ready(ready) = self {
+                    ready.overflow_open = false;
+                    ready.annot_redo_once();
+                }
+                Task::none()
+            }
+            Message::NoteInput(text) => {
+                if let Session::Ready(ready) = self {
+                    if let Some(draft) = ready.note_draft.as_mut() {
+                        draft.text = text;
+                    }
+                }
+                Task::none()
+            }
+            Message::NoteSave => {
+                if let Session::Ready(ready) = self {
+                    ready.save_note_draft();
+                }
+                Task::none()
+            }
+            Message::NoteCancel => {
+                if let Session::Ready(ready) = self {
+                    ready.note_draft = None;
                 }
                 Task::none()
             }
@@ -1075,7 +1457,9 @@ impl Session {
                 if let Session::Ready(ready) = self {
                     ready.outline = result;
                 }
-                Task::none()
+                // O outline destrava o gate em schedule_work: sem reagendar,
+                // nada mais é despachado e a folha trava em "Renderizando…".
+                self.schedule_work()
             }
             Message::OutlineTab(show) => {
                 if let Session::Ready(ready) = self {
@@ -1132,12 +1516,24 @@ impl Session {
             }
             Message::ClosePrintDialog => {
                 if let Session::Ready(ready) = self {
+                    // Esc com rascunho de nota aberto também o fecha: o
+                    // popover de nota não tem subscription própria e a
+                    // função pura de teclas não vê estado (Esc → este
+                    // diálogo); a guarda de foco é o `status` do iced.
+                    ready.note_draft = None;
+                    // Idem para o aviso de documento assinado.
+                    ready.save_warning = false;
                     // Enviando: ignora (Esc) para não perder o resultado na volta.
                     if ready
                         .print_dialog
                         .as_ref()
                         .is_none_or(|dialog| !dialog.busy)
                     {
+                        // Esc sem diálogo: desseleciona (padrão dos leitores).
+                        if ready.print_dialog.is_none() {
+                            ready.selection = None;
+                            ready.press_anchor = None;
+                        }
                         ready.print_dialog = None;
                     }
                 }
@@ -1363,6 +1759,66 @@ impl Session {
                 }
                 Task::none()
             }
+            Message::SaveCopyRequested => {
+                let Session::Ready(ready) = self else {
+                    return Task::none();
+                };
+                ready.overflow_open = false;
+                ready.save_status = None;
+                if ready.annotations.is_empty() {
+                    ready.save_status = Some("Nada para salvar — marque o texto primeiro.".into());
+                    return Task::none();
+                }
+                // Assinado: o aviso vem antes do diálogo (a cópia com
+                // marcações invalida a assinatura).
+                if needs_sign_warning(&ready.signatures) {
+                    ready.save_warning = true;
+                    return Task::none();
+                }
+                start_save_dialog(ready)
+            }
+            Message::SaveCopyConfirmed => {
+                let Session::Ready(ready) = self else {
+                    return Task::none();
+                };
+                ready.save_warning = false;
+                start_save_dialog(ready)
+            }
+            Message::SaveCopyCancelled => {
+                if let Session::Ready(ready) = self {
+                    ready.save_warning = false;
+                }
+                Task::none()
+            }
+            Message::SaveCopyDone {
+                doc_gen,
+                path,
+                result,
+            } => {
+                if let Session::Ready(ready) = self {
+                    if doc_gen == ready.open_gen {
+                        match result {
+                            Ok(()) => {
+                                // Registra a cópia nos recentes, mas não a abre:
+                                // abrir descartaria o estado da sessão atual.
+                                let recents = merge_recents(ready.recents.clone(), read_recents());
+                                let recents = push_recent(recents, path.clone());
+                                let _ = save_recents(&recents);
+                                ready.recents = recents;
+                                let name = path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                ready.save_status = Some(format!("Cópia salva em {name}"));
+                            }
+                            Err(err) => {
+                                ready.save_status = Some(format!("Falha ao salvar: {err}"));
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
             Message::SetTheme(theme) => {
                 self.set_theme(theme);
                 self.close_overflow();
@@ -1458,6 +1914,7 @@ impl Session {
     pub fn subscription(&self) -> iced::Subscription<Message> {
         event::listen_with(|event, status, id| match event {
             Event::Window(window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
+            Event::Window(window::Event::Unfocused) => Some(Message::DragCancelled),
             Event::Window(window::Event::Opened { size, .. })
             | Event::Window(window::Event::Resized(size)) => Some(Message::WindowMetrics {
                 width: size.width,
@@ -1751,6 +2208,19 @@ pub(crate) fn keyboard_message(
     if status != event::Status::Ignored {
         return None;
     }
+    // Ctrl/Cmd+Z desfaz, com Shift refaz (antes do hist_mod: ⌘/Ctrl engolem
+    // o resto das teclas no bloco abaixo; guarda de foco cobre inputs).
+    #[cfg(target_os = "macos")]
+    let cmd = modifiers.logo() && !modifiers.control() && !modifiers.alt();
+    #[cfg(not(target_os = "macos"))]
+    let cmd = modifiers.control() && !modifiers.logo() && !modifiers.alt();
+    if cmd {
+        match key.as_ref() {
+            Key::Character("z" | "Z") if modifiers.shift() => return Some(Message::AnnotRedo),
+            Key::Character("z" | "Z") => return Some(Message::AnnotUndo),
+            _ => {}
+        }
+    }
     // Alt+←/→ (⌘ no mac): histórico voltar/avançar.
     #[cfg(target_os = "macos")]
     let hist_mod =
@@ -1775,6 +2245,13 @@ pub(crate) fn keyboard_message(
         Key::Named(Named::End) => Some(Message::Nav(NavCmd::Last)),
         // R gira a vista; com foco em campo o iced captura antes (guarda de foco).
         Key::Character("r" | "R") => Some(Message::RotateView),
+        // H/U/S marcam a seleção (o handler ignora sem seleção com texto).
+        Key::Character("h" | "H") => Some(Message::Annotate(AnnotKind::Highlight)),
+        Key::Character("u" | "U") => Some(Message::Annotate(AnnotKind::Underline)),
+        Key::Character("s" | "S") => Some(Message::Annotate(AnnotKind::Strikeout)),
+        // N abre o rascunho de nota da seleção (handler ignora sem seleção
+        // com texto; com draft já aberto é no-op para não apagar o digitado).
+        Key::Character("n" | "N") => Some(Message::Annotate(AnnotKind::Note)),
         // Sem diálogo aberto o handler ignora; com foco em campo, o iced captura antes.
         Key::Named(Named::Escape) => Some(Message::ClosePrintDialog),
         _ => None,
@@ -1832,7 +2309,7 @@ impl Ready {
     }
 
     /// Mídia na orientação da vista: rotação ímpar troca largura ↔ altura.
-    fn rotated_media(&self, page: PageNo) -> MediaBox {
+    pub(crate) fn rotated_media(&self, page: PageNo) -> MediaBox {
         let media = self.media(page);
         if self.view_rotation & 1 == 1 {
             MediaBox {
@@ -1985,6 +2462,217 @@ impl Ready {
         } else {
             Some(sliced)
         }
+    }
+
+    /// Cria marcação da seleção atual; `false` sem seleção com texto (ignora).
+    pub(crate) fn annotate_selection(&mut self, kind: AnnotKind) -> bool {
+        let Some(sel) = self.selection.clone() else {
+            return false;
+        };
+        let quads = match self
+            .pages
+            .text
+            .get(sel.page.index() as usize)
+            .and_then(|l| l.as_ref())
+        {
+            Some(layer) if !layer.slice(sel.range).trim().is_empty() => {
+                quads_for_range_by_line(&layer.glyphs, sel.range.start, sel.range.end)
+            }
+            _ => return false,
+        };
+        if quads.is_empty() {
+            return false;
+        }
+        let annot = Annotation {
+            id: self.next_annot_id,
+            page: sel.page,
+            range: sel.range,
+            quads,
+            kind,
+            // H/U/S não carregam texto; apenas notas (`save_note_draft`).
+            text: String::new(),
+        };
+        self.next_annot_id += 1;
+        self.apply_annot_action(AnnotAction::Add(annot.clone()));
+        self.annot_undo.push(AnnotAction::Add(annot));
+        self.annot_redo.clear();
+        true
+    }
+
+    /// Abre o rascunho de nota da seleção atual (N / menu ⋯); `false` sem
+    /// seleção com texto, ou com draft já aberto (no-op — não apaga o texto
+    /// digitado). Sobre o trecho de uma nota existente, reabre em modo de
+    /// edição com o texto dela.
+    pub(crate) fn open_note_draft(&mut self) -> bool {
+        if self.note_draft.is_some() {
+            return false;
+        }
+        let Some(sel) = self.selection.clone() else {
+            return false;
+        };
+        let quads = match self
+            .pages
+            .text
+            .get(sel.page.index() as usize)
+            .and_then(|l| l.as_ref())
+        {
+            Some(layer) if !layer.slice(sel.range).trim().is_empty() => {
+                quads_for_range_by_line(&layer.glyphs, sel.range.start, sel.range.end)
+            }
+            _ => return false,
+        };
+        if quads.is_empty() {
+            return false;
+        }
+        let existing = self
+            .annotations
+            .iter()
+            .find(|a| a.kind == AnnotKind::Note && a.page == sel.page && a.range == sel.range);
+        let (editing, text) = match existing {
+            Some(a) => (Some(a.id), a.text.clone()),
+            None => (None, String::new()),
+        };
+        self.note_draft = Some(NoteDraft {
+            page: sel.page,
+            range: sel.range,
+            quads,
+            text,
+            editing,
+        });
+        true
+    }
+
+    /// Abre a edição de uma nota existente (clique sobre o marcador): ancora
+    /// o draft no trecho dela com o texto atual. `false` se não é nota ou com
+    /// draft já aberto (o clique então não remove a nota — vira no-op).
+    fn open_note_draft_for_id(&mut self, id: u64) -> bool {
+        let Some(annot) = self
+            .annotations
+            .iter()
+            .find(|a| a.id == id && a.kind == AnnotKind::Note)
+            .cloned()
+        else {
+            return false;
+        };
+        if self.note_draft.is_some() {
+            return false;
+        }
+        // Âncora do draft = o trecho da nota, não a palavra do clique.
+        self.selection = Some(Selection {
+            page: annot.page,
+            range: annot.range,
+        });
+        self.open_note_draft()
+    }
+
+    /// Salva o rascunho como nota (`kind: Note`, texto do draft) via pilha
+    /// de undo (limpa o redo, como `annotate_selection`). Texto vazio ou
+    /// só-espaço descarta sem criar (sem undo entry). Edição de nota
+    /// existente vira `Remove(antiga)` + `Add(nova)` na pilha — desfazer os
+    /// dois passos restaura o texto antigo. `false` sem draft ou descartado.
+    pub(crate) fn save_note_draft(&mut self) -> bool {
+        let Some(draft) = self.note_draft.take() else {
+            return false;
+        };
+        if draft.text.trim().is_empty() {
+            return false;
+        }
+        if let Some(old) = draft
+            .editing
+            .and_then(|id| self.annotations.iter().find(|a| a.id == id).cloned())
+        {
+            self.apply_annot_action(AnnotAction::Remove(old.clone()));
+            self.annot_undo.push(AnnotAction::Remove(old));
+        }
+        let annot = Annotation {
+            id: self.next_annot_id,
+            page: draft.page,
+            range: draft.range,
+            quads: draft.quads,
+            kind: AnnotKind::Note,
+            text: draft.text,
+        };
+        self.next_annot_id += 1;
+        self.apply_annot_action(AnnotAction::Add(annot.clone()));
+        self.annot_undo.push(AnnotAction::Add(annot));
+        self.annot_redo.clear();
+        true
+    }
+
+    /// Remove por id (clique sobre nota abre edição, não remove); `false` se não existe.
+    pub(crate) fn remove_annotation(&mut self, id: u64) -> bool {
+        let Some(annot) = self.annotations.iter().find(|a| a.id == id).cloned() else {
+            return false;
+        };
+        self.apply_annot_action(AnnotAction::Remove(annot.clone()));
+        self.annot_undo.push(AnnotAction::Remove(annot));
+        self.annot_redo.clear();
+        true
+    }
+
+    pub(crate) fn annot_undo_once(&mut self) -> bool {
+        let Some(action) = self.annot_undo.pop() else {
+            return false;
+        };
+        let inverse = match &action {
+            AnnotAction::Add(a) => AnnotAction::Remove(a.clone()),
+            AnnotAction::Remove(a) => AnnotAction::Add(a.clone()),
+        };
+        self.apply_annot_action(inverse);
+        self.annot_redo.push(action);
+        true
+    }
+
+    pub(crate) fn annot_redo_once(&mut self) -> bool {
+        let Some(action) = self.annot_redo.pop() else {
+            return false;
+        };
+        self.apply_annot_action(action.clone());
+        self.annot_undo.push(action);
+        true
+    }
+
+    pub(crate) fn can_annot_undo(&self) -> bool {
+        !self.annot_undo.is_empty()
+    }
+
+    pub(crate) fn can_annot_redo(&self) -> bool {
+        !self.annot_redo.is_empty()
+    }
+
+    /// Id da marcação sob o ponto (espaço da mídia original); `None` fora.
+    pub(crate) fn annotation_at(&self, page: PageNo, page_pt: [f32; 2]) -> Option<u64> {
+        let [x, y] = page_pt;
+        self.annotations
+            .iter()
+            .find(|a| a.page == page && a.quads.iter().any(|q| q.contains(x, y)))
+            .map(|a| a.id)
+    }
+
+    fn apply_annot_action(&mut self, action: AnnotAction) {
+        match action {
+            AnnotAction::Add(a) => {
+                if self.annotations.iter().all(|e| e.id != a.id) {
+                    self.annotations.push(a);
+                }
+            }
+            AnnotAction::Remove(a) => self.annotations.retain(|e| e.id != a.id),
+        }
+    }
+
+    /// Retângulos da seleção atual em espaço da mídia original, um por linha
+    /// (`None` sem texto).
+    pub(crate) fn selection_quads(&self) -> Option<(PageNo, Vec<Quad>)> {
+        let sel = self.selection.as_ref()?;
+        let layer = self.pages.text.get(sel.page.index() as usize)?.as_ref()?;
+        if layer.slice(sel.range).trim().is_empty() {
+            return None;
+        }
+        let quads = quads_for_range_by_line(&layer.glyphs, sel.range.start, sel.range.end);
+        if quads.is_empty() {
+            return None;
+        }
+        Some((sel.page, quads))
     }
 
     pub fn set_query(&mut self, query: String) {
@@ -2415,6 +3103,12 @@ impl Document {
             page_input: String::new(),
             search: Search::derive("", &[]),
             selection: None,
+            annotations: Vec::new(),
+            next_annot_id: 0,
+            press_anchor: None,
+            annot_undo: Vec::new(),
+            annot_redo: Vec::new(),
+            note_draft: None,
             signatures_open: false,
             pages_open: false,
             outline_open: false,
@@ -2429,6 +3123,8 @@ impl Document {
             overflow_open: false,
             print_dialog: None,
             print_status: None,
+            save_status: None,
+            save_warning: false,
             open_gen: 0,
             render_gen: 1,
             surfaces: SurfaceCache::default(),
@@ -2488,6 +3184,19 @@ fn glyph_byte_range(layer: &TextLayer, index: usize) -> (usize, usize) {
         cursor = next;
     }
     (0, 0)
+}
+
+/// Estende a seleção a partir da âncora do press: puxar de volta encolhe
+/// (padrão dos leitores); sem âncora, ancora no cursor.
+fn extend_range(anchor: Option<TextRange>, cursor: (usize, usize)) -> TextRange {
+    let (start, end) = match anchor {
+        Some(a) => (a.start, a.end),
+        None => cursor,
+    };
+    TextRange {
+        start: start.min(cursor.0),
+        end: end.max(cursor.1),
+    }
 }
 
 impl std::fmt::Debug for Ready {
@@ -3071,6 +3780,497 @@ mod tests {
             Status::Ignored
         )
         .is_none());
+    }
+
+    #[test]
+    fn annot_shortcuts_mark_undo_redo() {
+        use iced::event::Status;
+        use iced::keyboard::Modifiers;
+        let plain = Modifiers::empty();
+        assert!(matches!(
+            keyboard_message(Key::Character("h".into()), plain, Status::Ignored),
+            Some(Message::Annotate(AnnotKind::Highlight))
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("U".into()), plain, Status::Ignored),
+            Some(Message::Annotate(AnnotKind::Underline))
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("s".into()), plain, Status::Ignored),
+            Some(Message::Annotate(AnnotKind::Strikeout))
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("n".into()), plain, Status::Ignored),
+            Some(Message::Annotate(AnnotKind::Note))
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("N".into()), plain, Status::Ignored),
+            Some(Message::Annotate(AnnotKind::Note))
+        ));
+        // Com modificador o atalho não dispara (mesma guarda de H/U/S).
+        assert!(keyboard_message(
+            Key::Character("n".into()),
+            Modifiers::SHIFT,
+            Status::Ignored
+        )
+        .is_none());
+        #[cfg(target_os = "macos")]
+        let cmd = Modifiers::LOGO;
+        #[cfg(not(target_os = "macos"))]
+        let cmd = Modifiers::CTRL;
+        assert!(matches!(
+            keyboard_message(Key::Character("z".into()), cmd, Status::Ignored),
+            Some(Message::AnnotUndo)
+        ));
+        assert!(matches!(
+            keyboard_message(
+                Key::Character("Z".into()),
+                cmd | Modifiers::SHIFT,
+                Status::Ignored
+            ),
+            Some(Message::AnnotRedo)
+        ));
+        // Com foco em campo o iced captura antes (guarda de foco).
+        assert!(keyboard_message(Key::Character("h".into()), plain, Status::Captured).is_none());
+    }
+
+    #[test]
+    fn annotate_clears_selection_and_unfocus_kills_drag() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        let mut session = Session::Ready(ready);
+        // Marcar limpa a seleção (padrão dos leitores).
+        apply(&mut session, Message::Annotate(AnnotKind::Highlight));
+        match &session {
+            Session::Ready(ready) => {
+                assert_eq!(ready.annotations.len(), 1);
+                assert!(ready.selection.is_none());
+            }
+            _ => unreachable!(),
+        }
+        // Unfocus no meio do drag mata a âncora, mantém a seleção.
+        match &mut session {
+            Session::Ready(ready) => {
+                ready.selection = Some(Selection {
+                    page: PageNo::first(),
+                    range: TextRange { start: 0, end: 2 },
+                });
+                ready.press_anchor = Some(PressAnchor {
+                    sel: Selection {
+                        page: PageNo::first(),
+                        range: TextRange { start: 0, end: 2 },
+                    },
+                    exact: true,
+                });
+            }
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::DragCancelled);
+        match &session {
+            Session::Ready(ready) => {
+                assert!(ready.press_anchor.is_none());
+                assert!(ready.selection.is_some());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn display_rect_roundtrips_page_pt_in_all_rotations() {
+        let media = MediaBox {
+            width: 100.0,
+            height: 200.0,
+        };
+        let quad = Quad::from_rect(10.0, 20.0, 30.0, 60.0);
+        for rot in 0..4u8 {
+            let (dw, dh) = if rot & 1 == 1 {
+                (400.0, 200.0)
+            } else {
+                (200.0, 400.0)
+            };
+            let r = display_rect(quad, media, rot, dw, dh);
+            // 20×40 pt vira 40×80 px; rotação ímpar troca os eixos (80×40).
+            let (ew, eh) = if rot & 1 == 1 {
+                (80.0, 40.0)
+            } else {
+                (40.0, 80.0)
+            };
+            assert!((r[2] - ew).abs() < 0.01, "rot {rot}: {r:?}");
+            assert!((r[3] - eh).abs() < 0.01, "rot {rot}: {r:?}");
+            // Centro exibido volta ao centro original.
+            let pt = page_pt_at([r[0] + r[2] / 2.0, r[1] + r[3] / 2.0], media, rot, dw, dh);
+            assert!((pt[0] - 20.0).abs() < 0.02, "rot {rot}: {pt:?}");
+            assert!((pt[1] - 40.0).abs() < 0.02, "rot {rot}: {pt:?}");
+        }
+        // Âncora absoluta de orientação (espaço PDF tem Y para cima, tela
+        // para baixo): faixa na base do PDF aparece na base da tela.
+        let bottom = display_rect(
+            Quad::from_rect(0.0, 0.0, 100.0, 20.0),
+            media,
+            0,
+            200.0,
+            400.0,
+        );
+        assert!((bottom[1] - 360.0).abs() < 0.01, "flip Y: {bottom:?}");
+        assert!((bottom[3] - 40.0).abs() < 0.01, "flip Y: {bottom:?}");
+        // Topo da tela volta ao topo do PDF.
+        let pt = page_pt_at([100.0, 0.0], media, 0, 200.0, 400.0);
+        assert!((pt[0] - 50.0).abs() < 0.01, "flip Y: {pt:?}");
+        assert!((pt[1] - 200.0).abs() < 0.01, "flip Y: {pt:?}");
+    }
+
+    #[test]
+    fn annotate_selection_undo_redo_remove() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        // Sem seleção: ignora.
+        assert!(!ready.annotate_selection(AnnotKind::Highlight));
+        assert!(ready.annotations.is_empty());
+        let len = match ready.pages.text.first() {
+            Some(Some(layer)) => layer.plain.len(),
+            _ => return,
+        };
+        if len < 2 {
+            return;
+        }
+        let sel = Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        };
+        ready.selection = Some(sel.clone());
+        assert!(ready.annotate_selection(AnnotKind::Highlight));
+        assert_eq!(ready.annotations.len(), 1);
+        assert_eq!(ready.annotations[0].kind, AnnotKind::Highlight);
+        assert!(ready.can_annot_undo());
+        // Undo esvazia, redo restaura.
+        assert!(ready.annot_undo_once());
+        assert!(ready.annotations.is_empty());
+        assert!(ready.can_annot_redo());
+        assert!(ready.annot_redo_once());
+        assert_eq!(ready.annotations.len(), 1);
+        // Nova ação limpa o redo.
+        assert!(ready.annot_undo_once());
+        assert!(ready.annotate_selection(AnnotKind::Underline));
+        assert!(!ready.can_annot_redo());
+        // Clique sobre a marcação acha o id; fora não.
+        let annot = ready.annotations[0].clone();
+        assert!(!annot.quads.is_empty());
+        let q = annot.quads[0];
+        let xs = [q.x0, q.x1, q.x2, q.x3];
+        let ys = [q.y0, q.y1, q.y2, q.y3];
+        let center = [
+            (xs.iter().fold(f32::INFINITY, |a, &b| a.min(b))
+                + xs.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)))
+                / 2.0,
+            (ys.iter().fold(f32::INFINITY, |a, &b| a.min(b))
+                + ys.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)))
+                / 2.0,
+        ];
+        assert_eq!(ready.annotation_at(annot.page, center), Some(annot.id));
+        assert_eq!(ready.annotation_at(annot.page, [-1000.0, -1000.0]), None);
+        // PointerUp sem arrasto remove via mensagens.
+        ready.press_anchor = Some(PressAnchor { sel, exact: true });
+        let mut session = Session::Ready(ready);
+        apply(
+            &mut session,
+            Message::PointerUp {
+                page: annot.page,
+                page_pt: center,
+            },
+        );
+        match &session {
+            Session::Ready(ready) => assert!(ready.annotations.is_empty()),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Draft de teste: âncora na página 1, trecho 0..2, sem depender do
+    /// texto extraído do PDF (os testes de nota mexem só no estado).
+    fn dummy_draft() -> NoteDraft {
+        NoteDraft {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+            quads: vec![Quad::from_rect(0.0, 0.0, 10.0, 10.0)],
+            text: String::new(),
+            editing: None,
+        }
+    }
+
+    #[test]
+    fn note_draft_save_creates_note_with_text() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        assert!(!ready.can_annot_undo());
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "olá mundo".into();
+        assert!(ready.save_note_draft());
+        // Draft fechou e a nota entrou no estado com o texto digitado.
+        assert!(ready.note_draft.is_none());
+        assert_eq!(ready.annotations.len(), 1);
+        assert_eq!(ready.annotations[0].kind, AnnotKind::Note);
+        assert_eq!(ready.annotations[0].text, "olá mundo");
+        assert!(ready.can_annot_undo());
+    }
+
+    #[test]
+    fn note_draft_save_whitespace_discards_without_undo_entry() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "   \n".into();
+        assert!(!ready.save_note_draft());
+        // Fecha o draft mas não cria nada nem suja a pilha de undo.
+        assert!(ready.note_draft.is_none());
+        assert!(ready.annotations.is_empty());
+        assert!(!ready.can_annot_undo());
+        assert!(!ready.can_annot_redo());
+    }
+
+    #[test]
+    fn note_add_undo_redo() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "nota".into();
+        assert!(ready.save_note_draft());
+        assert_eq!(ready.annotations.len(), 1);
+        // Undo remove a nota; redo a devolve com o texto.
+        assert!(ready.annot_undo_once());
+        assert!(ready.annotations.is_empty());
+        assert!(!ready.can_annot_undo());
+        assert!(ready.can_annot_redo());
+        assert!(ready.annot_redo_once());
+        assert_eq!(ready.annotations.len(), 1);
+        assert_eq!(ready.annotations[0].kind, AnnotKind::Note);
+        assert_eq!(ready.annotations[0].text, "nota");
+    }
+
+    #[test]
+    fn note_edit_undo_restores_old_text() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        // Nota existente.
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "antiga".into();
+        assert!(ready.save_note_draft());
+        let id = ready.annotations[0].id;
+        // Edição (draft com editing = Some(id)): Remove(antiga) + Add(nova).
+        let mut draft = dummy_draft();
+        draft.editing = Some(id);
+        draft.text = "nova".into();
+        ready.note_draft = Some(draft);
+        assert!(ready.save_note_draft());
+        assert_eq!(ready.annotations.len(), 1);
+        assert_ne!(ready.annotations[0].id, id);
+        assert_eq!(ready.annotations[0].text, "nova");
+        // Desfaz a edição: primeiro some, segundo restaura o texto antigo.
+        assert!(ready.annot_undo_once());
+        assert!(ready.annotations.is_empty());
+        assert!(ready.annot_undo_once());
+        assert_eq!(ready.annotations.len(), 1);
+        assert_eq!(ready.annotations[0].id, id);
+        assert_eq!(ready.annotations[0].text, "antiga");
+    }
+
+    #[test]
+    fn note_draft_requires_selection() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        // Sem seleção: ignorado, como `annotate_selection`.
+        ready.selection = None;
+        assert!(!ready.open_note_draft());
+        assert!(ready.note_draft.is_none());
+        assert!(ready.annotations.is_empty());
+        // Com draft aberto, reabrir é no-op (não apaga o texto digitado).
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        let mut draft = dummy_draft();
+        draft.text = "digitando...".into();
+        ready.note_draft = Some(draft);
+        assert!(!ready.open_note_draft());
+        assert_eq!(ready.note_draft.as_ref().unwrap().text, "digitando...");
+    }
+
+    #[test]
+    fn note_draft_reopens_existing_note_in_editing_mode() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let len = match ready.pages.text.first() {
+            Some(Some(layer)) => layer.plain.len(),
+            _ => return,
+        };
+        if len < 2 {
+            return;
+        }
+        // Cria uma nota no trecho 0..2 via save direto.
+        ready.note_draft = Some(dummy_draft());
+        ready.note_draft.as_mut().unwrap().text = "anotação".into();
+        assert!(ready.save_note_draft());
+        let id = ready.annotations[0].id;
+        // N com a seleção sobre o trecho da nota reabre em edição com o texto.
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        assert!(ready.open_note_draft());
+        let draft = ready.note_draft.as_ref().unwrap();
+        assert_eq!(draft.editing, Some(id));
+        assert_eq!(draft.text, "anotação");
+        // Clique sobre o marcador (âncora no trecho da nota) idem.
+        ready.note_draft = None;
+        ready.selection = None;
+        assert!(ready.open_note_draft_for_id(id));
+        let draft = ready.note_draft.as_ref().unwrap();
+        assert_eq!(draft.page, PageNo::first());
+        assert_eq!(draft.range, TextRange { start: 0, end: 2 });
+        assert_eq!(draft.editing, Some(id));
+        assert_eq!(draft.text, "anotação");
+        // Id de marcação que não é nota: falso (o clique remove no handler).
+        assert!(!ready.open_note_draft_for_id(u64::MAX));
+    }
+
+    fn glyph_at(cluster: &str, x0: f32, y0: f32, x1: f32, y1: f32) -> Glyph {
+        Glyph {
+            cluster: cluster.to_string(),
+            quad: Quad::from_rect(x0, y0, x1, y1),
+        }
+    }
+
+    #[test]
+    fn quads_by_line_split_lines_and_columns() {
+        // Duas linhas + segunda coluna na mesma faixa: 3 retângulos, sem vão.
+        let glyphs = vec![
+            glyph_at("a", 0.0, 0.0, 10.0, 10.0),
+            glyph_at("b", 10.0, 0.0, 20.0, 10.0),
+            glyph_at("c", 0.0, 20.0, 10.0, 30.0),
+            glyph_at("d", -20.0, 20.0, -10.0, 30.0),
+        ];
+        let quads = quads_for_range_by_line(&glyphs, 0, 4);
+        assert_eq!(quads.len(), 3);
+        // Linha 1 cobre só a primeira faixa (sem vazar para a de baixo).
+        let top = quad_bbox(quads[0]);
+        assert_eq!((top.0, top.1, top.2, top.3), (0.0, 0.0, 20.0, 10.0));
+        // Range vazio: nada.
+        assert!(quads_for_range_by_line(&glyphs, 4, 4).is_empty());
+    }
+
+    #[test]
+    fn drag_back_shrinks_to_anchor() {
+        let anchor = Some(TextRange { start: 10, end: 20 });
+        // Para frente: estende o fim.
+        assert_eq!(
+            extend_range(anchor, (15, 25)),
+            TextRange { start: 10, end: 25 }
+        );
+        // Para trás: estende o início.
+        assert_eq!(
+            extend_range(anchor, (0, 5)),
+            TextRange { start: 0, end: 20 }
+        );
+        // De volta para dentro: encolhe até a âncora (não menos).
+        assert_eq!(
+            extend_range(anchor, (12, 13)),
+            TextRange { start: 10, end: 20 }
+        );
+        // Sem âncora: ancora no cursor.
+        assert_eq!(extend_range(None, (4, 9)), TextRange { start: 4, end: 9 });
+    }
+
+    #[test]
+    fn pointer_down_miss_and_escape_clear_selection() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        let mut session = Session::Ready(ready);
+        // Press longe de qualquer glifo: ancora no mais próximo (snap).
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page: PageNo::first(),
+                page_pt: [-1000.0, -1000.0],
+            },
+        );
+        match &session {
+            Session::Ready(ready) => assert!(ready.selection.is_some()),
+            _ => unreachable!(),
+        }
+        // ...mas soltar sem arrastar no vazio limpa (clique no vazio).
+        apply(
+            &mut session,
+            Message::PointerUp {
+                page: PageNo::first(),
+                page_pt: [-1000.0, -1000.0],
+            },
+        );
+        match &session {
+            Session::Ready(ready) => assert!(ready.selection.is_none()),
+            _ => unreachable!(),
+        }
+        // Esc sem diálogo também limpa.
+        match &mut session {
+            Session::Ready(ready) => {
+                ready.selection = Some(Selection {
+                    page: PageNo::first(),
+                    range: TextRange { start: 0, end: 2 },
+                });
+            }
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::ClosePrintDialog);
+        match &session {
+            Session::Ready(ready) => assert!(ready.selection.is_none()),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn drag_from_blank_extends_from_snapped_anchor() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.selection = None;
+        let mut session = Session::Ready(ready);
+        // Press no vazio ancora no glifo mais próximo...
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page: PageNo::first(),
+                page_pt: [-1000.0, -1000.0],
+            },
+        );
+        // ...e arrastar dali estende a seleção (não fica travada).
+        apply(
+            &mut session,
+            Message::PointerMove {
+                page: PageNo::first(),
+                page_pt: [9000.0, 9000.0],
+            },
+        );
+        match &session {
+            Session::Ready(ready) => {
+                let sel = ready.selection.clone().expect("snap ancora");
+                assert!(sel.range.end > sel.range.start, "{sel:?}");
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -4346,5 +5546,165 @@ mod tests {
         ready.render_inflight.clear();
         let _ = ready.request_thumb_render();
         assert!(ready.render_inflight.contains(&key));
+    }
+
+    #[test]
+    fn suggested_marked_name_replaces_only_the_last_extension() {
+        use std::path::Path;
+        assert_eq!(
+            suggested_marked_name(Path::new("/tmp/contrato.pdf")),
+            "contrato (marcado).pdf"
+        );
+        assert_eq!(
+            suggested_marked_name(Path::new("/tmp/contrato")),
+            "contrato (marcado).pdf"
+        );
+        assert_eq!(
+            suggested_marked_name(Path::new("/tmp/ata.v1.tar.gz")),
+            "ata.v1.tar (marcado).pdf"
+        );
+    }
+
+    /// Assinatura de mentira: o fluxo só olha a lista estar vazia ou não.
+    fn one_signature() -> tsuro_sign::SignatureInfo {
+        tsuro_sign::SignatureInfo {
+            field_name: None,
+            signer_name: None,
+            reason: None,
+            location: None,
+            contact_info: None,
+            signing_time: None,
+            filter: None,
+            sub_filter: None,
+            byte_range: None,
+            covers_whole_document: true,
+            status: tsuro_sign::SignatureStatus::IntactButUntrusted,
+            status_detail: String::new(),
+            certificate: None,
+            digest_algorithm: None,
+            signature_algorithm: None,
+        }
+    }
+
+    #[test]
+    fn sign_warning_only_for_signed_documents() {
+        let analysis = |signatures| PdfAnalysis {
+            page_count_hint: Some(1),
+            has_acro_form: false,
+            signatures,
+        };
+        assert!(!needs_sign_warning(&analysis(Vec::new())));
+        assert!(needs_sign_warning(&analysis(vec![one_signature()])));
+    }
+
+    #[test]
+    fn same_file_detects_original_through_path_aliases() {
+        let dir = std::env::temp_dir().join(format!(
+            "tsuro-save-same-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("doc.pdf");
+        std::fs::write(&src, b"%PDF-1.4").unwrap();
+        assert!(is_same_file(&src, &src));
+        assert!(is_same_file(&dir.join(".").join("doc.pdf"), &src));
+        // Destino novo (ainda inexistente) nunca é o original.
+        assert!(!is_same_file(&dir.join("doc (marcado).pdf"), &src));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_without_annotations_sets_status_and_opens_nothing() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        apply(&mut session, Message::SaveCopyRequested);
+        let Session::Ready(ready) = &session else {
+            panic!("expected Ready, got {session:?}");
+        };
+        assert_eq!(
+            ready.save_status.as_deref(),
+            Some("Nada para salvar — marque o texto primeiro.")
+        );
+        assert!(!ready.save_warning);
+    }
+
+    #[test]
+    fn save_done_ok_records_copy_in_recents() {
+        isolated(|| {
+            let Some(ready) = sample_ready() else {
+                return;
+            };
+            let dest = std::env::temp_dir().join("contrato (marcado).pdf");
+            let doc_gen = ready.open_gen;
+            let mut session = Session::Ready(ready);
+            apply(
+                &mut session,
+                Message::SaveCopyDone {
+                    doc_gen,
+                    path: dest.clone(),
+                    result: Ok(()),
+                },
+            );
+            let Session::Ready(ready) = &session else {
+                panic!("expected Ready, got {session:?}");
+            };
+            assert_eq!(
+                ready.save_status.as_deref(),
+                Some("Cópia salva em contrato (marcado).pdf")
+            );
+            assert_eq!(ready.recents.first(), Some(&dest));
+            assert_eq!(read_recents().first(), Some(&dest));
+        });
+    }
+
+    #[test]
+    fn save_done_err_sets_failure_status() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let doc_gen = ready.open_gen;
+        let mut session = Session::Ready(ready);
+        apply(
+            &mut session,
+            Message::SaveCopyDone {
+                doc_gen,
+                path: std::env::temp_dir().join("x.pdf"),
+                result: Err("disco cheio".into()),
+            },
+        );
+        let Session::Ready(ready) = &session else {
+            panic!("expected Ready, got {session:?}");
+        };
+        assert_eq!(
+            ready.save_status.as_deref(),
+            Some("Falha ao salvar: disco cheio")
+        );
+    }
+
+    #[test]
+    fn save_done_with_stale_doc_gen_is_ignored() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let stale = ready.open_gen.wrapping_add(1);
+        let mut session = Session::Ready(ready);
+        apply(
+            &mut session,
+            Message::SaveCopyDone {
+                doc_gen: stale,
+                path: std::env::temp_dir().join("x.pdf"),
+                result: Ok(()),
+            },
+        );
+        let Session::Ready(ready) = &session else {
+            panic!("expected Ready, got {session:?}");
+        };
+        assert!(ready.save_status.is_none());
     }
 }
