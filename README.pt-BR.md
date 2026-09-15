@@ -79,11 +79,12 @@ Sem argumento, a janela abre vazia. Controles ficam na barra, não em atalhos.
 
 ## Exemplos
 
-Há dois PDFs em `public/samples/`:
+Há três PDFs em `public/samples/`:
 
 | Arquivo | O que testa |
 | --- | --- |
 | `guia-folio.pdf` | Tipografia, tabela, acentos, busca |
+| `sumario-folio.pdf` | Bookmarks (sumário) alimentando a aba Sumário |
 | `contrato-assinado.pdf` | Campo `/Sig` com certificado autoassinado de demonstração |
 
 O certificado do contrato é **autoassinado**. TsuroPDF trata isso como assinatura criptograficamente íntegra, mas sem cadeia de confiança pública. O estado esperado é "íntegra (sem confiança pública)".

@@ -1055,9 +1055,12 @@ fn panel_tabs(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 /// Aba Sumário: árvore clicável com expandir/colapsar e destaque da ativa.
 fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let active = ready.outline_active();
+    let focus = ready.outline_focus();
     let mut col = column![panel_tabs(ready, t)].spacing(8);
     for (path, depth, title, page, has_children) in ready.outline_rows() {
         let is_active = active.as_ref() == Some(&path);
+        // O cursor do teclado é a pílula; a página ativa, o texto em accent.
+        let is_focus = focus.as_ref() == Some(&path);
         let fold: Element<'_, Message> = if has_children {
             let collapsed = ready.outline_collapsed.contains(&path);
             button(text(if collapsed { "▸" } else { "▾" }).size(12))
@@ -1078,7 +1081,7 @@ fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             )
             .width(Length::Fill)
             .on_press(Message::OutlineJump(page)),
-            is_active,
+            is_focus,
         );
         col = col.push(
             row![

@@ -23,6 +23,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
 from reportlab.platypus import (
     CondPageBreak,
     KeepTogether,
@@ -49,13 +50,23 @@ PAPER = HexColor("#F7F3EC")
 RULE = HexColor("#D9D1C3")
 ACCENT_LINE = HexColor("#C45C26")
 
-pdfmetrics.registerFont(TTFont("Inter", "/usr/share/fonts/truetype/macos/Inter-Regular.ttf"))
-pdfmetrics.registerFont(TTFont("Inter-Bold", "/usr/share/fonts/truetype/macos/Inter-Bold.ttf"))
-pdfmetrics.registerFont(TTFont("Inter-Semi", "/usr/share/fonts/truetype/macos/Inter-SemiBold.ttf"))
-pdfmetrics.registerFont(TTFont("Tinos", "/usr/share/fonts/truetype/croscore/Tinos-Regular.ttf"))
-pdfmetrics.registerFont(TTFont("Tinos-Bold", "/usr/share/fonts/truetype/croscore/Tinos-Bold.ttf"))
-pdfmetrics.registerFont(TTFont("Tinos-Italic", "/usr/share/fonts/truetype/croscore/Tinos-Italic.ttf"))
-pdfmetrics.registerFont(TTFont("Tinos-BoldItalic", "/usr/share/fonts/truetype/croscore/Tinos-BoldItalic.ttf"))
+def register_font(name: str, path: str) -> None:
+    """Registra a fonte só se o arquivo existir.
+
+    As amostras de texto usam as fontes do Linux do build; onde elas não
+    existem, `build_outline_sample` (fontes base-14) ainda roda.
+    """
+    if Path(path).exists():
+        pdfmetrics.registerFont(TTFont(name, path))
+
+
+register_font("Inter", "/usr/share/fonts/truetype/macos/Inter-Regular.ttf")
+register_font("Inter-Bold", "/usr/share/fonts/truetype/macos/Inter-Bold.ttf")
+register_font("Inter-Semi", "/usr/share/fonts/truetype/macos/Inter-SemiBold.ttf")
+register_font("Tinos", "/usr/share/fonts/truetype/croscore/Tinos-Regular.ttf")
+register_font("Tinos-Bold", "/usr/share/fonts/truetype/croscore/Tinos-Bold.ttf")
+register_font("Tinos-Italic", "/usr/share/fonts/truetype/croscore/Tinos-Italic.ttf")
+register_font("Tinos-BoldItalic", "/usr/share/fonts/truetype/croscore/Tinos-BoldItalic.ttf")
 
 
 def styles() -> dict[str, ParagraphStyle]:
@@ -391,6 +402,69 @@ def build_guide(path: Path) -> None:
     print(f"wrote {path} ({path.stat().st_size} bytes)")
 
 
+SECTION_TITLES = (
+    "Identificação das partes",
+    "Objeto do contrato",
+    "Prazo e vigência",
+    "Preços e reajuste",
+    "Forma de pagamento",
+    "Obrigações do contratado",
+    "Obrigações do contratante",
+    "Garantia e assistência técnica",
+    "Sigilo e confidencialidade",
+    "Propriedade intelectual",
+    "Proteção de dados",
+    "Responsabilidade civil",
+    "Rescisão",
+    "Penalidades",
+    "Solução de controvérsias",
+    "Disposições finais",
+)
+
+SUBSECTIONS = {
+    4: ("Reajuste anual", "Revisão extraordinária"),
+    7: ("Acesso às dependências", "Aprovação de entregas"),
+    10: ("Cessão de direitos", "Uso do nome"),
+    13: ("Rescisão imotivada", "Rescisão por inadimplemento"),
+    15: ("Mediação", "Foro da comarca"),
+}
+
+
+def build_outline_sample(path: Path) -> None:
+    """Amostra com sumário embutido (bookmarks) para a aba Sumário.
+
+    Usa só as fontes base-14: precisa ser gerável em qualquer máquina, mesmo
+    onde as fontes do `guia-folio` não existem. Cada seção ocupa uma página e
+    as subseções ficam na página da seção — a árvore tem dois níveis e passa
+    da altura do painel, para exercitar a rolagem da aba.
+    """
+    c = canvas.Canvas(str(path), pagesize=A4)
+    c.setTitle("Contrato de exemplo com sumário")
+    c.setAuthor("Tsuro")
+    for number, title in enumerate(SECTION_TITLES, start=1):
+        key = f"secao-{number}"
+        c.bookmarkPage(key)
+        c.addOutlineEntry(f"{number}. {title}", key, level=0)
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(22 * mm, 250 * mm, f"{number}. {title}")
+        c.setFont("Helvetica", 11)
+        c.drawString(
+            22 * mm,
+            240 * mm,
+            "Página de exemplo do sumário do Tsuro — os títulos vêm dos "
+            "bookmarks do próprio arquivo.",
+        )
+        subs = SUBSECTIONS.get(number, ())
+        for sub_number, sub_title in enumerate(subs, start=1):
+            sub_key = f"{key}-{sub_number}"
+            c.bookmarkPage(sub_key)
+            c.addOutlineEntry(f"{number}.{sub_number} {sub_title}", sub_key, level=1)
+            c.drawString(28 * mm, (230 - 8 * sub_number) * mm, f"{number}.{sub_number} {sub_title}")
+        c.showPage()
+    c.save()
+    print(f"wrote {path} ({path.stat().st_size} bytes)")
+
+
 def build_contract(path: Path) -> None:
     s = styles()
     buf = BytesIO()
@@ -563,8 +637,11 @@ def main() -> None:
     SAMPLES.mkdir(parents=True, exist_ok=True)
     FIXTURES.mkdir(parents=True, exist_ok=True)
     guide = SAMPLES / "guia-folio.pdf"
+    outline = SAMPLES / "sumario-folio.pdf"
     unsigned = SAMPLES / "contrato-rascunho.pdf"
     signed = SAMPLES / "contrato-assinado.pdf"
+    # Só a amostra de sumário dispensa as fontes do build: gera primeiro.
+    build_outline_sample(outline)
     build_guide(guide)
     build_contract(unsigned)
     key_path, cert_path = issue_demo_cert()

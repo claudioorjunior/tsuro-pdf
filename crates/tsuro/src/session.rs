@@ -35,6 +35,13 @@ pub(crate) const THUMB_ROW: f32 = 156.0;
 const THUMB_VISIBLE: u32 = 8;
 const THUMB_PREFETCH: u32 = 3;
 
+/// Passo vertical de uma linha da árvore do sumário, usado só para manter a
+/// linha do cursor visível ao andar com ↑/↓. `outline_tab` em view.rs mede
+/// texto 12 com line-height 1.3 (=15,6) + padding [9,10] (=18) + spacing 8
+/// = 41,6; o valor é arredondado para baixo de propósito: subestimar deixa a
+/// linha um pouco abaixo do topo (visível), superestimar a esconderia.
+pub(crate) const OUTLINE_ROW: f32 = 41.0;
+
 /// RGBA byte budget for neighbor/speculative page surfaces (`visible ± 1`).
 /// The mandatory visible-page bitmap at its current scale is excluded.
 const NEIGHBOR_CACHE_BUDGET: usize = 64 * 1024 * 1024;
@@ -456,6 +463,15 @@ pub enum NavCmd {
     GoTo(PageNo),
 }
 
+/// Teclas da árvore do sumário: ↑/↓ movem o cursor, Enter salta para a página.
+/// Sem a aba Sumário aberta o handler ignora (como R/H/U/S sem seleção).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineKey {
+    Prev,
+    Next,
+    Activate,
+}
+
 pub enum Session {
     Empty(EmptyState),
     Loading {
@@ -513,6 +529,8 @@ pub struct Ready {
     pub outline: Option<Outline>,
     /// Caminhos colapsados na árvore (`[0, 2]` = 3º filho do 1º item).
     pub outline_collapsed: HashSet<Vec<usize>>,
+    /// Linha sob o cursor do teclado (↑/↓); `None` = nunca andou, usa a ativa.
+    outline_cursor: Option<Vec<usize>>,
     /// Evita disparar mais de um task de carregamento de outline por documento.
     outline_load_issued: bool,
     /// Tema Kiri — sobrevive a `begin_open`/`finish_open`/`close_document`.
@@ -941,6 +959,8 @@ pub enum Message {
     OutlineLoaded(Option<Outline>),
     /// Clique em um item do sumário: navega (com clamp) para a página do item.
     OutlineJump(PageNo),
+    /// ↑/↓/Enter na árvore do sumário (ignorado sem a aba aberta).
+    OutlineKey(OutlineKey),
     /// ⋯ → Imprimir: abre o diálogo próprio e lista impressoras em background.
     OpenPrintDialog,
     /// Lista do SO pronta; pré-seleciona a default (ou a primeira).
@@ -1471,16 +1491,49 @@ impl Session {
             Message::OutlineFold(path) => {
                 if let Session::Ready(ready) = self {
                     if !ready.outline_collapsed.remove(&path) {
+                        // Colapsar esconde os filhos: o cursor volta para a ativa.
+                        if ready
+                            .outline_cursor
+                            .as_ref()
+                            .is_some_and(|c| c.starts_with(&path) && *c != path)
+                        {
+                            ready.outline_cursor = None;
+                        }
                         ready.outline_collapsed.insert(path);
                     }
                 }
                 Task::none()
             }
-            Message::OutlineJump(page) => {
-                if let Session::Ready(ready) = self {
-                    ready.navigate_to(page);
+            Message::OutlineJump(page) => self.outline_jump(page),
+            Message::OutlineKey(cmd) => {
+                let Session::Ready(ready) = self else {
+                    return Task::none();
+                };
+                if !ready.outline_open || ready.outline.is_none() {
+                    return Task::none();
                 }
-                self.schedule_work()
+                match cmd {
+                    OutlineKey::Prev | OutlineKey::Next => {
+                        let next = matches!(cmd, OutlineKey::Next);
+                        match ready.outline_step(next) {
+                            // Rola junto (senão o cursor sai da janela): +1
+                            // desconta o cabeçalho das abas, que ocupa uma
+                            // linha e está dentro do mesmo scrollable.
+                            Some(row) => scrollable::scroll_to(
+                                crate::view::pages_scroll_id(),
+                                scrollable::AbsoluteOffset {
+                                    x: 0.0,
+                                    y: (row as f32 + 1.0) * OUTLINE_ROW,
+                                },
+                            ),
+                            None => Task::none(),
+                        }
+                    }
+                    OutlineKey::Activate => match ready.outline_cursor_page() {
+                        Some(page) => self.outline_jump(page),
+                        None => Task::none(),
+                    },
+                }
             }
             Message::OpenPrintDialog => {
                 let Session::Ready(ready) = self else {
@@ -1978,6 +2031,7 @@ impl Session {
                 ready.outline_open = false;
                 ready.outline = None;
                 ready.outline_collapsed.clear();
+                ready.outline_cursor = None;
                 ready.outline_load_issued = false;
                 ready.pages_scroll_y = 0.0;
                 ready.overflow_open = false;
@@ -2089,6 +2143,15 @@ impl Session {
             Session::Loading { gen, .. } => Some(*gen),
             _ => None,
         }
+    }
+
+    /// Salto do sumário (clique ou Enter): mesmo caminho de `SetPage` — clamp +
+    /// histórico —, depois reagenda o trabalho de render.
+    fn outline_jump(&mut self, page: PageNo) -> Task<Message> {
+        if let Session::Ready(ready) = self {
+            ready.navigate_to(page);
+        }
+        self.schedule_work()
     }
 
     fn schedule_work(&mut self) -> Task<Message> {
@@ -2254,6 +2317,11 @@ pub(crate) fn keyboard_message(
         Key::Character("n" | "N") => Some(Message::Annotate(AnnotKind::Note)),
         // Sem diálogo aberto o handler ignora; com foco em campo, o iced captura antes.
         Key::Named(Named::Escape) => Some(Message::ClosePrintDialog),
+        // ↑/↓ e Enter andam/saltam na árvore do sumário; sem a aba aberta o
+        // handler ignora (setas horizontais continuam com o histórico e a nav).
+        Key::Named(Named::ArrowUp) => Some(Message::OutlineKey(OutlineKey::Prev)),
+        Key::Named(Named::ArrowDown) => Some(Message::OutlineKey(OutlineKey::Next)),
+        Key::Named(Named::Enter) => Some(Message::OutlineKey(OutlineKey::Activate)),
         _ => None,
     }
 }
@@ -2727,6 +2795,43 @@ impl Ready {
             .last()
     }
 
+    /// Linha sob o cursor do teclado: o movimento explícito (↑/↓) ou, sem
+    /// movimento, a entrada ativa — começar a andar de onde a página está.
+    pub(crate) fn outline_focus(&self) -> Option<Vec<usize>> {
+        self.outline_cursor
+            .clone()
+            .or_else(|| self.outline_active())
+    }
+
+    /// Anda uma linha (↑/↓) sem sair da lista e devolve o índice da nova linha,
+    /// que a view rola para manter o cursor visível.
+    fn outline_step(&mut self, next: bool) -> Option<usize> {
+        let rows = self.outline_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let index = self
+            .outline_focus()
+            .and_then(|path| rows.iter().position(|(row, ..)| *row == path));
+        let target = match (index, next) {
+            (Some(i), true) => (i + 1).min(rows.len() - 1),
+            (Some(i), false) => i.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => rows.len() - 1,
+        };
+        self.outline_cursor = Some(rows[target].0.clone());
+        Some(target)
+    }
+
+    /// Página da linha sob o cursor (Enter); `None` sem cursor válido.
+    fn outline_cursor_page(&self) -> Option<PageNo> {
+        let path = self.outline_focus()?;
+        self.outline_rows()
+            .into_iter()
+            .find(|(row, ..)| *row == path)
+            .map(|(_, _, _, page, _)| page)
+    }
+
     pub(crate) fn thumb_page_window(&self) -> Vec<PageNo> {
         let first = (self.pages_scroll_y / THUMB_ROW).floor().max(0.0) as u32;
         let start = first.saturating_sub(THUMB_PREFETCH);
@@ -3114,6 +3219,7 @@ impl Document {
             outline_open: false,
             outline: None,
             outline_collapsed: HashSet::new(),
+            outline_cursor: None,
             outline_load_issued: false,
             pages_scroll_y: 0.0,
             doc_scroll_y: 0.0,
@@ -4355,6 +4461,109 @@ mod tests {
         assert_eq!(ready.outline_active(), Some(vec![1]));
         ready.visible = PageNo::first();
         assert_eq!(ready.outline_active(), Some(vec![0]));
+    }
+
+    #[test]
+    fn outline_keyboard_walks_tree_and_jumps() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        apply(&mut session, Message::OutlineLoaded(Some(outline_tree())));
+        // Sem a aba aberta as teclas não andam nem saltam.
+        apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        apply(&mut session, Message::OutlineKey(OutlineKey::Activate));
+        match &session {
+            Session::Ready(r) => {
+                assert!(r.outline_cursor.is_none());
+                assert_eq!(r.visible, PageNo::first());
+            }
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::OutlineTab(true));
+        // O cursor parte da entrada ativa (página 1 → primeiro item).
+        match &session {
+            Session::Ready(r) => assert_eq!(r.outline_focus(), Some(vec![0])),
+            _ => unreachable!(),
+        }
+        // ↓ anda pela árvore sem navegar: quem salta é o Enter.
+        apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        match &session {
+            Session::Ready(r) => {
+                assert_eq!(r.outline_focus(), Some(vec![0, 0]));
+                assert_eq!(r.visible, PageNo::first());
+            }
+            _ => unreachable!(),
+        }
+        // Enter salta para a página do cursor e entra no histórico.
+        let history = match &session {
+            Session::Ready(r) => r.history.len(),
+            _ => unreachable!(),
+        };
+        apply(&mut session, Message::OutlineKey(OutlineKey::Activate));
+        match &session {
+            Session::Ready(r) => {
+                // Alvo é a página do cursor, com o mesmo clamp do SetPage
+                // (o fixture tem 2 páginas, então a página 3 cai na última).
+                let last = PageNo::from_index(r.page_count() - 1);
+                assert_eq!(r.visible, PageNo::from_index(2).min(last));
+                assert_eq!(r.history.len(), history + 1);
+            }
+            _ => unreachable!(),
+        }
+        // ↑/↓ não passam das pontas da lista.
+        for _ in 0..4 {
+            apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        }
+        match &session {
+            Session::Ready(r) => assert_eq!(r.outline_focus(), Some(vec![1])),
+            _ => unreachable!(),
+        }
+        for _ in 0..4 {
+            apply(&mut session, Message::OutlineKey(OutlineKey::Prev));
+        }
+        match &session {
+            Session::Ready(r) => assert_eq!(r.outline_focus(), Some(vec![0])),
+            _ => unreachable!(),
+        }
+        // Colapsar o nó esconde os filhos: o cursor volta para a ativa.
+        apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        apply(&mut session, Message::OutlineFold(vec![0]));
+        match &session {
+            Session::Ready(r) => {
+                assert_eq!(r.outline_rows().len(), 2);
+                assert_eq!(r.outline_focus(), Some(vec![0]));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn outline_keys_map_to_outline_messages() {
+        use iced::event::Status;
+        use iced::keyboard::Modifiers;
+        let plain = Modifiers::empty();
+        assert!(matches!(
+            keyboard_message(Key::Named(Named::ArrowUp), plain, Status::Ignored),
+            Some(Message::OutlineKey(OutlineKey::Prev))
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Named(Named::ArrowDown), plain, Status::Ignored),
+            Some(Message::OutlineKey(OutlineKey::Next))
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Named(Named::Enter), plain, Status::Ignored),
+            Some(Message::OutlineKey(OutlineKey::Activate))
+        ));
+        // Com modificador a tecla sai do mapa (⌘/Alt+setas seguem no histórico)
+        // e com foco em campo o evento chega capturado: nada é despachado.
+        assert!(keyboard_message(
+            Key::Named(Named::ArrowUp),
+            Modifiers::SHIFT,
+            Status::Ignored
+        )
+        .is_none());
+        assert!(keyboard_message(Key::Named(Named::Enter), plain, Status::Captured).is_none());
     }
 
     #[test]
