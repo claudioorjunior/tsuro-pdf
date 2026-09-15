@@ -1,7 +1,7 @@
 use iced::widget::canvas::event::{Event as CanvasEvent, Status as CanvasStatus};
-use iced::widget::canvas::{Frame, Geometry, Path, Program, Stroke, Style};
+use iced::widget::canvas::{Frame, Geometry, LineDash, Path, Program, Stroke, Style};
 use iced::widget::{
-    button, column, container, image, mouse_area, pick_list, row, scrollable, stack, svg, text,
+    button, column, container, image, mouse_area, pick_list, row, scrollable, stack, text,
     text_input, tooltip, Canvas, Space,
 };
 use iced::{mouse, Alignment, Background, Border, Color, Element, Length, Padding, Point};
@@ -51,7 +51,7 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
         col = col.push(progress(ready, t));
     }
     col = col.push(body);
-    let main = container(
+    let main: Element<'_, Message> = container(
         col.spacing(0)
             .padding(4)
             .width(Length::Fill)
@@ -63,7 +63,14 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
         background: Some(Background::Color(t.bg)),
         text_color: Some(t.ink),
         ..container::Style::default()
-    });
+    })
+    .into();
+    // HUD flutuante (Stitch): pílula bottom-center sobre o canvas, sob os
+    // modais — que escurecem por cima e capturam tudo.
+    let main = match session {
+        Session::Ready(ready) => stack![main, hud(ready, t)].into(),
+        _ => main,
+    };
     match session {
         // Modal de impressão captura tudo; menu ⋯ nunca abre junto (fecha ao abrir).
         Session::Ready(ready) if ready.print_dialog.is_some() => {
@@ -85,21 +92,92 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
     }
 }
 
-// Lucide restante (sem par Ori v1): `copy`, `x`, `folder`, `file-text`, `chevron-left`
-// (empty state). Toolbar usa `kiri::ori!` — cor fixa no SVG, sem `.style()`.
-macro_rules! icon {
-    ($t:expr, $file:literal) => {
-        svg(svg::Handle::from_memory(include_bytes!(concat!(
-            "../assets/icons/",
-            $file,
-            ".svg"
-        ))))
-        .width(Length::Fixed(17.0))
-        .height(Length::Fixed(17.0))
-        .style(move |_theme, _status| svg::Style {
-            color: Some($t.ink),
-        })
+/// Botão-ícone da pílula do HUD: Ori + tooltip, no tamanho dos segmentos.
+fn hud_icon(
+    file: &str,
+    label: &'static str,
+    t: Tokens,
+    message: Message,
+) -> Element<'static, Message> {
+    tip(
+        control_seg(t, button(kiri::ori_icon(file, 16.0))).on_press(message),
+        label,
+    )
+}
+
+/// HUD flutuante (Stitch §Floating Action Pill): pílula 36px centrada a 24px do
+/// rodapé, sobre o canvas. Só os botões capturam clique — o resto atravessa.
+fn hud(ready: &Ready, t: Tokens) -> Element<'_, Message> {
+    let n = ready.page_count().max(1);
+    let page = ready.visible.index() + 1;
+    let current = match ready.zoom {
+        Zoom::Manual(z) => z.get(),
+        Zoom::Width | Zoom::Page => ready
+            .zoom
+            .scale(ready.viewport(), ready.media(ready.visible))
+            .factor(),
     };
+    let out = Zoom::Manual(ZoomFactor::new(current / 1.1));
+    let into = Zoom::Manual(ZoomFactor::new(current * 1.1));
+    let mono = |s: String, color: Color| {
+        text(s)
+            .size(12)
+            .font(iced::Font::MONOSPACE)
+            .color(color)
+    };
+    let mut pill = row![
+        hud_icon("chevron-left", "Página anterior", t, Message::Nav(NavCmd::Previous)),
+        mono(page.to_string(), t.ink),
+        mono("/".to_string(), t.muted),
+        mono(n.to_string(), t.muted),
+        hud_icon("chevron-right", "Próxima página", t, Message::Nav(NavCmd::Next)),
+        kiri::vsep(t),
+        hud_icon("fit-width", "Ajustar à largura", t, Message::SetZoom(Zoom::Width)),
+        hud_icon("minus", "Diminuir zoom", t, Message::SetZoom(out)),
+        mono(format!("{}%", (current * 100.0).round() as i32), t.ink),
+        hud_icon("plus", "Aumentar zoom", t, Message::SetZoom(into)),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center);
+    // Modo Anotação: só com seleção viva ou marcações na sessão.
+    if ready.selection_plain_text().is_some() || !ready.annotations.is_empty() {
+        pill = pill.push(kiri::vsep(t)).push(
+            row![
+                container(Space::with_width(Length::Fixed(7.0)))
+                    .width(Length::Fixed(7.0))
+                    .height(Length::Fixed(7.0))
+                    .style(move |_| container::Style {
+                        background: Some(Background::Color(t.accent)),
+                        border: Border {
+                            radius: 99.0.into(),
+                            ..Border::default()
+                        },
+                        ..container::Style::default()
+                    }),
+                text("Modo Anotação").size(11).color(t.accent),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+    container(
+        container(pill)
+            .height(Length::Fixed(28.0))
+            .align_y(Alignment::Center)
+            .padding(Padding::from([4, 6]))
+            .style(kiri::hud_style(t)),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(Alignment::Center)
+    .align_y(Alignment::End)
+    .padding(Padding {
+        top: 0.0,
+        right: 0.0,
+        bottom: 24.0,
+        left: 0.0,
+    })
+    .into()
 }
 
 fn control_style(
@@ -140,10 +218,7 @@ fn tip<'a>(content: impl Into<Element<'a, Message>>, label: &'static str) -> Ele
 
 fn open_button(t: Tokens) -> Element<'static, Message> {
     tip(
-        control(
-            t,
-            button(kiri::ori!("folder-open")).on_press(Message::PickFile),
-        ),
+        control(t, button(kiri::ori!("folder")).on_press(Message::PickFile)),
         "Abrir PDF",
     )
 }
@@ -168,29 +243,84 @@ fn toolbar_frame(t: Tokens, content: Element<'_, Message>) -> Element<'_, Messag
         .into()
 }
 
-/// Barra única Kiri (`Session::Ready`): abrir │ pílula │ zoom │ painéis │ ⋯.
+/// Nome do arquivo com elipse no meio (`Contrato_Locacao_..._2024.pdf`).
+fn middle_truncate(name: &str, max: usize) -> String {
+    let count = name.chars().count();
+    if count <= max {
+        return name.to_string();
+    }
+    // A elipse ocupa 1; o resto divide cabeça e cauda.
+    let head = (max - 1) / 2;
+    let tail = max - 1 - head;
+    let head_end = name.char_indices().nth(head).map_or(name.len(), |(i, _)| i);
+    let tail_start = name
+        .char_indices()
+        .nth(count - tail)
+        .map_or(name.len(), |(i, _)| i);
+    format!("{}…{}", &name[..head_end], &name[tail_start..])
+}
+
+/// Barra única Kiri (`Session::Ready`): abrir │ pílula do documento │ busca e
+/// página │ marcar │ zoom │ painéis │ ⋯. Uma linha só (`CHROME_HEIGHT`).
 fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
     if let Session::Ready(ready) = session {
         let n = ready.page_count().max(1);
+        // Pílula do documento: dot (marcas da sessão ainda não salvas) + nome do
+        // arquivo com elipse no meio. Nada de tamanho/data: só o que o estado tem.
+        let name = ready
+            .source
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut doc_row = row![].spacing(6).align_y(Alignment::Center);
+        if !ready.annotations.is_empty() {
+            doc_row = doc_row.push(
+                container(Space::with_width(Length::Fixed(6.0)))
+                    .width(Length::Fixed(6.0))
+                    .height(Length::Fixed(6.0))
+                    .style(kiri::bar_dot_style(t)),
+            );
+        }
+        let doc_pill = tip(
+            container(doc_row.push(text(middle_truncate(&name, 24)).size(13).color(t.ink)))
+                .padding(Padding {
+                    top: 4.0,
+                    right: 8.0,
+                    bottom: 4.0,
+                    left: 8.0,
+                })
+                .style(kiri::bar_doc_style(t)),
+            "Documento aberto",
+        );
         let pill = container(
             row![
                 kiri::ori_small!("search"),
-                text_input("Buscar", ready.search.query())
+                text_input("Buscar no documento...", ready.search.query())
                     .on_input(Message::SearchChanged)
-                    .width(Length::Fixed(200.0)),
+                    .style(kiri::bar_input_style(t))
+                    .padding([2, 4])
+                    .size(12)
+                    .width(Length::Fixed(180.0)),
+                kiri::vsep(t),
                 row![
                     tip(
                         text_input("Página", ready.page_input())
                             .on_input(Message::PageInput)
                             .on_submit(Message::PageSubmit)
-                            .width(Length::Fixed(48.0))
-                            .padding([4, 6])
-                            .size(12),
+                            .style(kiri::bar_input_style(t))
+                            .font(iced::Font::MONOSPACE)
+                            .size(12)
+                            .padding([2, 4])
+                            .width(Length::Fixed(30.0)),
                         "Ir para página (Enter confirma)",
                     ),
-                    text(format!("/{n}")).size(12).color(t.muted),
+                    text(format!("/{n}"))
+                        .size(12)
+                        .font(iced::Font::MONOSPACE)
+                        .color(t.muted),
                 ]
-                .spacing(4)
+                .spacing(2)
                 .align_y(Alignment::Center),
                 container(
                     row![
@@ -217,14 +347,14 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                 .padding(2)
                 .style(kiri::seg_style(t)),
             ]
-            .spacing(8)
+            .spacing(6)
             .align_y(Alignment::Center),
         )
         .padding(Padding {
-            top: 4.0,
+            top: 2.0,
             right: 6.0,
-            bottom: 4.0,
-            left: 12.0,
+            bottom: 2.0,
+            left: 10.0,
         })
         .style(kiri::pill_style(t))
         .max_width(520.0);
@@ -248,11 +378,14 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                     "Diminuir zoom"
                 ),
                 tip(
-                    control_seg(
-                        t,
-                        button(kiri::ori!("fit-width")).on_press(Message::SetZoom(Zoom::Width))
-                    ),
-                    "Ajustar à largura"
+                    container(
+                        text(format!("{}%", (current * 100.0).round() as i32))
+                            .size(12)
+                            .font(iced::Font::MONOSPACE)
+                            .color(t.muted),
+                    )
+                    .padding(Padding::from([0, 4])),
+                    "Zoom atual",
                 ),
                 tip(
                     control_seg(
@@ -260,6 +393,13 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                         button(kiri::ori!("plus")).on_press(Message::SetZoom(into))
                     ),
                     "Aumentar zoom"
+                ),
+                tip(
+                    control_seg(
+                        t,
+                        button(kiri::ori!("fit-width")).on_press(Message::SetZoom(Zoom::Width))
+                    ),
+                    "Ajustar à largura"
                 ),
             ]
             .spacing(0)
@@ -330,14 +470,42 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
             "Mais opções",
         ));
 
-        // Ferramentas de marcar na cara (seleção ativa): ⋯ é fuga, não casa.
+        // Barra de anotar na cara (seleção viva): ⋯ é fuga, não casa. Os atalhos
+        // H/U/S/N já vivem em `keyboard_message`; aqui só o rótulo da tecla.
+        let mut bar = row![
+            home_button(t),
+            open_button(t),
+            kiri::vsep(t),
+            doc_pill,
+            Space::with_width(Length::Fill),
+            pill,
+            Space::with_width(Length::Fill),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
         if ready.selection_plain_text().is_some() {
+            let hint = |key: &'static str| {
+                text(key)
+                    .size(10)
+                    .font(iced::Font::MONOSPACE)
+                    .color(t.muted)
+            };
+            // Rótulo só com janela larga (Stitch: `hidden xl:inline`, 1280px);
+            // estreita fica ícone + tecla, que é o que cabe na mesma linha.
+            let wide = ready.viewport().width >= 1280.0;
+            let tool = |icon: Element<'static, Message>, label: &'static str, key: &'static str| {
+                let mut content = row![icon].spacing(4).align_y(Alignment::Center);
+                if wide {
+                    content = content.push(text(label).size(12));
+                }
+                content.push(hint(key))
+            };
             let mark_seg = container(
                 row![
                     tip(
                         control_seg(
                             t,
-                            button(text("Destacar").size(12))
+                            button(tool(kiri::ori!("highlighter"), "Destacar", "H"))
                                 .on_press(Message::Annotate(AnnotKind::Highlight))
                         ),
                         "Destacar (H)"
@@ -345,7 +513,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                     tip(
                         control_seg(
                             t,
-                            button(text("Sublinhar").size(12))
+                            button(tool(kiri::ori!("underline"), "Sublinhar", "U"))
                                 .on_press(Message::Annotate(AnnotKind::Underline))
                         ),
                         "Sublinhar (U)"
@@ -353,7 +521,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                     tip(
                         control_seg(
                             t,
-                            button(text("Riscar").size(12))
+                            button(tool(kiri::ori!("strike"), "Riscar", "S"))
                                 .on_press(Message::Annotate(AnnotKind::Strikeout))
                         ),
                         "Riscar (S)"
@@ -361,7 +529,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                     tip(
                         control_seg(
                             t,
-                            button(text("Nota (N)").size(12))
+                            button(tool(kiri::ori!("note"), "Nota", "N"))
                                 .on_press(Message::Annotate(AnnotKind::Note))
                         ),
                         "Nota (N)"
@@ -371,30 +539,12 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                 .align_y(Alignment::Center),
             )
             .padding(2)
-            .style(kiri::seg_style(t));
-            right = row![mark_seg, kiri::vsep(t), right,]
-                .spacing(4)
-                .align_y(Alignment::Center);
+            .style(kiri::bar_mark_style(t));
+            bar = bar.push(mark_seg).push(kiri::vsep(t));
         }
+        bar = bar.push(zoom_seg).push(kiri::vsep(t)).push(right);
 
-        return toolbar_frame(
-            t,
-            row![
-                home_button(t),
-                open_button(t),
-                kiri::vsep(t),
-                Space::with_width(Length::Fill),
-                pill,
-                Space::with_width(Length::Fill),
-                kiri::vsep(t),
-                zoom_seg,
-                kiri::vsep(t),
-                right,
-            ]
-            .spacing(4)
-            .align_y(Alignment::Center)
-            .into(),
-        );
+        return toolbar_frame(t, bar.into());
     }
 
     // Tela inicial não precisa de home; erro/carregando usam para voltar.
@@ -724,7 +874,7 @@ fn print_footer(dialog: &PrintDialog, t: Tokens) -> Element<'static, Message> {
     let secondary = |label: &'static str, message: Message| {
         button(text(label).size(13))
             .padding(Padding::from([8, 12]))
-            .style(kiri::menu_item_style(t))
+            .style(kiri::hud_ghost_style(t))
             .on_press_maybe((!busy).then_some(message))
     };
     row![
@@ -733,7 +883,7 @@ fn print_footer(dialog: &PrintDialog, t: Tokens) -> Element<'static, Message> {
         secondary("Cancelar", Message::ClosePrintDialog),
         button(text(label).size(13))
             .padding(Padding::from([8, 12]))
-            .style(kiri::menu_item_style(t))
+            .style(kiri::hud_primary_style(t))
             .on_press_maybe((!busy).then_some(Message::PrintSubmit)),
     ]
     .spacing(8)
@@ -759,39 +909,43 @@ fn note_layer(draft: &NoteDraft, t: Tokens) -> Element<'_, Message> {
     stack![mouse_area(dim).on_press(Message::NoteCancel), card,].into()
 }
 
-/// Campo de texto + Salvar/Cancelar; rótulo diz se cria ou edita.
+/// Popover de nota (Stitch): rótulo caps + campo + `Cancelar` ghost e
+/// `Salvar Nota` primária. O rótulo diz se cria ou edita.
 fn note_card(draft: &NoteDraft, t: Tokens) -> Element<'_, Message> {
-    let title = if draft.editing.is_some() {
-        "Editar nota"
+    let label = if draft.editing.is_some() {
+        "EDITAR NOTA"
     } else {
-        "Nova nota"
+        "NOVA NOTA"
     };
     let can_save = !draft.text.trim().is_empty();
-    let secondary = |label: &'static str, message: Message| {
-        button(text(label).size(13))
-            .padding(Padding::from([8, 12]))
-            .style(kiri::menu_item_style(t))
-            .on_press(message)
-    };
     container(
         column![
-            text(title).size(16),
+            text(label).size(10).color(t.muted),
+            container(Space::with_height(Length::Fixed(1.0)))
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(t.line)),
+                    ..container::Style::default()
+                }),
             text_input("Escreva a nota…", &draft.text)
                 .on_input(Message::NoteInput)
                 .on_submit(Message::NoteSave)
                 .width(Length::Fill),
             row![
                 Space::with_width(Length::Fill),
-                secondary("Cancelar", Message::NoteCancel),
-                button(text("Salvar").size(13))
+                button(text("Cancelar").size(13))
                     .padding(Padding::from([8, 12]))
-                    .style(kiri::menu_item_style(t))
+                    .style(kiri::hud_ghost_style(t))
+                    .on_press(Message::NoteCancel),
+                button(text("Salvar Nota").size(13))
+                    .padding(Padding::from([8, 12]))
+                    .style(kiri::hud_primary_style(t))
                     .on_press_maybe(can_save.then_some(Message::NoteSave)),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         ]
-        .spacing(12),
+        .spacing(10),
     )
     .width(Length::Fixed(440.0))
     .padding(16)
@@ -821,20 +975,20 @@ fn save_warning_layer(t: Tokens) -> Element<'static, Message> {
 /// Pergunta sim/não do aviso de assinatura; "Salvar mesmo assim" segue para o
 /// diálogo de destino.
 fn save_warning_card(t: Tokens) -> Element<'static, Message> {
-    let secondary = |label: &'static str, message: Message| {
-        button(text(label).size(13))
-            .padding(Padding::from([8, 12]))
-            .style(kiri::menu_item_style(t))
-            .on_press(message)
-    };
     container(
         column![
             text("Documento assinado").size(16),
             text("Salvar marcações invalida a assinatura digital. Continuar?").size(13),
             row![
                 Space::with_width(Length::Fill),
-                secondary("Voltar", Message::SaveCopyCancelled),
-                secondary("Salvar mesmo assim", Message::SaveCopyConfirmed),
+                button(text("Voltar").size(13))
+                    .padding(Padding::from([8, 12]))
+                    .style(kiri::hud_ghost_style(t))
+                    .on_press(Message::SaveCopyCancelled),
+                button(text("Salvar mesmo assim").size(13))
+                    .padding(Padding::from([8, 12]))
+                    .style(kiri::hud_primary_style(t))
+                    .on_press(Message::SaveCopyConfirmed),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -892,89 +1046,178 @@ fn progress(ready: &Ready, t: Tokens) -> Element<'static, Message> {
         .into()
 }
 
+/// Moldura tracejada da dropzone (Stitch). `Border` do iced não tem dash,
+/// então o retângulo vem do canvas — 1px `line`, traço 6/4.
+struct EmptyDash {
+    color: Color,
+}
+
+impl Program<Message> for EmptyDash {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        // Meio pixel para dentro: o traço de 1px cai na linha física.
+        let rect = Path::rectangle(
+            Point::new(0.5, 0.5),
+            Size::new(bounds.width - 1.0, bounds.height - 1.0),
+        );
+        frame.stroke(
+            &rect,
+            Stroke {
+                style: Style::Solid(self.color),
+                width: 1.0,
+                line_dash: LineDash {
+                    segments: &[6.0, 4.0],
+                    offset: 0,
+                },
+                ..Stroke::default()
+            },
+        );
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Estado vazio (Stitch): dropzone tracejada, grid de "Documentos recentes"
+/// e, abaixo, o navegador de pastas de sempre (o Stitch não o mostra, mas o
+/// comportamento fica — só discreto, sem título próprio).
 fn empty_browser(empty: &EmptyState, t: Tokens) -> Element<'_, Message> {
     let mut path_row = row![].spacing(6).align_y(Alignment::Center);
     if let Some(parent) = empty.parent() {
         path_row = path_row.push(tip(
             control(
                 t,
-                button(icon!(t, "chevron-left")).on_press(Message::BrowseTo(parent)),
+                button(kiri::ori!("chevron-left")).on_press(Message::BrowseTo(parent)),
             ),
             "Voltar",
         ));
     }
-    path_row = path_row.push(text(empty.path_label()).size(14));
+    path_row = path_row.push(text(empty.path_label()).size(14).color(t.muted));
 
     let mut listing = column![].spacing(4);
     if let Some(err) = &empty.listing_error {
-        listing = listing.push(text(err).size(13));
+        listing = listing.push(text(err).size(13).color(t.muted));
     } else if empty.listing.is_empty() {
-        listing = listing.push(text("Nenhuma pasta ou PDF aqui.").size(13));
+        listing = listing.push(text("Nenhuma pasta ou PDF aqui.").size(13).color(t.muted));
     } else {
         for entry in &empty.listing {
             listing = listing.push(entry_row(entry, t));
         }
     }
 
-    let mut recents = column![].spacing(4);
+    let mut recents = column![].spacing(10).width(Length::Fill);
     if empty.recents.is_empty() {
-        recents = recents.push(text("Nenhum arquivo recente.").size(13));
+        recents = recents.push(text("Nenhum arquivo recente.").size(13).color(t.muted));
     } else {
-        for path in &empty.recents {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            recents = recents.push(
-                container(
-                    control(
-                        t,
-                        button(
-                            row![icon!(t, "file-text"), text(name).size(14)]
-                                .spacing(8)
-                                .align_y(Alignment::Center),
-                        )
-                        .width(Length::Fill)
-                        .on_press(Message::OpenRecent(path.clone())),
-                    )
-                    .width(Length::Fill),
-                )
-                .width(Length::Fill)
-                .padding(12)
-                .style(kiri::recent_card_style(t)),
-            );
+        for chunk in empty.recents.chunks(3) {
+            let mut line = row![].spacing(10).width(Length::Fill);
+            for path in chunk {
+                line = line.push(empty_card(path, t));
+            }
+            // Espaços fecham a linha: 3 colunas de largura igual.
+            for _ in chunk.len()..3 {
+                line = line.push(Space::with_width(Length::Fill));
+            }
+            recents = recents.push(line);
         }
     }
 
-    column![
-        container(
-            column![
-                image(image::Handle::from_bytes(
-                    &include_bytes!("../../../public/tsuro-horizontal.png")[..],
-                ))
-                .width(Length::Fixed(200.0)),
-                text("Abra um PDF ou arraste para cá")
-                    .size(14)
-                    .color(t.muted),
-            ]
-            .spacing(8)
-            .align_x(Alignment::Center),
-        )
+    let header = row![
+        section_title("Documentos recentes", t),
+        container(text(empty.recents.len().to_string()).size(10).color(t.muted))
+            .padding(Padding::from([1, 6]))
+            .style(kiri::empty_badge_style(t)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let drop_h = 180.0;
+    let dropzone = container(
+        container(stack![
+            Canvas::new(EmptyDash { color: t.line })
+                .width(Length::Fill)
+                .height(Length::Fixed(drop_h)),
+            container(
+                column![
+                    image(image::Handle::from_bytes(
+                        &include_bytes!("../../../public/tsuro-horizontal.png")[..],
+                    ))
+                    .width(Length::Fixed(180.0)),
+                    text("Nenhum documento aberto").size(18),
+                    text("Arraste e solte um arquivo PDF aqui")
+                        .size(13)
+                        .color(t.muted),
+                    button(text("Abrir PDF").size(13))
+                        .padding(Padding::from([6, 14]))
+                        .style(kiri::hud_primary_style(t))
+                        .on_press(Message::PickFile),
+                ]
+                .spacing(10)
+                .align_x(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fixed(drop_h))
+            .center_x(Length::Fill)
+            .center_y(Length::Fixed(drop_h))
+            .padding(20),
+        ])
         .width(Length::Fill)
-        .center_x(Length::Fill)
-        .padding(Padding::from([16, 0])),
+        .max_width(560.0)
+        .style(kiri::empty_drop_style(t)),
+    )
+    .width(Length::Fill)
+    .center_x(Length::Fill);
+
+    column![
+        dropzone,
+        header,
+        scrollable(recents)
+            .width(Length::Fill)
+            .height(Length::FillPortion(2)),
         path_row,
         scrollable(listing)
             .width(Length::Fill)
             .height(Length::FillPortion(3)),
-        text("Últimos arquivos").size(16),
-        scrollable(recents)
-            .width(Length::Fill)
-            .height(Length::FillPortion(2)),
     ]
     .spacing(10)
     .width(Length::Fill)
     .height(Length::Fill)
+    .into()
+}
+
+/// Card de recente: ícone `file-text`, nome do arquivo e pasta-mãe — o único
+/// meta que o estado tem (sem tamanho, data ou páginas: não existem aqui).
+fn empty_card(path: &std::path::Path, t: Tokens) -> Element<'static, Message> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let mut info = column![text(name).size(13)].spacing(2);
+    if let Some(parent) = path.parent().and_then(|p| p.file_name()) {
+        info = info.push(text(parent.to_string_lossy().into_owned()).size(11).color(t.muted));
+    }
+    container(
+        button(
+            row![kiri::ori!("file-text"), info]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .padding(0)
+        .style(control_style(t, false))
+        .on_press(Message::OpenRecent(path.to_path_buf())),
+    )
+    .width(Length::Fill)
+    .padding(12)
+    .style(kiri::recent_card_style(t))
     .into()
 }
 
@@ -985,9 +1228,9 @@ fn entry_row(entry: &FsEntry, t: Tokens) -> Element<'static, Message> {
         Message::OpenRecent(entry.path.clone())
     };
     let glyph: Element<'static, Message> = if entry.is_dir {
-        icon!(t, "folder").into()
+        kiri::ori!("folder")
     } else {
-        icon!(t, "file-text").into()
+        kiri::ori!("file-text")
     };
     control(
         t,
@@ -1023,63 +1266,80 @@ fn ready_body(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     }
 }
 
+/// Painel de navegação (Stitch sidebar): cabeçalho `Navegação`, abas segmentadas
+/// Miniaturas | Sumário e lista virtualizada (miniaturas ou sumário).
 fn pages_panel(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    if ready.outline.is_some() && ready.outline_open {
-        outline_tab(ready, t)
-    } else {
-        thumbs_tab(ready, t)
-    }
-}
-
-/// Cabeçalho com abas Miniaturas | Sumário (só quando o PDF tem outline).
-fn panel_tabs(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    match &ready.outline {
-        None => section_title("Páginas", t),
-        Some(_) => row![
-            control_active(
-                t,
-                button(text("Miniaturas").size(12)).on_press(Message::OutlineTab(false)),
-                !ready.outline_open,
-            ),
-            control_active(
-                t,
-                button(text("Sumário").size(12)).on_press(Message::OutlineTab(true)),
-                ready.outline_open,
-            ),
+    let mut col = column![
+        column![
+            text("Navegação").size(13).color(t.ink),
+            text("Documento ativo").size(11).color(t.muted),
         ]
-        .spacing(4)
-        .into(),
+        .spacing(2),
+    ]
+    .spacing(8);
+    if ready.outline.is_some() {
+        col = col.push(panel_tabs(ready, t));
     }
+    if ready.outline.is_some() && ready.outline_open {
+        col = col.push(outline_tab(ready, t));
+    } else {
+        col = col.push(thumbs_tab(ready, t));
+    }
+    container(col.width(Length::Fill).height(Length::Fill))
+        .width(Length::Fixed(PAGES_PANEL_W))
+        .height(Length::Fill)
+        .padding(6)
+        .style(kiri::panel_bg_style(t))
+        .into()
 }
 
-/// Aba Sumário: árvore clicável com expandir/colapsar e destaque da ativa.
+/// Controle segmentado Miniaturas | Sumário (só quando o PDF tem outline).
+fn panel_tabs(ready: &Ready, t: Tokens) -> Element<'_, Message> {
+    let seg = |label: &'static str, active: bool, msg: Message| {
+        button(text(label).size(12))
+            .width(Length::Fill)
+            .padding(Padding::from([5, 8]))
+            .style(kiri::panel_seg_style(t, active))
+            .on_press(msg)
+    };
+    container(
+        row![
+            seg("Miniaturas", !ready.outline_open, Message::OutlineTab(false)),
+            seg("Sumário", ready.outline_open, Message::OutlineTab(true)),
+        ],
+    )
+    .padding(Padding::from(2))
+    .style(kiri::panel_seg_track_style(t))
+    .into()
+}
+
+/// Aba Sumário: árvore clicável com expandir/colapsar (body-md + indent) e
+/// destaque da ativa.
 fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let active = ready.outline_active();
-    let mut col = column![panel_tabs(ready, t)].spacing(8);
+    let mut col = column![].spacing(2);
     for (path, depth, title, page, has_children) in ready.outline_rows() {
         let is_active = active.as_ref() == Some(&path);
         let fold: Element<'_, Message> = if has_children {
             let collapsed = ready.outline_collapsed.contains(&path);
-            button(text(if collapsed { "▸" } else { "▾" }).size(12))
-                .padding(Padding::from([4, 6]))
-                .style(kiri::menu_item_style(t))
+            button(text(if collapsed { "▸" } else { "▾" }).size(11))
+                .padding(Padding::from([3, 5]))
+                .style(kiri::panel_fold_style(t))
                 .on_press(Message::OutlineFold(path.clone()))
                 .into()
         } else {
             Space::with_width(Length::Fixed(24.0)).into()
         };
         let label = format!("{} · {}", outline_title(title), page.index() + 1);
-        let entry = control_active(
-            t,
-            button(
-                text(label)
-                    .size(12)
-                    .color(if is_active { t.accent } else { t.ink }),
-            )
-            .width(Length::Fill)
-            .on_press(Message::OutlineJump(page)),
-            is_active,
-        );
+        let entry = button(
+            text(label)
+                .size(12)
+                .color(if is_active { t.accent } else { t.ink }),
+        )
+        .width(Length::Fill)
+        .padding(Padding::from([4, 6]))
+        .style(kiri::panel_toc_item_style(t, is_active))
+        .on_press(Message::OutlineJump(page));
         col = col.push(
             row![
                 Space::with_width(Length::Fixed(depth as f32 * 12.0)),
@@ -1093,7 +1353,7 @@ fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     scrollable(col)
         .id(pages_scroll_id())
         .on_scroll(|viewport| Message::PagesScrolled(viewport.absolute_offset().y))
-        .width(Length::Fixed(156.0))
+        .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
@@ -1117,7 +1377,7 @@ fn thumbs_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let window = ready.thumb_page_window();
     let start = window.first().map(|page| page.index()).unwrap_or(0);
     let end = window.last().map(|page| page.index() + 1).unwrap_or(0);
-    let mut col = column![panel_tabs(ready, t)].spacing(8);
+    let mut col = column![].spacing(8);
     if start > 0 {
         col = col.push(Space::with_height(Length::Fixed(start as f32 * THUMB_ROW)));
     }
@@ -1127,22 +1387,11 @@ fn thumbs_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             Some(surface) => image(surface.image.clone())
                 .width(Length::Fixed(120.0))
                 .into(),
-            None => container(text("…").size(13))
-                .width(Length::Fixed(120.0))
-                .height(Length::Fixed(150.0))
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(t.elevated)),
-                    border: Border {
-                        color: t.line,
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    text_color: Some(t.ink),
-                    ..container::Style::default()
-                })
-                .into(),
+            None => container(
+                Space::new(Length::Fixed(120.0), Length::Fixed(150.0)),
+            )
+            .style(kiri::panel_thumb_frame_style(t))
+            .into(),
         };
         let active = ready.visible == page;
         col = col.push(
@@ -1150,18 +1399,17 @@ fn thumbs_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
                 t,
                 button(
                     column![
-                        // Borda 2px sempre (transparente fora da ativa) — sem shift de layout.
-                        container(preview)
-                            .padding(0)
-                            .style(move |_| container::Style {
-                                border: Border {
-                                    color: if active { t.accent } else { Color::TRANSPARENT },
-                                    width: 2.0,
-                                    radius: 4.0.into(),
-                                },
-                                ..container::Style::default()
-                            }),
-                        text(format!("{}", i + 1)).size(12)
+                        // Halo 2px `accent` na ativa (transparente fora) + gap 2px —
+                        // borda sempre ocupando o mesmo espaço, sem shift de layout.
+                        container(
+                            container(preview).style(kiri::panel_thumb_frame_style(t)),
+                        )
+                        .padding(2)
+                        .style(kiri::panel_thumb_style(t, active)),
+                        text(format!("Pág. {}", i + 1))
+                            .size(11)
+                            .font(iced::Font::MONOSPACE)
+                            .color(if active { t.accent } else { t.muted }),
                     ]
                     .spacing(4)
                     .align_x(Alignment::Center),
@@ -1181,7 +1429,7 @@ fn thumbs_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     scrollable(col)
         .id(pages_scroll_id())
         .on_scroll(|viewport| Message::PagesScrolled(viewport.absolute_offset().y))
-        .width(Length::Fixed(PAGES_PANEL_W))
+        .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
@@ -1225,7 +1473,8 @@ fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             left: DOC_PAD_X,
         })
         .style(move |_| container::Style {
-            background: Some(Background::Color(t.surface)),
+            // Canvas do documento: mesmo fundo da janela (Stitch Layer 0).
+            background: Some(Background::Color(t.bg)),
             ..container::Style::default()
         }),
     )
@@ -1276,7 +1525,7 @@ fn doc_cell(ready: &Ready, page: PageNo, cw: f32, t: Tokens) -> Element<'_, Mess
                 .width(Length::Fill)
                 .height(Length::Fixed(h))
                 .center_x(Length::Fill)
-                .center_y(Length::Fill)
+                .align_y(Alignment::Center)
                 .into()
         }
     };
@@ -1296,7 +1545,8 @@ fn doc_cell(ready: &Ready, page: PageNo, cw: f32, t: Tokens) -> Element<'_, Mess
         left: DOC_PAD_X,
     })
     .style(move |_| container::Style {
-        background: Some(Background::Color(t.surface)),
+        // Canvas do documento: mesmo fundo da janela (Stitch Layer 0).
+        background: Some(Background::Color(t.bg)),
         ..container::Style::default()
     })
     .into()
@@ -1555,7 +1805,7 @@ fn signatures_panel(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     if ready.signatures.signatures.is_empty() {
         col = col.push(
             text("Nenhuma assinatura neste arquivo.")
-                .size(13)
+                .size(12)
                 .color(t.muted),
         );
     } else {
@@ -1568,47 +1818,37 @@ fn signatures_panel(ready: &Ready, t: Tokens) -> Element<'_, Message> {
                     .as_ref()
                     .and_then(|c| c.common_name.as_deref()))
                 .unwrap_or("Assinante");
-            let dot = kiri::status_color(t, sig.status);
+            // Mesmo veredito do escudo da toolbar (status_dot_color).
+            let dot = kiri::status_dot_color(t, std::iter::once(sig.status))
+                .unwrap_or(t.muted);
             col = col.push(
                 container(
                     column![
-                        row![status_dot(dot), text(name).size(14).color(t.ink),]
+                        row![status_dot(dot), text(name).size(13).color(t.ink),]
                             .spacing(8)
                             .align_y(Alignment::Center),
-                        text(status_label(sig.status)).size(13).color(t.ink),
-                        text(&sig.status_detail).size(12).color(t.muted),
+                        text(status_label(sig.status)).size(12).color(t.ink),
+                        text(&sig.status_detail).size(11).color(t.muted),
                     ]
                     .spacing(4),
                 )
                 .width(Length::Fill)
                 .padding(12)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(t.elevated)),
-                    border: Border {
-                        color: t.line,
-                        width: 1.0,
-                        radius: 8.0.into(),
-                    },
-                    text_color: Some(t.ink),
-                    ..container::Style::default()
-                }),
+                .style(kiri::panel_card_style(t)),
             );
         }
     }
     container(scrollable(col).height(Length::Fill))
         .width(Length::Fixed(SIG_PANEL_W))
         .height(Length::Fill)
-        .padding(Padding::from([4, 0]))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(t.bg)),
-            ..container::Style::default()
-        })
+        .padding(6)
+        .style(kiri::panel_bg_style(t))
         .into()
 }
 
-/// Título de seção de painel: 12px, maiúsculas, `muted`.
+/// Título de seção de painel: label-caps 10px, maiúsculas, `muted`.
 fn section_title(label: &'static str, t: Tokens) -> Element<'static, Message> {
-    text(label.to_uppercase()).size(12).color(t.muted).into()
+    text(label.to_uppercase()).size(10).color(t.muted).into()
 }
 
 /// Dot 8px de status (cartões de assinatura).

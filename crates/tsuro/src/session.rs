@@ -5707,4 +5707,149 @@ mod tests {
         };
         assert!(ready.save_status.is_none());
     }
+    #[test]
+    fn zoom_out_to_min_renders_and_views_every_step() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        let mut current = 1.0f32;
+        for step in 0..40 {
+            current /= 1.1;
+            apply(
+                &mut session,
+                Message::SetZoom(Zoom::Manual(ZoomFactor::new(current))),
+            );
+            let (page, scale, doc_gen, render_gen, surface) = {
+                let Session::Ready(ready) = &session else {
+                    panic!("sessao saiu de Ready no passo {step}");
+                };
+                let Zoom::Manual(z) = ready.zoom else {
+                    panic!("zoom trocado sozinho no passo {step}");
+                };
+                assert!(z.get() >= 0.25, "clamp furou: {}", z.get());
+                let page = ready.visible;
+                let scale = ready.page_scale(page);
+                let surface = crate::page::PageEngine::render(&ready.engine, page, scale, 0)
+                    .expect("render real falhou");
+                assert!(surface.bitmap.width > 0 && surface.bitmap.height > 0);
+                assert_eq!(
+                    surface.bitmap.rgba.len(),
+                    surface.bitmap.width as usize * surface.bitmap.height as usize * 4
+                );
+                (page, scale, ready.open_gen, ready.render_gen, surface)
+            };
+            apply(
+                &mut session,
+                Message::Rendered {
+                    page,
+                    scale,
+                    rotation: 0,
+                    doc_gen,
+                    render_gen,
+                    surface: Some(surface),
+                },
+            );
+            let _ = session.view();
+        }
+    }
+    #[test]
+    fn stale_and_failed_renders_recover_on_next_zoom() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        let gen0 = match &session {
+            Session::Ready(r) => r.render_gen,
+            _ => unreachable!(),
+        };
+        // Rajada de zoom-out sem alimentar completions (inflight acumula).
+        let mut current = 1.0f32;
+        for _ in 0..10 {
+            current /= 1.1;
+            apply(
+                &mut session,
+                Message::SetZoom(Zoom::Manual(ZoomFactor::new(current))),
+            );
+            let _ = session.view();
+        }
+        let (page, doc_gen, render_gen) = match &session {
+            Session::Ready(r) => (r.visible, r.open_gen, r.render_gen),
+            _ => panic!("saiu de Ready na rajada"),
+        };
+        assert!(render_gen > gen0);
+        // Completion velha (gen antiga, escala errada): tem que ignorar.
+        apply(
+            &mut session,
+            Message::Rendered {
+                page,
+                scale: Scale::from_factor(9.0),
+                rotation: 0,
+                doc_gen,
+                render_gen: gen0,
+                surface: Some(fake_surface(page, Scale::from_factor(9.0))),
+            },
+        );
+        let _ = session.view();
+        // Falha na gen atual: marca failed, nao quebra.
+        let scale_now = match &session {
+            Session::Ready(r) => r.page_scale(page),
+            _ => panic!("saiu de Ready"),
+        };
+        apply(
+            &mut session,
+            Message::Rendered {
+                page,
+                scale: scale_now,
+                rotation: 0,
+                doc_gen,
+                render_gen,
+                surface: None,
+            },
+        );
+        let _ = session.view();
+        // Zoom novo (nova chave) + render real: recupera com superficie.
+        apply(
+            &mut session,
+            Message::SetZoom(Zoom::Manual(ZoomFactor::new(0.5))),
+        );
+        let (scale2, dg2, rg2, surface) = match &session {
+            Session::Ready(r) => {
+                let s = r.page_scale(page);
+                let surf = crate::page::PageEngine::render(&r.engine, page, s, 0)
+                    .expect("render real falhou");
+                (s, r.open_gen, r.render_gen, surf)
+            }
+            _ => panic!("saiu de Ready"),
+        };
+        apply(
+            &mut session,
+            Message::Rendered {
+                page,
+                scale: scale2,
+                rotation: 0,
+                doc_gen: dg2,
+                render_gen: rg2,
+                surface: Some(surface),
+            },
+        );
+        let Session::Ready(r) = &session else {
+            panic!("saiu de Ready na recuperacao");
+        };
+        assert!(
+            r.surface(page, scale2).is_some(),
+            "sem superficie apos recuperar"
+        );
+        let _ = session.view();
+    }
+    #[test]
+    fn continuous_placeholders_do_not_panic_scrollable() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        let _ = session.view();
+        apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
+        let _ = session.view();
+    }
 }
