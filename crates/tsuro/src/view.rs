@@ -1525,7 +1525,7 @@ fn doc_cell(ready: &Ready, page: PageNo, cw: f32, t: Tokens) -> Element<'_, Mess
                 .width(Length::Fill)
                 .height(Length::Fixed(h))
                 .center_x(Length::Fill)
-                .center_y(Length::Fill)
+                .align_y(Alignment::Center)
                 .into()
         }
     };
