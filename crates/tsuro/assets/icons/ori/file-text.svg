@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+  <!-- Ori · file-text · Tsuro -->
+  <path fill="#3a9d95" d="M6 10h14v12H6z"/>
+  <path fill="#5ec9c1" d="M6 2h8l6 6v2H6z"/>
+  <path fill="#247870" d="M14 2l6 6h-6z"/>
+  <path fill="#5ec9c1" d="M10 14.5h8v1.5H10zM10 18h4.5v1.5H10z"/>
+  <path stroke="#1a5c56" stroke-width=".65" stroke-linejoin="round" d="M6 2h8l6 6v14H6zM14 2v6h6"/>
+</svg>
