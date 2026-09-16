@@ -1,10 +1,12 @@
+use iced::advanced::widget::operation::{Focusable, Operation};
+use iced::advanced::widget::{operate, Id as WidgetId};
 use iced::widget::canvas::event::{Event as CanvasEvent, Status as CanvasStatus};
 use iced::widget::canvas::{Frame, Geometry, LineDash, Path, Program, Stroke, Style};
 use iced::widget::{
     button, column, container, image, mouse_area, pick_list, row, scrollable, stack, text,
-    text_input, tooltip, Canvas, Space,
+    text_editor, text_input, tooltip, Canvas, Space,
 };
-use iced::{mouse, Alignment, Background, Border, Color, Element, Length, Padding, Point};
+use iced::{mouse, Alignment, Background, Border, Color, Element, Length, Padding, Point, Task};
 use iced::{Rectangle, Size};
 use tsuro_sign::SignatureStatus;
 
@@ -13,9 +15,9 @@ use crate::kiri::{self, Theme, Tokens};
 use crate::page::{MediaBox, PageNo};
 use crate::print::{PrintOrientation, MAX_COPIES};
 use crate::session::{
-    display_rect, page_pt_at, AnnotKind, Message, NavCmd, NoteDraft, PrintDialog, RangeMode, Ready,
-    Session, Tabs, ViewMode, Zoom, ZoomFactor, DOC_GAP, DOC_PAD_BOTTOM, DOC_PAD_TOP, DOC_PAD_X,
-    PAGES_PANEL_W, SIG_PANEL_W, THUMB_ROW,
+    display_pt, display_rect, marker_side, page_pt_at, AnnotKind, Message, NavCmd, NoteDraft,
+    OpenSource, PrintDialog, RangeMode, Ready, Session, Tabs, ViewMode, Zoom, ZoomFactor, DOC_GAP,
+    DOC_PAD_BOTTOM, DOC_PAD_TOP, DOC_PAD_X, PAGES_PANEL_W, SIG_PANEL_W, THUMB_ROW,
 };
 
 /// Altura do chrome Kiri: toolbar 36px + progresso 2px + respiro.
@@ -23,6 +25,21 @@ pub const CHROME_HEIGHT: f32 = 46.0;
 
 /// Altura da faixa de abas (issue #40), reservada só com 2+ documentos.
 pub const TAB_STRIP_HEIGHT: f32 = 30.0;
+
+/// Papel do post-it (issue #30): amarelo fixo, como o marcador nota do
+/// canvas — papel não segue o tema e a tinta escura lê nos dois.
+const STICKY: Color = Color::from_rgb(0.99, 0.80, 0.20);
+/// Tinta sobre o papel (marcador, rótulo, texto e botões do post-it).
+const STICKY_INK: Color = Color::from_rgb(0.42, 0.30, 0.02);
+/// Borda do papel (um tom abaixo do fundo).
+const STICKY_LINE: Color = Color::from_rgb(0.80, 0.62, 0.10);
+/// Post-it: largura, altura do cartão (posição presa por ela) e altura do
+/// campo de texto. A altura do cartão é a do conteúdo montado abaixo
+/// (rótulo + editor + rodapé + paddings), só para prender a posição.
+const POSTIT_W: f32 = 320.0;
+const POSTIT_H: f32 = 210.0;
+const POSTIT_EDITOR_H: f32 = 112.0;
+
 pub fn pages_scroll_id() -> scrollable::Id {
     scrollable::Id::new("tsuro-pages")
 }
@@ -84,10 +101,11 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
             let dialog = ready.print_dialog.as_ref().expect("checked above");
             stack![main, print_layer(ready, dialog, t)].into()
         }
-        // Popover de nota (issue #30): captura tudo, como o modal de impressão.
+        // Post-it (issue #30): editor ancorado no trecho da nota. Sem modal
+        // centrado — só o fundo escurece e cancela no clique (como o de
+        // impressão), que também captura os cliques de fora.
         Session::Ready(ready) if ready.note_draft.is_some() => {
-            let draft = ready.note_draft.as_ref().expect("checked above");
-            stack![main, note_layer(draft, t)].into()
+            stack![main, note_layer(ready, t)].into()
         }
         // Aviso de documento assinado (⋯ → Salvar cópia): captura tudo.
         Session::Ready(ready) if ready.save_warning => stack![main, save_warning_layer(t)].into(),
@@ -898,9 +916,16 @@ fn print_footer(dialog: &PrintDialog, t: Tokens) -> Element<'static, Message> {
     .into()
 }
 
-/// Popover de nota (issue #30): mesmo padrão do modal de impressão — fundo
-/// escurece e cancela no clique, cartão engole o clique (`PrintNop` é no-op).
-fn note_layer(draft: &NoteDraft, t: Tokens) -> Element<'_, Message> {
+/// Post-it (issue #30): o editor abre ancorado no trecho da nota, não no
+/// centro da janela — o rascunho guarda o canto (origem da folha no clique +
+/// rolagem) e a vista o desenha ali, preso à janela. Mesmo padrão do modal de
+/// impressão: o fundo escurece e cancela no clique, o cartão engole o clique
+/// (`PrintNop` é no-op) e o editor dentro dele recebe os eventos primeiro.
+fn note_layer(ready: &Ready, t: Tokens) -> Element<'_, Message> {
+    let Some(draft) = ready.note_draft.as_ref() else {
+        return Space::with_width(Length::Fill).into();
+    };
+    let [x, y] = ready.postit_pos([POSTIT_W, POSTIT_H]);
     let dim = container(Space::with_width(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
@@ -911,53 +936,125 @@ fn note_layer(draft: &NoteDraft, t: Tokens) -> Element<'_, Message> {
     let card = container(mouse_area(note_card(draft, t)).on_press(Message::PrintNop))
         .width(Length::Fill)
         .height(Length::Fill)
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center);
+        .align_x(Alignment::Start)
+        .align_y(Alignment::Start)
+        .padding(Padding {
+            top: y,
+            right: 0.0,
+            bottom: 0.0,
+            left: x,
+        });
     stack![mouse_area(dim).on_press(Message::NoteCancel), card,].into()
 }
 
-/// Popover de nota (Stitch): rótulo caps + campo + `Cancelar` ghost e
-/// `Salvar Nota` primária. O rótulo diz se cria ou edita.
+/// Cartão do post-it: rótulo caps + editor multilinha + rodapé com o vermelho
+/// `remover nota` (só em edição), `Cancelar` ghost e `Salvar` primária. Texto
+/// escuro fixo: o papel é amarelo em qualquer tema.
 fn note_card(draft: &NoteDraft, t: Tokens) -> Element<'_, Message> {
-    let label = if draft.editing.is_some() {
-        "EDITAR NOTA"
-    } else {
-        "NOVA NOTA"
-    };
-    let can_save = !draft.text.trim().is_empty();
+    let editing = draft.editing.is_some();
+    let can_save = !draft.content.text().trim().is_empty();
+    let mut footer = row![].spacing(8).align_y(Alignment::Center);
+    if editing {
+        footer = footer.push(
+            button(text("remover nota").size(13))
+                .padding(Padding::from([8, 12]))
+                .style(sticky_button_style(t.danger))
+                .on_press(Message::NoteDelete),
+        );
+    }
     container(
         column![
-            text(label).size(10).color(t.muted),
+            text(if editing { "EDITAR NOTA" } else { "NOVA NOTA" })
+                .size(10)
+                .color(STICKY_INK),
             container(Space::with_height(Length::Fixed(1.0)))
                 .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(t.line)),
+                .style(|_| container::Style {
+                    background: Some(Background::Color(STICKY_LINE)),
                     ..container::Style::default()
                 }),
-            text_input("Escreva a nota…", &draft.text)
-                .on_input(Message::NoteInput)
-                .on_submit(Message::NoteSave)
-                .width(Length::Fill),
-            row![
-                Space::with_width(Length::Fill),
-                button(text("Cancelar").size(13))
-                    .padding(Padding::from([8, 12]))
-                    .style(kiri::hud_ghost_style(t))
-                    .on_press(Message::NoteCancel),
-                button(text("Salvar Nota").size(13))
-                    .padding(Padding::from([8, 12]))
-                    .style(kiri::hud_primary_style(t))
-                    .on_press_maybe(can_save.then_some(Message::NoteSave)),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+            text_editor(&draft.content)
+                .placeholder("Escreva a nota…")
+                .on_action(Message::NoteEdit)
+                .padding(6)
+                .size(13)
+                .height(Length::Fixed(POSTIT_EDITOR_H))
+                .style(sticky_editor_style),
+            footer
+                .push(Space::with_width(Length::Fill))
+                .push(
+                    button(text("Cancelar").size(13))
+                        .padding(Padding::from([8, 12]))
+                        .style(sticky_button_style(STICKY_INK))
+                        .on_press(Message::NoteCancel),
+                )
+                .push(
+                    button(text("Salvar").size(13))
+                        .padding(Padding::from([8, 12]))
+                        .style(kiri::hud_primary_style(t))
+                        .on_press_maybe(can_save.then_some(Message::NoteSave)),
+                ),
         ]
-        .spacing(10),
+        .spacing(8),
     )
-    .width(Length::Fixed(440.0))
-    .padding(16)
-    .style(kiri::menu_style(t))
+    .width(Length::Fixed(POSTIT_W))
+    .padding(12)
+    .style(sticky_style)
     .into()
+}
+
+/// Papel do post-it: fundo amarelo, borda discreta e sombra de papel solto
+/// (o cartão flutua sobre a folha, então precisa descolar dela).
+fn sticky_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(STICKY)),
+        border: Border {
+            color: STICKY_LINE,
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+            offset: iced::Vector::new(0.0, 4.0),
+            blur_radius: 16.0,
+        },
+        text_color: Some(STICKY_INK),
+        ..container::Style::default()
+    }
+}
+
+/// Botão de texto sobre o papel (ghost): sem fundo, tinta da cor pedida —
+/// `t.danger` no `remover nota`, a tinta do papel no `Cancelar`.
+fn sticky_button_style(color: Color) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let interactive = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if interactive {
+                Color::from_rgba(0.0, 0.0, 0.0, 0.10)
+            } else {
+                Color::TRANSPARENT
+            })),
+            text_color: color,
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            shadow: iced::Shadow::default(),
+        }
+    }
+}
+
+/// Editor sobre o papel: fundo do próprio papel (sem caixa branca), tinta
+/// escura e cursor/seleção legíveis no amarelo.
+fn sticky_editor_style(_theme: &iced::Theme, _status: text_editor::Status) -> text_editor::Style {
+    text_editor::Style {
+        background: Background::Color(STICKY),
+        border: Border::default(),
+        icon: STICKY_INK,
+        placeholder: Color::from_rgba(STICKY_INK.r, STICKY_INK.g, STICKY_INK.b, 0.55),
+        value: STICKY_INK,
+        selection: Color::from_rgba(0.42, 0.30, 0.02, 0.25),
+    }
 }
 
 /// Aviso de documento assinado antes de salvar a cópia (⋯ → Salvar cópia):
@@ -1548,6 +1645,10 @@ fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             ..container::Style::default()
         }),
     )
+    .id(doc_scroll_id())
+    // A rolagem do modo página também entra no estado: o post-it aberto segue
+    // a folha (a âncora é janela, a rolagem é o delta).
+    .on_scroll(|viewport| Message::DocScrolled(viewport.absolute_offset().y))
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
@@ -1631,6 +1732,9 @@ struct DrawMark {
     h: f32,
     kind: Option<AnnotKind>,
     marker: bool,
+    /// Candidato do arrasto de nota: contorno claro pontilhado (o original
+    /// segue sólido até o soltar).
+    ghost: bool,
 }
 
 /// Camada transparente sobre a folha (issue #30): desenha marcações/seleção
@@ -1677,6 +1781,9 @@ impl Program<Message> for MarkLayer {
                             Some(Message::PointerDown {
                                 page: self.page,
                                 page_pt: page_pt(at),
+                                // Canto da folha na janela: a sessão não vê o
+                                // layout, e o post-it nasce ancorado nele.
+                                sheet: [bounds.x, bounds.y],
                             }),
                         )
                     }
@@ -1716,7 +1823,9 @@ impl Program<Message> for MarkLayer {
                             page_pt: page_pt(at),
                         }),
                     ),
-                    None => (CanvasStatus::Ignored, None),
+                    // Solta fora da folha: cancela (sem Up, a âncora do press
+                    // e o arrasto de nota ficariam presos).
+                    None => (CanvasStatus::Ignored, Some(Message::DragCancelled)),
                 }
             }
             _ => (CanvasStatus::Ignored, None),
@@ -1732,15 +1841,35 @@ impl Program<Message> for MarkLayer {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, self.size);
+        // Traço do ghost: o mesmo para todos (fatia estática).
+        const GHOST_DASH: [f32; 2] = [6.0, 4.0];
         for m in &self.marks {
             let rect = Path::rectangle(Point::new(m.x, m.y), Size::new(m.w, m.h));
-            // Nota: amarelo fixo — a folha é sempre branca, o tema não se aplica.
-            if m.marker {
-                frame.fill(&rect, Color::from_rgb(0.99, 0.80, 0.20));
+            // Ghost do arrasto de nota: contorno claro pontilhado — a nota
+            // fica onde está até o soltar.
+            if m.ghost {
+                frame.fill(&rect, Color::from_rgba(0.99, 0.80, 0.20, 0.25));
                 frame.stroke(
                     &rect,
                     Stroke {
-                        style: Style::Solid(Color::from_rgb(0.42, 0.30, 0.02)),
+                        style: Style::Solid(STICKY),
+                        width: 1.5,
+                        line_dash: LineDash {
+                            segments: &GHOST_DASH,
+                            offset: 0,
+                        },
+                        ..Stroke::default()
+                    },
+                );
+                continue;
+            }
+            // Nota: amarelo fixo — a folha é sempre branca, o tema não se aplica.
+            if m.marker {
+                frame.fill(&rect, STICKY);
+                frame.stroke(
+                    &rect,
+                    Stroke {
+                        style: Style::Solid(STICKY_INK),
                         width: 1.0,
                         ..Stroke::default()
                     },
@@ -1801,6 +1930,35 @@ impl Program<Message> for MarkLayer {
     }
 }
 
+/// Foca o editor do post-it recém-aberto (autofocus): o `text_editor` do iced
+/// não expõe `Id`, então `operation::focus` não o alcança — aqui o alvo é o
+/// único campo focável sem id (e os demais perdem o foco, como no `focus`).
+/// A operação roda no quadro seguinte, sobre a árvore que já tem o post-it.
+pub fn focus_postit() -> Task<Message> {
+    struct FocusEditor;
+
+    impl Operation<Message> for FocusEditor {
+        fn focusable(&mut self, state: &mut dyn Focusable, id: Option<&WidgetId>) {
+            if id.is_none() {
+                state.focus();
+            } else {
+                state.unfocus();
+            }
+        }
+
+        fn container(
+            &mut self,
+            _id: Option<&WidgetId>,
+            _bounds: Rectangle,
+            operate_on_children: &mut dyn FnMut(&mut dyn Operation<Message>),
+        ) {
+            operate_on_children(self);
+        }
+    }
+
+    operate(FocusEditor)
+}
+
 /// Folha com overlay: imagem em tamanho fixo + canvas transparente da mesma
 /// medida (view e canvas dividem `cw`/`ch`, então o mapeamento alinha).
 fn with_marks<'a>(
@@ -1825,6 +1983,7 @@ fn with_marks<'a>(
                     h,
                     kind: None,
                     marker: false,
+                    ghost: false,
                 });
             }
         }
@@ -1839,19 +1998,46 @@ fn with_marks<'a>(
                 h,
                 kind: Some(a.kind),
                 marker: false,
+                ghost: false,
             });
-            // Nota: marcador compacto na origem do primeiro quad.
+            // Nota: marcador compacto — na origem do primeiro quad ou onde o
+            // arrasto o deixou (`Annotation::marker`); o trecho não se move.
             if a.kind == AnnotKind::Note && i == 0 {
-                let side = h.clamp(6.0, 14.0);
+                let side = marker_side(&a.quads, media, ready.view_rotation, cw, ch);
+                let [mx, my] = display_pt(
+                    a.marker_pt(),
+                    media,
+                    ready.view_rotation,
+                    cw,
+                    ch,
+                );
                 marks.push(DrawMark {
-                    x,
-                    y,
+                    x: mx,
+                    y: my,
                     w: side,
                     h: side,
                     kind: Some(AnnotKind::Note),
                     marker: true,
+                    ghost: false,
                 });
             }
+        }
+    }
+    // Marcador arrastado: ghost = só o ícone, em contorno pontilhado claro, na
+    // posição candidata (o marcador sólido fica onde está até o soltar).
+    if let Some((id, marker_pt)) = ready.note_drag_ghost(page) {
+        if let Some(note) = ready.annotations.iter().find(|a| a.id == id) {
+            let side = marker_side(&note.quads, media, ready.view_rotation, cw, ch);
+            let [x, y] = display_pt(marker_pt, media, ready.view_rotation, cw, ch);
+            marks.push(DrawMark {
+                x,
+                y,
+                w: side,
+                h: side,
+                kind: Some(AnnotKind::Note),
+                marker: true,
+                ghost: true,
+            });
         }
     }
     let layer = MarkLayer {

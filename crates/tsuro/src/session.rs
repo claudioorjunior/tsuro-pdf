@@ -5,7 +5,7 @@ use std::sync::Arc;
 use iced::clipboard;
 use iced::event::{self, Event};
 use iced::keyboard::{self, key::Named, Key};
-use iced::widget::{image, scrollable};
+use iced::widget::{image, scrollable, text_editor};
 use iced::window;
 use iced::Task;
 use tsuro_sign::{analyze_pdf, PdfAnalysis};
@@ -379,6 +379,74 @@ pub(crate) fn page_pt_at(
     }
 }
 
+/// Respiro entre o marcador da nota e o post-it (px CSS).
+pub(crate) const POSTIT_GAP: f32 = 6.0;
+/// Margem mínima do post-it dentro da janela (px CSS).
+pub(crate) const POSTIT_MARGIN: f32 = 8.0;
+/// Arrasto de nota só vale depois disto (px CSS): abaixo disso é clique
+/// (abre a edição), como o clique-vs-arrasto da seleção.
+const NOTE_DRAG_MIN_PX: f32 = 4.0;
+
+/// Prende o post-it à janela: com o tamanho dado, o canto nunca sai da tela
+/// nem cola na borda (nota perto do limite abre deslocada para dentro).
+pub(crate) fn clamp_postit(pos: [f32; 2], size: [f32; 2], window: [f32; 2]) -> [f32; 2] {
+    let axis = |p: f32, s: f32, w: f32| {
+        let hi = (w - s - POSTIT_MARGIN).max(POSTIT_MARGIN);
+        p.clamp(POSTIT_MARGIN, hi)
+    };
+    [axis(pos[0], size[0], window[0]), axis(pos[1], size[1], window[1])]
+}
+
+/// Lado mínimo/máximo do marcador compacto da nota (px CSS).
+pub(crate) const NOTE_MARKER_MIN_PX: f32 = 6.0;
+pub(crate) const NOTE_MARKER_MAX_PX: f32 = 14.0;
+/// Folga de clique em volta do marcador (px CSS).
+const NOTE_MARKER_HIT_PAD: f32 = 2.0;
+
+/// Ponto da mídia original (espaço PDF, Y para cima) → ponto exibido (px CSS,
+/// Y para baixo): a conta de `display_rect` para um ponto (o inverso de
+/// `page_pt_at`). É o que alinha o marcador desenhado com o seu hit-test.
+pub(crate) fn display_pt(pt: [f32; 2], media: MediaBox, rotation: u8, dw: f32, dh: f32) -> [f32; 2] {
+    let [x, y, _, _] = display_rect(
+        Quad::from_rect(pt[0], pt[1], pt[0], pt[1]),
+        media,
+        rotation,
+        dw,
+        dh,
+    );
+    [x, y]
+}
+
+/// Lado do marcador compacto da nota (px CSS): o `clamp` da altura do
+/// primeiro quad — desenho e hit-test saem daqui, então coincidem.
+pub(crate) fn marker_side(quads: &[Quad], media: MediaBox, rotation: u8, dw: f32, dh: f32) -> f32 {
+    quads
+        .first()
+        .map(|q| display_rect(*q, media, rotation, dw, dh)[3].clamp(NOTE_MARKER_MIN_PX, NOTE_MARKER_MAX_PX))
+        .unwrap_or(NOTE_MARKER_MIN_PX)
+}
+
+/// Canto do marcador para um trecho sem nota ainda (default: origem do
+/// primeiro quad) — o mesmo que `Annotation::marker_pt` com `marker: None`.
+pub(crate) fn derived_marker_pt(quads: &[Quad]) -> [f32; 2] {
+    quads
+        .first()
+        .map(|q| {
+            let (left, _, _, top) = quad_bbox(*q);
+            [left, top]
+        })
+        .unwrap_or([0.0, 0.0])
+}
+
+/// Prende o marcador à página: o deslocamento do arrasto para na mídia (mover
+/// é sempre dentro de uma página).
+pub(crate) fn clamped_marker_pt(pt: [f32; 2], media: MediaBox) -> [f32; 2] {
+    [
+        pt[0].clamp(0.0, media.width.max(1.0)),
+        pt[1].clamp(0.0, media.height.max(1.0)),
+    ]
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Hit {
     pub page: PageNo,
@@ -427,6 +495,21 @@ pub struct Annotation {
     pub kind: AnnotKind,
     /// Texto da nota ("" para highlight/underline/strikeout).
     pub text: String,
+    /// Canto do marcador da nota (espaço de página, mesma página), quando ele
+    /// foi arrastado para fora do trecho; `None` = na origem do primeiro quad.
+    /// O trecho (`quads`/`range`) nunca se move: só o ícone amarelo anda.
+    pub marker: Option<[f32; 2]>,
+}
+
+impl Annotation {
+    /// Canto superior esquerdo do marcador no espaço de página: o dele
+    /// (`marker`) ou a origem do primeiro quad (default das notas novas).
+    pub(crate) fn marker_pt(&self) -> [f32; 2] {
+        match self.marker {
+            Some(pt) => pt,
+            None => derived_marker_pt(&self.quads),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -438,13 +521,60 @@ enum AnnotAction {
 /// Rascunho de nota em edição (issue #30): ancorado a um trecho, com o
 /// texto digitado e (`editing: Some(id)`) a nota que está sendo editada —
 /// `None` = criando uma nova. Some junto com `annotations` ao abrir.
-#[derive(Debug, Clone)]
+///
+#[derive(Debug)]
 pub struct NoteDraft {
     pub page: PageNo,
     pub range: TextRange,
     pub quads: Vec<Quad>,
-    pub text: String,
+    pub content: text_editor::Content,
     pub editing: Option<u64>,
+    /// Canto do post-it na janela (px CSS) no instante em que abriu; a
+    /// posição desenhada desconta a rolagem desde então (`anchor_scroll`).
+    anchor: [f32; 2],
+    anchor_scroll: f32,
+}
+
+impl Clone for NoteDraft {
+    /// O conteúdo é o editor do iced (`text_editor::Content`), que não é
+    /// `Clone`: a cópia nasce do texto, com o cursor no fim. O único clone de
+    /// estado do app é o `Message::Opened`, de um documento recém-carregado —
+    /// sem rascunho aberto.
+    fn clone(&self) -> Self {
+        Self {
+            page: self.page,
+            range: self.range,
+            quads: self.quads.clone(),
+            content: text_editor::Content::with_text(&self.content.text()),
+            editing: self.editing,
+            anchor: self.anchor,
+            anchor_scroll: self.anchor_scroll,
+        }
+    }
+}
+
+/// Arrasto do marcador de uma nota em curso (press no marcador + arrasto além
+/// do limiar): posição do marcador no press + deslocamento em pontos de
+/// página. Só o ícone amarelo anda; o trecho marcado fica onde está.
+#[derive(Debug, Clone)]
+pub(crate) struct NoteDrag {
+    id: u64,
+    page: PageNo,
+    from: [f32; 2],
+    /// Canto do marcador no press (`Annotation::marker_pt`).
+    marker0: [f32; 2],
+    delta: [f32; 2],
+}
+
+impl NoteDrag {
+    /// Canto candidato do marcador: posição do press + delta, preso à página.
+    /// Ghost e resultado do soltar saem daqui — o que se vê é o que fica.
+    fn candidate(&self, media: MediaBox) -> [f32; 2] {
+        clamped_marker_pt(
+            [self.marker0[0] + self.delta[0], self.marker0[1] + self.delta[1]],
+            media,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -678,6 +808,12 @@ pub struct Ready {
     annot_redo: Vec<AnnotAction>,
     /// Rascunho de nota aberto (issue #30); zera ao abrir. Sem persistência na v1.
     pub note_draft: Option<NoteDraft>,
+    /// Arrasto do marcador de uma nota em curso (mover); `None` = nenhum.
+    note_drag: Option<NoteDrag>,
+    /// Origem da folha na janela (px CSS) e rolagem do documento no último
+    /// press: a vista manda no `PointerDown` (só ela conhece o layout).
+    sheet_at: [f32; 2],
+    sheet_scroll: f32,
     pub signatures_open: bool,
     pub pages_open: bool,
     /// Aba Sumário ativa no painel de Páginas (só existe se houver outline).
@@ -1077,6 +1213,9 @@ pub enum Message {
     PointerDown {
         page: PageNo,
         page_pt: [f32; 2],
+        /// Canto superior esquerdo da folha na janela (px CSS) — só a vista
+        /// sabe; é o que ancora o post-it no lugar da nota.
+        sheet: [f32; 2],
     },
     PointerMove {
         page: PageNo,
@@ -1094,13 +1233,17 @@ pub enum Message {
     DragCancelled,
     AnnotUndo,
     AnnotRedo,
-    /// Digitação no rascunho de nota aberto (`NoteDraft.text`).
-    NoteInput(String),
+    /// Edição no post-it aberto (o editor do iced manda a ação; o rascunho
+    /// aplica e o texto vive em `NoteDraft.content`).
+    NoteEdit(text_editor::Action),
     /// Salva o rascunho como nota (cria nova ou substitui a que está em
     /// edição); texto vazio/só-espaço descarta sem criar.
     NoteSave,
     /// Fecha o rascunho sem criar/alterar nada.
     NoteCancel,
+    /// Botão vermelho do post-it (só em edição): remove a nota que está sendo
+    /// editada e fecha o rascunho; Ctrl+Z desfaz como qualquer marcação.
+    NoteDelete,
     Rendered {
         page: PageNo,
         scale: Scale,
@@ -1423,8 +1566,22 @@ impl Session {
                 };
                 Task::batch([self.schedule_work(), follow])
             }
-            Message::PointerDown { page, page_pt } => {
+            Message::PointerDown {
+                page,
+                page_pt,
+                sheet,
+            } => {
                 if let Session::Ready(ready) = self {
+                    // Origem da folha + rolagem do press: base da âncora do
+                    // post-it que o clique pode abrir logo abaixo.
+                    ready.sheet_at = sheet;
+                    ready.sheet_scroll = ready.doc_scroll_y;
+                    // Press sobre uma nota: candidato a arrasto. O clique
+                    // (sem arrasto) abre a edição no PointerUp; a seleção
+                    // fica de fora para o arrasto não estender texto.
+                    if ready.begin_note_drag(page, page_pt) {
+                        return Task::none();
+                    }
                     match ready.pages.text.get(page.index() as usize) {
                         Some(Some(layer)) => {
                             // Press ancora até no vazio (snap no mais próximo);
@@ -1461,6 +1618,11 @@ impl Session {
             Message::PointerMove { page, page_pt } => {
                 if let Session::Ready(tabs) = self {
                     let ready = tabs.active_mut();
+                    // Arrasto de nota: o delta mede o movimento desde o press
+                    // (a folha já vem com o ponto preso à borda).
+                    if ready.update_note_drag(page, page_pt) {
+                        return Task::none();
+                    }
                     if let Some(sel) = ready.selection.as_mut() {
                         if sel.page == page {
                             if let Some(Some(layer)) = ready.pages.text.get(page.index() as usize) {
@@ -1486,6 +1648,11 @@ impl Session {
             }
             Message::PointerUp { page, page_pt } => {
                 if let Session::Ready(ready) = self {
+                    // Press sobre nota: soltar move (o ghost é o resultado) ou,
+                    // sem passar do limiar, é o clique que abre a edição.
+                    if ready.finish_note_drag(page, page_pt) {
+                        return crate::view::focus_postit();
+                    }
                     // Clique (press+release sem arrasto): sobre marcação
                     // remove; no vazio desseleciona; em glifo mantém a palavra.
                     // Arrasto só estende (já feito no PointerMove).
@@ -1494,7 +1661,9 @@ impl Session {
                             if let Some(id) = ready.annotation_at(page, page_pt) {
                                 // Clique sobre nota abre a edição dela; as
                                 // demais marcações o clique remove.
-                                if !ready.open_note_draft_for_id(id) {
+                                if ready.open_note_draft_for_id(id) {
+                                    return crate::view::focus_postit();
+                                } else {
                                     ready.remove_annotation(id);
                                 }
                             } else if !anchor.exact {
@@ -1521,7 +1690,9 @@ impl Session {
                     if kind == AnnotKind::Note {
                         // Nota: abre o rascunho da seleção e mantém a
                         // seleção (âncora do draft); sem seleção ignora.
-                        ready.open_note_draft();
+                        if ready.open_note_draft() {
+                            return crate::view::focus_postit();
+                        }
                     } else if ready.annotate_selection(kind) {
                         // Pós-marcação limpa a seleção (padrão dos leitores).
                         ready.selection = None;
@@ -1533,6 +1704,9 @@ impl Session {
             Message::DragCancelled => {
                 if let Session::Ready(ready) = self {
                     ready.press_anchor = None;
+                    // A folha perdeu o mouse (solta fora dela, janela sem
+                    // foco): soltar fora da página cancela o arrasto.
+                    ready.note_drag = None;
                 }
                 Task::none()
             }
@@ -1550,10 +1724,10 @@ impl Session {
                 }
                 Task::none()
             }
-            Message::NoteInput(text) => {
+            Message::NoteEdit(action) => {
                 if let Session::Ready(ready) = self {
                     if let Some(draft) = ready.note_draft.as_mut() {
-                        draft.text = text;
+                        draft.content.perform(action);
                     }
                 }
                 Task::none()
@@ -1567,6 +1741,12 @@ impl Session {
             Message::NoteCancel => {
                 if let Session::Ready(ready) = self {
                     ready.note_draft = None;
+                }
+                Task::none()
+            }
+            Message::NoteDelete => {
+                if let Session::Ready(ready) = self {
+                    ready.delete_draft_note();
                 }
                 Task::none()
             }
@@ -1723,7 +1903,9 @@ impl Session {
                     // função pura de teclas não vê estado (Esc → este
                     // diálogo); a guarda de foco é o `status` do iced.
                     ready.note_draft = None;
-                    // Idem para o aviso de documento assinado.
+                    // Idem para o arrasto de nota e para o aviso de
+                    // documento assinado.
+                    ready.note_drag = None;
                     ready.save_warning = false;
                     // Enviando: ignora (Esc) para não perder o resultado na volta.
                     if ready
@@ -2541,6 +2723,14 @@ pub(crate) fn keyboard_message(
     modifiers: keyboard::Modifiers,
     status: event::Status,
 ) -> Option<Message> {
+    // ⌘/Ctrl+Enter salva o post-it antes da guarda de foco: com o editor
+    // focado o campo captura a tecla (status Captured) e a guarda a mataria.
+    // Sem rascunho aberto o handler descarta (no-op).
+    if (modifiers.logo() || modifiers.control()) && !modifiers.alt() {
+        if let Key::Named(Named::Enter) = key.as_ref() {
+            return Some(Message::NoteSave);
+        }
+    }
     if status != event::Status::Ignored {
         return None;
     }
@@ -2724,6 +2914,14 @@ impl Ready {
         (w - 2.0 * DOC_PAD_X).max(1.0)
     }
 
+    /// Tamanho da folha na janela (px CSS): largura útil × proporção da mídia
+    /// girada — o mesmo par que a vista usa para desenhar (`with_marks`).
+    pub(crate) fn sheet_size(&self, page: PageNo) -> [f32; 2] {
+        let cw = self.doc_content_width();
+        let rotated = self.rotated_media(page);
+        [cw, cw * rotated.height.max(1.0) / rotated.width.max(1.0)]
+    }
+
     /// Altura da célula (padding + folha proporcional à mídia girada).
     pub(crate) fn doc_cell_height(&self, page: PageNo, content_width: f32) -> f32 {
         let media = self.rotated_media(page);
@@ -2844,6 +3042,8 @@ impl Ready {
             kind,
             // H/U/S não carregam texto; apenas notas (`save_note_draft`).
             text: String::new(),
+            // Só nota tem marcador (e ele nasce no trecho: `marker: None`).
+            marker: None,
         };
         self.next_annot_id += 1;
         self.apply_annot_action(AnnotAction::Add(annot.clone()));
@@ -2881,22 +3081,58 @@ impl Ready {
             .annotations
             .iter()
             .find(|a| a.kind == AnnotKind::Note && a.page == sel.page && a.range == sel.range);
-        let (editing, text) = match existing {
-            Some(a) => (Some(a.id), a.text.clone()),
-            None => (None, String::new()),
+        let (editing, text, marker) = match existing {
+            Some(a) => (Some(a.id), a.text.clone(), a.marker_pt()),
+            None => (None, String::new(), derived_marker_pt(&quads)),
         };
+        let anchor = self.note_anchor(sel.page, &quads, marker);
         self.note_draft = Some(NoteDraft {
             page: sel.page,
             range: sel.range,
             quads,
-            text,
+            content: text_editor::Content::with_text(&text),
             editing,
+            anchor,
+            anchor_scroll: self.doc_scroll_y,
         });
         true
     }
 
+    /// Canto do post-it na janela (px CSS, Y para baixo) para uma nota: canto
+    /// do marcador na folha (mesma matemática do canvas: `display_pt`) somado
+    /// à origem da folha capturada no último press, descontada a rolagem desde
+    /// então. Sem clique ainda, a folha está em (0, 0).
+    fn note_anchor(&self, page: PageNo, quads: &[Quad], marker_pt: [f32; 2]) -> [f32; 2] {
+        let [cw, ch] = self.sheet_size(page);
+        let media = self.media(page);
+        let rotation = self.view_rotation;
+        let [mx, my] = display_pt(marker_pt, media, rotation, cw, ch);
+        // Marcador compacto + respiro: o post-it nasce ao lado dele.
+        let side = marker_side(quads, media, rotation, cw, ch);
+        let scrolled = self.doc_scroll_y - self.sheet_scroll;
+        [
+            self.sheet_at[0] + mx + side + POSTIT_GAP,
+            self.sheet_at[1] + my - scrolled,
+        ]
+    }
+
+    /// Posição do post-it na janela: a âncora do rascunho menos a rolagem
+    /// desde que abriu, presa à janela (nunca sai da tela) com o tamanho
+    /// dado para não cobrir os botões.
+    pub(crate) fn postit_pos(&self, size: [f32; 2]) -> [f32; 2] {
+        let Some(draft) = self.note_draft.as_ref() else {
+            return [POSTIT_MARGIN, POSTIT_MARGIN];
+        };
+        let pos = [
+            draft.anchor[0],
+            draft.anchor[1] - (self.doc_scroll_y - draft.anchor_scroll),
+        ];
+        clamp_postit(pos, size, [self.viewport.width, self.viewport.height])
+    }
+
     /// Abre a edição de uma nota existente (clique sobre o marcador): ancora
-    /// o draft no trecho dela com o texto atual. `false` se não é nota ou com
+    /// o draft no trecho dela com o texto atual, sem tocar na seleção (o
+    /// trecho sublinhado não "vem junto"). `false` se não é nota ou com
     /// draft já aberto (o clique então não remove a nota — vira no-op).
     fn open_note_draft_for_id(&mut self, id: u64) -> bool {
         let Some(annot) = self
@@ -2910,12 +3146,17 @@ impl Ready {
         if self.note_draft.is_some() {
             return false;
         }
-        // Âncora do draft = o trecho da nota, não a palavra do clique.
-        self.selection = Some(Selection {
+        let anchor = self.note_anchor(annot.page, &annot.quads, annot.marker_pt());
+        self.note_draft = Some(NoteDraft {
             page: annot.page,
             range: annot.range,
+            quads: annot.quads.clone(),
+            content: text_editor::Content::with_text(&annot.text),
+            editing: Some(annot.id),
+            anchor,
+            anchor_scroll: self.doc_scroll_y,
         });
-        self.open_note_draft()
+        true
     }
 
     /// Salva o rascunho como nota (`kind: Note`, texto do draft) via pilha
@@ -2927,15 +3168,21 @@ impl Ready {
         let Some(draft) = self.note_draft.take() else {
             return false;
         };
-        if draft.text.trim().is_empty() {
+        // O editor do iced sempre fecha a última linha com `\n`: guarda o
+        // texto como digitado (sem a quebra que o widget acrescenta).
+        let text = draft.content.text();
+        if text.trim().is_empty() {
             return false;
         }
-        if let Some(old) = draft
+        let text = text.trim_end().to_string();
+        // Edição substitui a nota (Remove + Add): o marcador vai junto, senão
+        // reescrever o texto devolveria o ícone amarelo para o trecho.
+        let previous = draft
             .editing
-            .and_then(|id| self.annotations.iter().find(|a| a.id == id).cloned())
-        {
+            .and_then(|id| self.annotations.iter().find(|a| a.id == id).cloned());
+        if let Some(old) = previous.as_ref() {
             self.apply_annot_action(AnnotAction::Remove(old.clone()));
-            self.annot_undo.push(AnnotAction::Remove(old));
+            self.annot_undo.push(AnnotAction::Remove(old.clone()));
         }
         let annot = Annotation {
             id: self.next_annot_id,
@@ -2943,12 +3190,27 @@ impl Ready {
             range: draft.range,
             quads: draft.quads,
             kind: AnnotKind::Note,
-            text: draft.text,
+            text,
+            marker: previous.and_then(|old| old.marker),
         };
         self.next_annot_id += 1;
         self.apply_annot_action(AnnotAction::Add(annot.clone()));
         self.annot_undo.push(AnnotAction::Add(annot));
         self.annot_redo.clear();
+        true
+    }
+
+    /// Botão vermelho do post-it: remove a nota em edição e fecha o rascunho.
+    /// Só vale em modo de edição (`editing: Some(id)`) — criando, o botão nem
+    /// existe; a remoção entra na pilha de undo (`Remove`, como o clique).
+    pub(crate) fn delete_draft_note(&mut self) -> bool {
+        let Some(id) = self.note_draft.as_ref().and_then(|draft| draft.editing) else {
+            return false;
+        };
+        if !self.remove_annotation(id) {
+            return false;
+        }
+        self.note_draft = None;
         true
     }
 
@@ -2961,6 +3223,109 @@ impl Ready {
         self.annot_undo.push(AnnotAction::Remove(annot));
         self.annot_redo.clear();
         true
+    }
+
+    /// Press sobre o marcador de uma nota: começa um arrasto candidato (delta
+    /// zero) e larga a seleção — o arrasto move o ícone, não estende texto.
+    /// Só o marcador inicia (`marker_hit`, que acompanha o arrasto); o press
+    /// no trecho sublinhado segue o fluxo de seleção normal. `false` = o
+    /// press não é sobre marcador; sem arrasto, o `PointerUp` abre a edição.
+    fn begin_note_drag(&mut self, page: PageNo, page_pt: [f32; 2]) -> bool {
+        let note = self
+            .annotations
+            .iter()
+            .find(|a| a.kind == AnnotKind::Note && a.page == page && self.marker_hit(a, page_pt))
+            .cloned();
+        let Some(note) = note else {
+            return false;
+        };
+        self.selection = None;
+        self.press_anchor = None;
+        self.note_drag = Some(NoteDrag {
+            id: note.id,
+            page,
+            from: page_pt,
+            marker0: note.marker_pt(),
+            delta: [0.0, 0.0],
+        });
+        true
+    }
+
+    /// Atualiza o delta do arrasto em curso (mover é dentro de uma página só:
+    /// pontos de outra página não mexem no candidato). `true` = o movimento
+    /// era do arrasto de nota.
+    fn update_note_drag(&mut self, page: PageNo, page_pt: [f32; 2]) -> bool {
+        let Some(drag) = self.note_drag.as_mut().filter(|drag| drag.page == page) else {
+            return false;
+        };
+        drag.delta = [page_pt[0] - drag.from[0], page_pt[1] - drag.from[1]];
+        true
+    }
+
+    /// Solta o press: arrasto além do limiar move o marcador (preso à
+    /// página); abaixo dele é o clique que abre a edição. `true` = o post-it
+    /// abriu (a vista então o foca).
+    fn finish_note_drag(&mut self, page: PageNo, page_pt: [f32; 2]) -> bool {
+        if self.note_drag.is_none() {
+            return false;
+        }
+        self.update_note_drag(page, page_pt);
+        let Some(drag) = self.note_drag.take() else {
+            return false;
+        };
+        if self.drag_px(&drag) < NOTE_DRAG_MIN_PX {
+            return self.open_note_draft_for_id(drag.id);
+        }
+        self.move_note_marker(&drag);
+        false
+    }
+
+    /// Delta do arrasto em px CSS na escala atual (limiar clique-vs-arrasto):
+    /// pontos de página → px acompanham o zoom da folha.
+    fn drag_px(&self, drag: &NoteDrag) -> f32 {
+        let scale = self.doc_content_width() / self.rotated_media(drag.page).width.max(1.0);
+        let (dx, dy) = (drag.delta[0] * scale, drag.delta[1] * scale);
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// Solta o marcador onde o ghost indicava: clamp na página (sem snap em
+    /// glifo — o resultado é o ghost que estava na tela) e `marker: Some(...)`
+    /// com id, trecho, quads e texto intactos. Entra na pilha como `Remove` +
+    /// `Add`, como o save da edição. `false` se o marcador não saiu do lugar.
+    fn move_note_marker(&mut self, drag: &NoteDrag) -> bool {
+        let to = drag.candidate(self.media(drag.page));
+        let Some(old) = self
+            .annotations
+            .iter()
+            .find(|a| a.id == drag.id && a.kind == AnnotKind::Note)
+            .cloned()
+        else {
+            return false;
+        };
+        if old.marker_pt() == to {
+            return false;
+        }
+        let moved = Annotation {
+            marker: Some(to),
+            ..old.clone()
+        };
+        self.apply_annot_action(AnnotAction::Remove(old.clone()));
+        self.annot_undo.push(AnnotAction::Remove(old.clone()));
+        self.apply_annot_action(AnnotAction::Add(moved.clone()));
+        self.annot_undo.push(AnnotAction::Add(moved));
+        self.annot_redo.clear();
+        true
+    }
+
+    /// Marcador candidato do arrasto nesta página (ghost pontilhado do
+    /// canvas): `(id da nota, canto em pontos de página)` — o mesmo que o
+    /// soltar aplica. `None` = sem arrasto, ou arrasto abaixo do limiar.
+    pub(crate) fn note_drag_ghost(&self, page: PageNo) -> Option<(u64, [f32; 2])> {
+        let drag = self.note_drag.as_ref().filter(|drag| drag.page == page)?;
+        if self.drag_px(drag) < NOTE_DRAG_MIN_PX {
+            return None;
+        }
+        Some((drag.id, drag.candidate(self.media(page))))
     }
 
     pub(crate) fn annot_undo_once(&mut self) -> bool {
@@ -2994,12 +3359,41 @@ impl Ready {
     }
 
     /// Id da marcação sob o ponto (espaço da mídia original); `None` fora.
+    /// Nota acerta só no marcador (`marker_hit`, que acompanha o arrasto); o
+    /// trecho sublinhado é só âncora visual — o press/clique nele seleciona
+    /// texto em vez de abrir/arrastar a nota.
     pub(crate) fn annotation_at(&self, page: PageNo, page_pt: [f32; 2]) -> Option<u64> {
-        let [x, y] = page_pt;
         self.annotations
             .iter()
-            .find(|a| a.page == page && a.quads.iter().any(|q| q.contains(x, y)))
+            .filter(|a| a.page == page)
+            .find(|a| match a.kind {
+                AnnotKind::Note => self.marker_hit(a, page_pt),
+                _ => {
+                    let [x, y] = page_pt;
+                    a.quads.iter().any(|q| q.contains(x, y))
+                }
+            })
             .map(|a| a.id)
+    }
+
+    /// O ponto cai no quadrado do marcador de uma nota? A conta é a do
+    /// desenho (`display_pt`/`marker_side`, em px da folha), então o clique
+    /// acerta o ícone mesmo arrastado para longe do trecho.
+    fn marker_hit(&self, annot: &Annotation, page_pt: [f32; 2]) -> bool {
+        if annot.kind != AnnotKind::Note {
+            return false;
+        }
+        let page = annot.page;
+        let [cw, ch] = self.sheet_size(page);
+        let media = self.media(page);
+        let rotation = self.view_rotation;
+        let [px, py] = display_pt(page_pt, media, rotation, cw, ch);
+        let [mx, my] = display_pt(annot.marker_pt(), media, rotation, cw, ch);
+        let side = marker_side(&annot.quads, media, rotation, cw, ch);
+        px >= mx - NOTE_MARKER_HIT_PAD
+            && px <= mx + side + NOTE_MARKER_HIT_PAD
+            && py >= my - NOTE_MARKER_HIT_PAD
+            && py <= my + side + NOTE_MARKER_HIT_PAD
     }
 
     fn apply_annot_action(&mut self, action: AnnotAction) {
@@ -3462,6 +3856,9 @@ impl Document {
             annot_undo: Vec::new(),
             annot_redo: Vec::new(),
             note_draft: None,
+            note_drag: None,
+            sheet_at: [0.0, 0.0],
+            sheet_scroll: 0.0,
             signatures_open: false,
             pages_open: false,
             outline_open: false,
@@ -4450,12 +4847,19 @@ mod tests {
     /// Draft de teste: âncora na página 1, trecho 0..2, sem depender do
     /// texto extraído do PDF (os testes de nota mexem só no estado).
     fn dummy_draft() -> NoteDraft {
+        dummy_draft_with("")
+    }
+
+    /// Draft de teste com texto digitado (o conteúdo é o editor do iced).
+    fn dummy_draft_with(text: &str) -> NoteDraft {
         NoteDraft {
             page: PageNo::first(),
             range: TextRange { start: 0, end: 2 },
             quads: vec![Quad::from_rect(0.0, 0.0, 10.0, 10.0)],
-            text: String::new(),
+            content: text_editor::Content::with_text(text),
             editing: None,
+            anchor: [0.0, 0.0],
+            anchor_scroll: 0.0,
         }
     }
 
@@ -4465,8 +4869,7 @@ mod tests {
             return;
         };
         assert!(!ready.can_annot_undo());
-        ready.note_draft = Some(dummy_draft());
-        ready.note_draft.as_mut().unwrap().text = "olá mundo".into();
+        ready.note_draft = Some(dummy_draft_with("olá mundo"));
         assert!(ready.save_note_draft());
         // Draft fechou e a nota entrou no estado com o texto digitado.
         assert!(ready.note_draft.is_none());
@@ -4481,8 +4884,7 @@ mod tests {
         let Some(mut ready) = sample_ready() else {
             return;
         };
-        ready.note_draft = Some(dummy_draft());
-        ready.note_draft.as_mut().unwrap().text = "   \n".into();
+        ready.note_draft = Some(dummy_draft_with("   \n"));
         assert!(!ready.save_note_draft());
         // Fecha o draft mas não cria nada nem suja a pilha de undo.
         assert!(ready.note_draft.is_none());
@@ -4496,8 +4898,7 @@ mod tests {
         let Some(mut ready) = sample_ready() else {
             return;
         };
-        ready.note_draft = Some(dummy_draft());
-        ready.note_draft.as_mut().unwrap().text = "nota".into();
+        ready.note_draft = Some(dummy_draft_with("nota"));
         assert!(ready.save_note_draft());
         assert_eq!(ready.annotations.len(), 1);
         // Undo remove a nota; redo a devolve com o texto.
@@ -4517,14 +4918,12 @@ mod tests {
             return;
         };
         // Nota existente.
-        ready.note_draft = Some(dummy_draft());
-        ready.note_draft.as_mut().unwrap().text = "antiga".into();
+        ready.note_draft = Some(dummy_draft_with("antiga"));
         assert!(ready.save_note_draft());
         let id = ready.annotations[0].id;
         // Edição (draft com editing = Some(id)): Remove(antiga) + Add(nova).
-        let mut draft = dummy_draft();
+        let mut draft = dummy_draft_with("nova");
         draft.editing = Some(id);
-        draft.text = "nova".into();
         ready.note_draft = Some(draft);
         assert!(ready.save_note_draft());
         assert_eq!(ready.annotations.len(), 1);
@@ -4554,11 +4953,10 @@ mod tests {
             page: PageNo::first(),
             range: TextRange { start: 0, end: 2 },
         });
-        let mut draft = dummy_draft();
-        draft.text = "digitando...".into();
+        let draft = dummy_draft_with("digitando...");
         ready.note_draft = Some(draft);
         assert!(!ready.open_note_draft());
-        assert_eq!(ready.note_draft.as_ref().unwrap().text, "digitando...");
+        assert_eq!(note_text(ready.note_draft.as_ref().unwrap()), "digitando...");
     }
 
     #[test]
@@ -4574,8 +4972,7 @@ mod tests {
             return;
         }
         // Cria uma nota no trecho 0..2 via save direto.
-        ready.note_draft = Some(dummy_draft());
-        ready.note_draft.as_mut().unwrap().text = "anotação".into();
+        ready.note_draft = Some(dummy_draft_with("anotação"));
         assert!(ready.save_note_draft());
         let id = ready.annotations[0].id;
         // N com a seleção sobre o trecho da nota reabre em edição com o texto.
@@ -4586,7 +4983,7 @@ mod tests {
         assert!(ready.open_note_draft());
         let draft = ready.note_draft.as_ref().unwrap();
         assert_eq!(draft.editing, Some(id));
-        assert_eq!(draft.text, "anotação");
+        assert_eq!(note_text(draft), "anotação");
         // Clique sobre o marcador (âncora no trecho da nota) idem.
         ready.note_draft = None;
         ready.selection = None;
@@ -4595,9 +4992,564 @@ mod tests {
         assert_eq!(draft.page, PageNo::first());
         assert_eq!(draft.range, TextRange { start: 0, end: 2 });
         assert_eq!(draft.editing, Some(id));
-        assert_eq!(draft.text, "anotação");
+        assert_eq!(note_text(draft), "anotação");
+        // Abrir pelo marcador não sequestra a seleção (o trecho sublinhado
+        // não "vem junto"): continua None, como o clique deixou.
+        assert!(ready.selection.is_none());
         // Id de marcação que não é nota: falso (o clique remove no handler).
         assert!(!ready.open_note_draft_for_id(u64::MAX));
+    }
+
+    /// Tamanho da pilha de undo das marcações: o setup (`note_on_selection`)
+    /// já empilha a criação da nota, então os testes comparam o tamanho antes
+    /// e depois da interação em vez de assumirem pilha vazia.
+    fn undo_len(session: &Session) -> usize {
+        match session {
+            Session::Ready(ready) => ready.annot_undo.len(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Tamanho do cartão do post-it nos testes de posição (o da vista).
+    const POSTIT_SIZE_TEST: [f32; 2] = [320.0, 200.0];
+
+    /// Texto digitado no rascunho: o editor do iced fecha a última linha com
+    /// `\n`, então o que interessa é o que o usuário escreveu.
+    fn note_text(draft: &NoteDraft) -> String {
+        draft.content.text().trim_end().to_string()
+    }
+
+    /// Centro do quad (ponto de página) — onde o clique acerta a marcação.
+    fn quad_center(q: Quad) -> [f32; 2] {
+        let xs = [q.x0, q.x1, q.x2, q.x3];
+        let ys = [q.y0, q.y1, q.y2, q.y3];
+        [
+            (xs.iter().fold(f32::INFINITY, |a, &b| a.min(b))
+                + xs.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)))
+                / 2.0,
+            (ys.iter().fold(f32::INFINITY, |a, &b| a.min(b))
+                + ys.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)))
+                / 2.0,
+        ]
+    }
+
+    /// Quad como tupla (o tipo não tem `PartialEq`): comparar posições.
+    fn quad_tuple(q: Quad) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+        (q.x0, q.y0, q.x1, q.y1, q.x2, q.y2, q.x3, q.y3)
+    }
+
+    /// Quads como tuplas, para comparar ghost e resultado.
+    fn quads_tuple(quads: &[Quad]) -> Vec<(f32, f32, f32, f32, f32, f32, f32, f32)> {
+        quads.iter().map(|q| quad_tuple(*q)).collect()
+    }
+
+    /// Nota real criada pela seleção do trecho 0..2, com o texto dado.
+    fn note_on_selection(ready: &mut Ready, text: &str) -> Annotation {
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        assert!(ready.open_note_draft(), "draft abre com a seleção");
+        ready.note_draft.as_mut().unwrap().content = text_editor::Content::with_text(text);
+        assert!(ready.save_note_draft(), "save cria a nota");
+        ready.annotations.last().cloned().expect("nota criada")
+    }
+
+    #[test]
+    fn note_delete_from_draft_stacks_remove_and_undo_restores() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let note = note_on_selection(&mut ready, "apagar");
+        // Reabre em edição como o clique no marcador e usa o botão vermelho.
+        assert!(ready.open_note_draft_for_id(note.id));
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::NoteDelete);
+        match &session {
+            Session::Ready(ready) => {
+                assert!(ready.note_draft.is_none(), "o post-it fecha ao remover");
+                assert!(ready.annotations.is_empty());
+                assert!(ready.can_annot_undo(), "remoção entra na pilha");
+            }
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::AnnotUndo);
+        match &session {
+            Session::Ready(ready) => {
+                assert_eq!(ready.annotations.len(), 1);
+                assert_eq!(ready.annotations[0].id, note.id, "a mesma nota volta");
+                assert_eq!(ready.annotations[0].text, "apagar");
+                assert_eq!(
+                    quads_tuple(&ready.annotations[0].quads),
+                    quads_tuple(&note.quads)
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn note_delete_without_editing_keeps_draft() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        // Criando (sem `editing`): o vermelho nem aparece no cartão; o handler
+        // não fecha o rascunho nem mexe nas marcações.
+        ready.note_draft = Some(dummy_draft_with("nova"));
+        assert!(!ready.delete_draft_note());
+        assert!(ready.note_draft.is_some());
+        assert!(ready.annotations.is_empty());
+        assert!(!ready.can_annot_undo());
+    }
+
+    #[test]
+    fn note_drag_drop_moves_marker_and_keeps_quads() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let note = note_on_selection(&mut ready, "mover");
+        let page = note.page;
+        let start = note.marker_pt();
+        let origin = note.marker_pt();
+        let to = [start[0] + 14.0, start[1] - 9.0];
+        let want = [origin[0] + 14.0, origin[1] - 9.0];
+        let mut session = Session::Ready(Tabs::single(ready));
+        let undo_before = undo_len(&session);
+
+        // Press no marcador + arrasto: ghost = só o ícone, na posição
+        // candidata; o trecho e o marcador sólido ficam onde estão.
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page,
+                page_pt: start,
+                sheet: [120.0, 60.0],
+            },
+        );
+        apply(
+            &mut session,
+            Message::PointerMove {
+                page,
+                page_pt: to,
+            },
+        );
+        let (ghost_id, ghost_pt) = match &session {
+            Session::Ready(ready) => {
+                assert_eq!(
+                    quads_tuple(&ready.annotations[0].quads),
+                    quads_tuple(&note.quads),
+                    "durante o arrasto o trecho não se mexe"
+                );
+                assert_eq!(ready.annotations[0].marker, None, "o sólido não anda");
+                ready.note_drag_ghost(page).expect("ghost ativo")
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(ghost_id, note.id);
+        assert_eq!(ghost_pt, want, "o ghost anda pelo delta do arrasto");
+
+        // Soltar: o marcador fica exatamente onde o ghost estava; o trecho
+        // (quads/range), o texto e o id não mudam.
+        apply(&mut session, Message::PointerUp { page, page_pt: to });
+        match &session {
+            Session::Ready(ready) => {
+                assert_eq!(ready.annotations.len(), 1);
+                assert_eq!(ready.annotations[0].id, note.id, "id fica");
+                assert_eq!(ready.annotations[0].text, "mover", "texto fica");
+                assert_eq!(ready.annotations[0].kind, AnnotKind::Note);
+                assert_eq!(ready.annotations[0].range, note.range, "trecho fica");
+                assert_eq!(
+                    quads_tuple(&ready.annotations[0].quads),
+                    quads_tuple(&note.quads),
+                    "soltar não move a marcação do texto"
+                );
+                assert_eq!(ready.annotations[0].marker, Some(ghost_pt));
+                assert!(ready.note_drag.is_none());
+                assert_eq!(
+                    ready.annot_undo.len(),
+                    undo_before + 2,
+                    "soltar empilha Remove(antiga) + Add(movida)"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        // Undo em dois passos (Remove + Add, como o save da edição): volta a
+        // nota antiga, com o marcador no trecho (`marker: None`).
+        apply(&mut session, Message::AnnotUndo);
+        apply(&mut session, Message::AnnotUndo);
+        match &session {
+            Session::Ready(ready) => {
+                assert_eq!(ready.annotations.len(), 1);
+                assert_eq!(ready.annotations[0].id, note.id);
+                assert_eq!(ready.annotations[0].marker, None);
+                assert_eq!(ready.annotations[0].marker_pt(), origin);
+                assert_eq!(
+                    quads_tuple(&ready.annotations[0].quads),
+                    quads_tuple(&note.quads)
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn marker_drag_starts_on_icon_line_press_selects_text() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let note = note_on_selection(&mut ready, "arrastada");
+        let page = note.page;
+        let line_pt = quad_center(note.quads[0]);
+        let media = ready.media(page);
+        // Arrasta o marcador para o canto inferior esquerdo da página, longe
+        // do trecho marcado — o press parte do ícone, não da linha.
+        let press = note.marker_pt();
+        let far = [5.0, 5.0];
+        let delta = [far[0] - press[0], far[1] - press[1]];
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page,
+                page_pt: press,
+                sheet: [0.0, 0.0],
+            },
+        );
+        apply(
+            &mut session,
+            Message::PointerMove {
+                page,
+                page_pt: [press[0] + delta[0], press[1] + delta[1]],
+            },
+        );
+        apply(
+            &mut session,
+            Message::PointerUp {
+                page,
+                page_pt: [press[0] + delta[0], press[1] + delta[1]],
+            },
+        );
+        match &session {
+            Session::Ready(ready) => {
+                let moved = ready.annotations[0].marker.expect("marcador movido");
+                assert_eq!(moved, far);
+                assert!(
+                    !note.quads.iter().any(|q| q.contains(far[0], far[1])),
+                    "o ponto do marcador está fora do trecho"
+                );
+                // O clique acerta o ícone arrastado; a linha sublinhada não
+                // abre mais a nota (o press nela seleciona texto).
+                assert_eq!(ready.annotation_at(page, moved), Some(note.id));
+                assert_eq!(ready.annotation_at(page, line_pt), None);
+                // Um ponto no meio da página, longe de ambos, não acerta nada.
+                assert_eq!(
+                    ready.annotation_at(page, [media.width * 0.5, media.height * 0.5]),
+                    None
+                );
+            }
+            _ => unreachable!(),
+        }
+        // Press + release sem arrasto em cima da linha sublinhada: ancora
+        // seleção de texto, não arrasto de nota — e não abre o post-it.
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page,
+                page_pt: line_pt,
+                sheet: [0.0, 0.0],
+            },
+        );
+        match &session {
+            Session::Ready(ready) => {
+                assert!(ready.note_drag.is_none(), "linha não inicia arrasto");
+                assert!(ready.press_anchor.is_some(), "linha ancora seleção");
+            }
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::PointerUp { page, page_pt: line_pt });
+        match &session {
+            Session::Ready(ready) => {
+                assert!(ready.note_draft.is_none(), "linha não abre a nota");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn note_marker_clamped_to_page() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let note = note_on_selection(&mut ready, "borda");
+        let page = note.page;
+        let start = note.marker_pt();
+        let media = ready.media(page);
+        let mut session = Session::Ready(Tabs::single(ready));
+        // Arrasto muito além do canto: o marcador para na página.
+        let out = [start[0] + media.width * 2.0, start[1] - media.height * 2.0];
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page,
+                page_pt: start,
+                sheet: [0.0, 0.0],
+            },
+        );
+        apply(
+            &mut session,
+            Message::PointerMove {
+                page,
+                page_pt: out,
+            },
+        );
+        apply(&mut session, Message::PointerUp { page, page_pt: out });
+        match &session {
+            Session::Ready(ready) => {
+                assert_eq!(
+                    ready.annotations[0].marker,
+                    Some([media.width, 0.0]),
+                    "o marcador para na borda da página"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn marker_default_none_and_kept_on_edit() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let note = note_on_selection(&mut ready, "original");
+        // Nota nova: sem marcador próprio — derivado da origem do 1º quad.
+        assert_eq!(note.marker, None);
+        let derived = note.marker_pt();
+        let q = note.quads[0];
+        let left = q.x0.min(q.x1).min(q.x2).min(q.x3);
+        let top = q.y0.max(q.y1).max(q.y2).max(q.y3);
+        assert_eq!(derived, [left, top], "default = origem do primeiro quad");
+
+        // Editar o texto não move o marcador nem o trecho.
+        assert!(ready.open_note_draft_for_id(note.id));
+        ready.note_draft.as_mut().unwrap().content = text_editor::Content::with_text("editada");
+        assert!(ready.save_note_draft());
+        let edited = ready.annotations.last().cloned().expect("nota editada");
+        assert_eq!(edited.marker, None, "edição preserva o default");
+        assert_eq!(edited.marker_pt(), derived);
+        assert_eq!(quads_tuple(&edited.quads), quads_tuple(&note.quads));
+        assert_eq!(edited.range, note.range);
+        assert_eq!(edited.text, "editada");
+
+        // Com o marcador arrastado, a edição o mantém onde está.
+        let marker = Some([derived[0] + 30.0, derived[1] - 20.0]);
+        let moved = Annotation {
+            marker,
+            ..edited.clone()
+        };
+        ready.annotations = vec![moved];
+        assert!(ready.open_note_draft_for_id(edited.id));
+        ready.note_draft.as_mut().unwrap().content = text_editor::Content::with_text("de novo");
+        assert!(ready.save_note_draft());
+        let again = ready.annotations.last().cloned().expect("nota reeditada");
+        assert_eq!(again.marker, marker, "edição preserva o marcador arrastado");
+        assert_eq!(again.text, "de novo");
+        assert_eq!(quads_tuple(&again.quads), quads_tuple(&note.quads));
+    }
+
+    #[test]
+    fn note_drag_small_press_opens_editor_instead_of_moving() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let note = note_on_selection(&mut ready, "clicar");
+        let page = note.page;
+        let start = note.marker_pt();
+        let mut session = Session::Ready(Tabs::single(ready));
+        let undo_before = undo_len(&session);
+        // Press + release sem passar do limiar (2 pontos de página ≈ 1 px):
+        // é clique — abre a edição e não move nada.
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page,
+                page_pt: start,
+                sheet: [10.0, 10.0],
+            },
+        );
+        apply(
+            &mut session,
+            Message::PointerMove {
+                page,
+                page_pt: [start[0] + 2.0, start[1]],
+            },
+        );
+        match &session {
+            Session::Ready(ready) => assert!(ready.note_drag_ghost(page).is_none()),
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::PointerUp { page, page_pt: start });
+        match &session {
+            Session::Ready(ready) => {
+                assert_eq!(ready.note_draft.as_ref().unwrap().editing, Some(note.id));
+                assert_eq!(
+                    quads_tuple(&ready.annotations[0].quads),
+                    quads_tuple(&note.quads)
+                );
+                assert_eq!(ready.annotations[0].marker, None, "clique não move");
+                assert_eq!(ready.annot_undo.len(), undo_before, "clique não empilha");
+                assert!(ready.selection.is_none(), "clique não seleciona o trecho");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn note_drag_cancel_paths_leave_note_untouched() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let note = note_on_selection(&mut ready, "cancelar");
+        let page = note.page;
+        let start = note.marker_pt();
+        let to = [start[0] + 40.0, start[1] + 25.0];
+
+        // Soltar fora da folha (a vista manda DragCancelled): nada muda.
+        let mut session = Session::Ready(Tabs::single(ready));
+        let undo_before = undo_len(&session);
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page,
+                page_pt: start,
+                sheet: [0.0, 0.0],
+            },
+        );
+        apply(
+            &mut session,
+            Message::PointerMove {
+                page,
+                page_pt: to,
+            },
+        );
+        apply(&mut session, Message::DragCancelled);
+        match &session {
+            Session::Ready(ready) => {
+                assert!(ready.note_drag.is_none());
+                assert!(ready.note_drag_ghost(page).is_none());
+                assert_eq!(
+                    quads_tuple(&ready.annotations[0].quads),
+                    quads_tuple(&note.quads)
+                );
+                assert_eq!(ready.annotations[0].marker, None, "cancelar não move");
+                assert_eq!(ready.annot_undo.len(), undo_before, "cancelar não empilha");
+            }
+            _ => unreachable!(),
+        }
+
+        // Esc no meio do arrasto: idem (o mesmo canal fecha o post-it).
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let note = note_on_selection(&mut ready, "cancelar");
+        let mut session = Session::Ready(Tabs::single(ready));
+        let undo_before = undo_len(&session);
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page,
+                page_pt: start,
+                sheet: [0.0, 0.0],
+            },
+        );
+        apply(
+            &mut session,
+            Message::PointerMove {
+                page,
+                page_pt: to,
+            },
+        );
+        apply(&mut session, Message::ClosePrintDialog);
+        match &session {
+            Session::Ready(ready) => {
+                assert!(ready.note_drag.is_none());
+                assert_eq!(
+                    quads_tuple(&ready.annotations[0].quads),
+                    quads_tuple(&note.quads)
+                );
+                assert_eq!(ready.annotations[0].marker, None, "Esc não move");
+                assert_eq!(ready.annot_undo.len(), undo_before, "Esc não empilha");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn postit_position_is_clamped_to_window() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.note_draft = Some(dummy_draft());
+        let size = [320.0, 200.0];
+        // Âncora no canto (folha em 0,0): a margem segura o post-it.
+        assert_eq!(ready.postit_pos(size), [POSTIT_MARGIN, POSTIT_MARGIN]);
+        // Nota no fim da página: preso dentro da janela, sem vazar a borda.
+        let draft = ready.note_draft.as_mut().unwrap();
+        draft.anchor = [5000.0, 5000.0];
+        assert_eq!(
+            ready.postit_pos(size),
+            [800.0 - 320.0 - POSTIT_MARGIN, 600.0 - 200.0 - POSTIT_MARGIN]
+        );
+        // Janela menor que o post-it: ainda dentro (margem dos dois lados).
+        assert_eq!(ready.postit_pos([2000.0, 2000.0]), [POSTIT_MARGIN, POSTIT_MARGIN]);
+    }
+
+    #[test]
+    fn postit_follows_document_scroll() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let note = note_on_selection(&mut ready, "rolar");
+        let page = note.page;
+        let start = note.marker_pt();
+        let mut session = Session::Ready(Tabs::single(ready));
+        // Clique no marcador com a folha em (120, 60): abre o post-it.
+        apply(
+            &mut session,
+            Message::PointerDown {
+                page,
+                page_pt: start,
+                sheet: [120.0, 60.0],
+            },
+        );
+        apply(&mut session, Message::PointerUp { page, page_pt: start });
+        let before = match &session {
+            Session::Ready(ready) => {
+                let draft = ready.note_draft.as_ref().expect("post-it aberto");
+                assert!(
+                    draft.anchor[0] > 120.0 && draft.anchor[1] >= 60.0,
+                    "nasce ancorado dentro da folha: {:?}",
+                    draft.anchor
+                );
+                ready.postit_pos(POSTIT_SIZE_TEST)
+            }
+            _ => unreachable!(),
+        };
+        // Rolar o documento sobe a folha: o post-it sobe junto (mesmo delta).
+        apply(&mut session, Message::DocScrolled(30.0));
+        match &session {
+            Session::Ready(ready) => {
+                assert_eq!(
+                    ready.postit_pos(POSTIT_SIZE_TEST)[1],
+                    before[1] - 30.0
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn glyph_at(cluster: &str, x0: f32, y0: f32, x1: f32, y1: f32) -> Glyph {
@@ -4663,6 +5615,7 @@ mod tests {
             Message::PointerDown {
                 page: PageNo::first(),
                 page_pt: [-1000.0, -1000.0],
+                sheet: [0.0, 0.0],
             },
         );
         match &session {
@@ -4711,6 +5664,7 @@ mod tests {
             Message::PointerDown {
                 page: PageNo::first(),
                 page_pt: [-1000.0, -1000.0],
+                sheet: [0.0, 0.0],
             },
         );
         // ...e arrastar dali estende a seleção (não fica travada).
