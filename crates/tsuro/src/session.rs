@@ -2902,6 +2902,19 @@ impl Ready {
         Scale::from_factor(css * dpr)
     }
 
+    /// Fator de zoom exibido (CSS, 1.0 = 100%) de onde partem os passos de
+    /// +/− da barra. Ajuste na mídia girada, como o render: com a vista a
+    /// 90°/270° o passo parte do que está na tela, não da página original.
+    pub(crate) fn zoom_step_factor(&self) -> f32 {
+        match self.zoom {
+            Zoom::Manual(z) => z.get(),
+            Zoom::Width | Zoom::Page => self
+                .zoom
+                .scale(self.viewport, self.rotated_media(self.visible))
+                .factor(),
+        }
+    }
+
     fn thumb_scale_for(&self, media: MediaBox) -> Scale {
         let dpr = if self.render_scale >= 1.0 {
             self.render_scale
@@ -6234,6 +6247,95 @@ mod tests {
             ready.page_scale(page),
             Zoom::Page.scale(ready.viewport, swapped)
         );
+    }
+
+    #[test]
+    fn zoom_step_follows_rotated_fit() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.zoom = Zoom::Page;
+        let page = ready.visible;
+        let media = ready.media(page);
+        let upright = ready.zoom_step_factor();
+        ready.view_rotation = 1;
+        assert_eq!(
+            ready.zoom_step_factor(),
+            Zoom::Page.scale(ready.viewport, ready.rotated_media(page)).factor()
+        );
+        // Página não quadrada: girar muda o ajuste, então o passo de +/− tem
+        // de partir do fator girado (antes partia do original e o + encolhia).
+        if media.width != media.height {
+            assert_ne!(ready.zoom_step_factor(), upright);
+        }
+    }
+
+    /// Spec rotação (smoke): com a vista girada, clicar na geometria
+    /// exibida de um glifo seleciona esse glifo e o quad pintado cobre o
+    /// ponto clicado — a seleção acompanha a página girada.
+    #[test]
+    fn click_on_rotated_page_selects_the_clicked_glyph() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 900.0,
+            height: 700.0,
+        };
+        ready.zoom = Zoom::Page;
+        let page = PageNo::first();
+        ready.visible = page;
+        let media = ready.media(page);
+        let Some(layer) = ready.pages.text[page.index() as usize].clone() else {
+            return;
+        };
+        // Glifo com texto real (espaço não gera seleção), do meio da página.
+        let middle = layer.glyphs.len() / 2;
+        let Some(k) = (middle..layer.glyphs.len()).chain(0..middle).find(|&i| {
+            let (start, end) = glyph_byte_range(&layer, i);
+            !layer
+                .slice(TextRange { start, end })
+                .trim()
+                .is_empty()
+        }) else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        for step in 0..4u8 {
+            if step > 0 {
+                apply(&mut session, Message::RotateView);
+            }
+            let Session::Ready(ready) = &session else {
+                panic!("expected Ready");
+            };
+            assert_eq!(ready.view_rotation, step);
+            let rotated = ready.rotated_media(page);
+            let (dw, dh) = (900.0, 900.0 * rotated.height / rotated.width.max(1.0));
+            let [x, y, w, h] = display_rect(layer.glyphs[k].quad, media, step, dw, dh);
+            let at = [x + w / 2.0, y + h / 2.0];
+            let page_pt = page_pt_at(at, media, step, dw, dh);
+            apply(&mut session, Message::PointerDown { page, page_pt });
+            let Session::Ready(ready) = &session else {
+                panic!("expected Ready");
+            };
+            let (sel_page, quads) = ready
+                .selection_quads()
+                .unwrap_or_else(|| panic!("rotação {step}: clique no texto não selecionou"));
+            assert_eq!(sel_page, page);
+            assert!(
+                quads.iter().any(|q| {
+                    let [qx, qy, qw, qh] = display_rect(*q, media, step, dw, dh);
+                    (qx - 1.0..=qx + qw + 1.0).contains(&at[0])
+                        && (qy - 1.0..=qy + qh + 1.0).contains(&at[1])
+                }),
+                "rotação {step}: quad pintado não cobriu o clique"
+            );
+            apply(&mut session, Message::PointerUp { page, page_pt });
+        }
     }
 
     #[test]

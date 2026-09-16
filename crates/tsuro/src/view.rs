@@ -376,13 +376,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
         })
         .style(kiri::pill_style(t))
         .max_width(520.0);
-        let current = match ready.zoom {
-            Zoom::Manual(z) => z.get(),
-            Zoom::Width | Zoom::Page => ready
-                .zoom
-                .scale(ready.viewport(), ready.media(ready.visible))
-                .factor(),
-        };
+        let current = ready.zoom_step_factor();
         let out = Zoom::Manual(ZoomFactor::new(current / 1.1));
         let into = Zoom::Manual(ZoomFactor::new(current * 1.1));
 
