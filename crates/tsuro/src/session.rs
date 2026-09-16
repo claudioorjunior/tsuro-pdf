@@ -1136,29 +1136,65 @@ impl SurfaceCache {
     }
 }
 
+/// Teto do cache de miniaturas em bytes RGBA (issue #47): janela típica
+/// cabe folgada; páginas grandes são as primeiras a sair (LRU por geração).
+const THUMB_CACHE_BUDGET: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Default)]
 struct ThumbCache {
-    entries: HashMap<(u32, u16), CachedSurface>,
+    entries: HashMap<(u32, u16), (u64, CachedSurface)>,
+    /// Geração LRU: o insert mais recente tem o maior valor.
+    generation: u64,
 }
 
 impl ThumbCache {
     fn get(&self, page: PageNo, scale: Scale) -> Option<&CachedSurface> {
-        self.entries.get(&(page.index(), scale.key()))
+        self.entries
+            .get(&(page.index(), scale.key()))
+            .map(|(_, surface)| surface)
     }
 
     fn insert(&mut self, page: PageNo, scale: Scale, surface: PageSurface) {
         let idx = page.index();
         self.entries.retain(|(page, _), _| *page != idx);
-        self.entries
-            .insert((idx, scale.key()), CachedSurface::from_page(surface, 0));
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.insert(
+            (idx, scale.key()),
+            (self.generation, CachedSurface::from_page(surface, 0)),
+        );
+        self.enforce_budget(THUMB_CACHE_BUDGET);
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.generation = 0;
     }
 
     fn retain_pages(&mut self, keep: &HashSet<u32>) {
         self.entries.retain(|(page, _), _| keep.contains(page));
+        self.enforce_budget(THUMB_CACHE_BUDGET);
+    }
+
+    /// LRU com teto em MB: estoura o orçamento, sai a entrada mais antiga
+    /// (menor geração). O `visible`/alvo do preview ficam protegidos pelo
+    /// chamador via `retain_pages` — aqui só importa a ordem de inserção.
+    fn enforce_budget(&mut self, budget: usize) {
+        let mut bytes: usize = self.entries.values().map(|(_, s)| s.byte_size()).sum();
+        while bytes > budget && self.entries.len() > 1 {
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (gen, _))| *gen)
+                .map(|(key, _)| *key);
+            let Some(key) = victim else {
+                break;
+            };
+            bytes -= self
+                .entries
+                .remove(&key)
+                .map(|(_, s)| s.byte_size())
+                .unwrap_or(0);
+        }
     }
 }
 
@@ -6435,6 +6471,27 @@ mod tests {
         thumbs.insert(page, s2, fake_surface(page, s2));
         assert!(thumbs.get(page, s1).is_none());
         assert!(thumbs.get(page, s2).is_some());
+    }
+
+    #[test]
+    fn thumb_cache_evicts_lru_when_over_budget() {
+        let scale = Scale::from_factor(1.0);
+        let mut thumbs = ThumbCache::default();
+        // 16 bytes por superfície (2×2 RGBA). Orçamento real (16 MiB) cabe a
+        // janela inteira; o teste trava o teto no mínimo para forçar a saída.
+        for i in 0..4 {
+            thumbs.insert(
+                PageNo::from_index(i),
+                scale,
+                fake_surface(PageNo::from_index(i), scale),
+            );
+        }
+        // 32 bytes = duas superfícies: as duas mais recentes sobrevivem.
+        thumbs.enforce_budget(32);
+        assert!(thumbs.get(PageNo::from_index(0), scale).is_none());
+        assert!(thumbs.get(PageNo::from_index(1), scale).is_none());
+        assert!(thumbs.get(PageNo::from_index(2), scale).is_some());
+        assert!(thumbs.get(PageNo::from_index(3), scale).is_some());
     }
 
     #[test]
