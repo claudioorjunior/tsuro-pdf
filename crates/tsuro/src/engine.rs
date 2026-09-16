@@ -682,6 +682,15 @@ mod tests {
         assert!(result.is_err(), "bytes vazios devem falhar");
     }
 
+    #[test]
+    fn pdfium_binds_when_ci_requires_it() {
+        match PdfiumEngine::bind() {
+            Ok(_) => {}
+            Err(e) if std::env::var("CI").is_ok() => panic!("{e}"),
+            Err(_) => {}
+        }
+    }
+
     fn sample_pdf_bytes() -> Option<Arc<[u8]>> {
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../public/samples/guia-folio.pdf");

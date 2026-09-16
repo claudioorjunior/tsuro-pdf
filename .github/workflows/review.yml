@@ -1,0 +1,26 @@
+name: Review
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        # -p keeps rustfmt off src-tauri (legacy).
+        run: cargo fmt -p tsuro -p tsuro-sign -- --check
+      - name: clippy
+        run: cargo clippy -p tsuro -p tsuro-sign --all-targets
