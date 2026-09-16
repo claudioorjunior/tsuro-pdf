@@ -23,6 +23,7 @@ Rust edition 2021, stable toolchain (`rust-toolchain.toml`). Viewer: `iced 0.13`
 - `cargo test -p tsuro` — session, browse, engine (run before every PR)
 - `cargo test -p tsuro-sign` — digital signatures
 - `.github/workflows/pr.yml` — same two commands on `pull_request` (macos-14, windows-latest)
+- `.github/workflows/review.yml` — rustfmt --check and clippy on `pull_request` (macos-14, tsuro + tsuro-sign only)
 - `.github/workflows/issues.yml` — `needs-triage` / `needs-info` on issue open and edit
 - `cargo run -p tsuro -- public/samples/guia-folio.pdf` — manual check
 - `./scripts/bundle-macos.sh` — macOS `.app`
@@ -44,6 +45,7 @@ Rust edition 2021, stable toolchain (`rust-toolchain.toml`). Viewer: `iced 0.13`
 - `crates/tsuro-sign/` — PDF + CMS signature engine (`SigError`, `CertificateInfo`)
 - `scripts/install-tsuro.ts` — instalador Bun (não entra no `.app`)
 - `.github/workflows/pr.yml` — `cargo test` on pull_request
+- `.github/workflows/review.yml` — rustfmt --check and clippy on pull_request
 - `.github/workflows/issues.yml` — triage labels on issues
 - `.github/workflows/release.yml` — DMG + NSIS no tag `v*`
 - New viewer code → `crates/tsuro/...`; new signature code → `crates/tsuro-sign/...`. NEVER in the legacy tree.

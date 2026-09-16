@@ -32,6 +32,7 @@ A new issue gets the `needs-triage` label from `.github/workflows/issues.yml`. A
    ```
 
    `.github/workflows/pr.yml` runs the same commands on macos-14 and windows-latest.
+   `.github/workflows/review.yml` runs rustfmt --check and clippy on those same packages.
 4. New viewer code → `crates/tsuro/...`; signature code → `crates/tsuro-sign/...`.
 
 Commits follow [Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/): `type(scope): description (#issue) (#PR)`.
