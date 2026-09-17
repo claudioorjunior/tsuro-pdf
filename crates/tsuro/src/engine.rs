@@ -853,6 +853,48 @@ mod tests {
         assert_send_sync::<PdfiumEngine>();
     }
 
+    /// Fixture de `scripts/generate_samples.py` (`public/samples/` é read-only:
+    /// o PDF nunca é editado à mão).
+    fn sample_engine(name: &str) -> Option<PdfiumEngine> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../public/samples")
+            .join(name);
+        let bytes = std::fs::read(path).ok()?;
+        PdfiumEngine::open(Arc::from(bytes.as_slice())).ok()
+    }
+
+    #[test]
+    fn outline_reads_nested_bookmarks_with_pages() {
+        let Some(engine) = sample_engine("sumario-folio.pdf") else {
+            return; // sem Pdfium ao lado do binário de teste
+        };
+        let outline = engine
+            .outline()
+            .expect("leitura do outline")
+            .expect("o fixture declara bookmarks");
+        assert_eq!(outline.items.len(), 16);
+        assert_eq!(outline.items[0].title, "1. Identificação das partes");
+        assert_eq!(outline.items[0].page, PageNo::first());
+        assert!(outline.items[0].children.is_empty());
+        // Nó com filhos: título, página (0-based) e ordem dos filhos.
+        let precos = &outline.items[3];
+        assert_eq!(precos.title, "4. Preços e reajuste");
+        assert_eq!(precos.page, PageNo::from_index(3));
+        assert_eq!(precos.children.len(), 2);
+        assert_eq!(precos.children[0].title, "4.1 Reajuste anual");
+        assert_eq!(precos.children[1].title, "4.2 Revisão extraordinária");
+        assert_eq!(precos.children[1].page, PageNo::from_index(3));
+    }
+
+    #[test]
+    fn outline_is_none_for_pdf_without_bookmarks() {
+        let Some(engine) = sample_engine("guia-folio.pdf") else {
+            return;
+        };
+        // `None`, não árvore vazia: a aba Sumário só existe quando há outline.
+        assert!(engine.outline().expect("leitura do outline").is_none());
+    }
+
     #[test]
     fn frameworks_path_points_at_bundle_lib() {
         let exe = Path::new("/Applications/TsuroPDF.app/Contents/MacOS/TsuroPDF");

@@ -1471,9 +1471,12 @@ fn panel_tabs(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 /// destaque da ativa.
 fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let active = ready.outline_active();
+    let focus = ready.outline_focus();
     let mut col = column![].spacing(2);
     for (path, depth, title, page, has_children) in ready.outline_rows() {
         let is_active = active.as_ref() == Some(&path);
+        // O cursor do teclado é a pílula; a página ativa, o texto em accent.
+        let is_focus = focus.as_ref() == Some(&path);
         let fold: Element<'_, Message> = if has_children {
             let collapsed = ready.outline_collapsed.contains(&path);
             button(text(if collapsed { "▸" } else { "▾" }).size(11))
@@ -1492,7 +1495,7 @@ fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         )
         .width(Length::Fill)
         .padding(Padding::from([4, 6]))
-        .style(kiri::panel_toc_item_style(t, is_active))
+        .style(kiri::panel_toc_item_style(t, is_active || is_focus))
         .on_press(Message::OutlineJump(page));
         col = col.push(
             row![
