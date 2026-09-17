@@ -351,9 +351,7 @@ pub fn hud_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
 
 /// Ação primária teal do HUD/overlays (Stitch): fundo `accent`, texto escuro
 /// (`bg`, que inverte no tema claro), raio 99.
-pub fn hud_primary_style(
-    tokens: Tokens,
-) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+pub fn hud_primary_style(tokens: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let background = match status {
             button::Status::Hovered | button::Status::Pressed => lift(tokens.accent, 0.08),
@@ -386,7 +384,11 @@ pub fn hud_ghost_style(tokens: Tokens) -> impl Fn(&iced::Theme, button::Status) 
             } else {
                 Color::TRANSPARENT
             })),
-            text_color: if interactive { tokens.ink } else { tokens.muted },
+            text_color: if interactive {
+                tokens.ink
+            } else {
+                tokens.muted
+            },
             border: Border {
                 radius: 6.0.into(),
                 ..Border::default()
@@ -569,7 +571,11 @@ pub fn panel_thumb_style(
     move |_| container::Style {
         background: None,
         border: Border {
-            color: if active { tokens.accent } else { Color::TRANSPARENT },
+            color: if active {
+                tokens.accent
+            } else {
+                Color::TRANSPARENT
+            },
             width: 2.0,
             radius: 5.0.into(),
         },

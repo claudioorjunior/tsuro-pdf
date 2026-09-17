@@ -113,20 +113,30 @@ fn hud(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let current = ready.zoom_step_factor();
     let out = Zoom::Manual(ZoomFactor::new(current / 1.1));
     let into = Zoom::Manual(ZoomFactor::new(current * 1.1));
-    let mono = |s: String, color: Color| {
-        text(s)
-            .size(12)
-            .font(iced::Font::MONOSPACE)
-            .color(color)
-    };
+    let mono = |s: String, color: Color| text(s).size(12).font(iced::Font::MONOSPACE).color(color);
     let mut pill = row![
-        hud_icon("chevron-left", "Página anterior", t, Message::Nav(NavCmd::Previous)),
+        hud_icon(
+            "chevron-left",
+            "Página anterior",
+            t,
+            Message::Nav(NavCmd::Previous)
+        ),
         mono(page.to_string(), t.ink),
         mono("/".to_string(), t.muted),
         mono(n.to_string(), t.muted),
-        hud_icon("chevron-right", "Próxima página", t, Message::Nav(NavCmd::Next)),
+        hud_icon(
+            "chevron-right",
+            "Próxima página",
+            t,
+            Message::Nav(NavCmd::Next)
+        ),
         kiri::vsep(t),
-        hud_icon("fit-width", "Ajustar à largura", t, Message::SetZoom(Zoom::Width)),
+        hud_icon(
+            "fit-width",
+            "Ajustar à largura",
+            t,
+            Message::SetZoom(Zoom::Width)
+        ),
         hud_icon("minus", "Diminuir zoom", t, Message::SetZoom(out)),
         mono(format!("{}%", (current * 100.0).round() as i32), t.ink),
         hud_icon("plus", "Aumentar zoom", t, Message::SetZoom(into)),
@@ -1125,9 +1135,13 @@ fn empty_browser(empty: &EmptyState, t: Tokens) -> Element<'_, Message> {
 
     let header = row![
         section_title("Documentos recentes", t),
-        container(text(empty.recents.len().to_string()).size(10).color(t.muted))
-            .padding(Padding::from([1, 6]))
-            .style(kiri::empty_badge_style(t)),
+        container(
+            text(empty.recents.len().to_string())
+                .size(10)
+                .color(t.muted)
+        )
+        .padding(Padding::from([1, 6]))
+        .style(kiri::empty_badge_style(t)),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -1195,7 +1209,11 @@ fn empty_card(path: &std::path::Path, t: Tokens) -> Element<'static, Message> {
         .unwrap_or_else(|| path.display().to_string());
     let mut info = column![text(name).size(13)].spacing(2);
     if let Some(parent) = path.parent().and_then(|p| p.file_name()) {
-        info = info.push(text(parent.to_string_lossy().into_owned()).size(11).color(t.muted));
+        info = info.push(
+            text(parent.to_string_lossy().into_owned())
+                .size(11)
+                .color(t.muted),
+        );
     }
     container(
         button(
@@ -1263,13 +1281,11 @@ fn ready_body(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 /// Painel de navegação (Stitch sidebar): cabeçalho `Navegação`, abas segmentadas
 /// Miniaturas | Sumário e lista virtualizada (miniaturas ou sumário).
 fn pages_panel(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    let mut col = column![
-        column![
-            text("Navegação").size(13).color(t.ink),
-            text("Documento ativo").size(11).color(t.muted),
-        ]
-        .spacing(2),
+    let mut col = column![column![
+        text("Navegação").size(13).color(t.ink),
+        text("Documento ativo").size(11).color(t.muted),
     ]
+    .spacing(2),]
     .spacing(8);
     if ready.outline.is_some() {
         col = col.push(panel_tabs(ready, t));
@@ -1296,12 +1312,14 @@ fn panel_tabs(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             .style(kiri::panel_seg_style(t, active))
             .on_press(msg)
     };
-    container(
-        row![
-            seg("Miniaturas", !ready.outline_open, Message::OutlineTab(false)),
-            seg("Sumário", ready.outline_open, Message::OutlineTab(true)),
-        ],
-    )
+    container(row![
+        seg(
+            "Miniaturas",
+            !ready.outline_open,
+            Message::OutlineTab(false)
+        ),
+        seg("Sumário", ready.outline_open, Message::OutlineTab(true)),
+    ])
     .padding(Padding::from(2))
     .style(kiri::panel_seg_track_style(t))
     .into()
@@ -1381,11 +1399,9 @@ fn thumbs_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             Some(surface) => image(surface.image.clone())
                 .width(Length::Fixed(120.0))
                 .into(),
-            None => container(
-                Space::new(Length::Fixed(120.0), Length::Fixed(150.0)),
-            )
-            .style(kiri::panel_thumb_frame_style(t))
-            .into(),
+            None => container(Space::new(Length::Fixed(120.0), Length::Fixed(150.0)))
+                .style(kiri::panel_thumb_frame_style(t))
+                .into(),
         };
         let active = ready.visible == page;
         col = col.push(
@@ -1395,11 +1411,9 @@ fn thumbs_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
                     column![
                         // Halo 2px `accent` na ativa (transparente fora) + gap 2px —
                         // borda sempre ocupando o mesmo espaço, sem shift de layout.
-                        container(
-                            container(preview).style(kiri::panel_thumb_frame_style(t)),
-                        )
-                        .padding(2)
-                        .style(kiri::panel_thumb_style(t, active)),
+                        container(container(preview).style(kiri::panel_thumb_frame_style(t)),)
+                            .padding(2)
+                            .style(kiri::panel_thumb_style(t, active)),
                         text(format!("Pág. {}", i + 1))
                             .size(11)
                             .font(iced::Font::MONOSPACE)
@@ -1507,7 +1521,9 @@ fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 fn continuous_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let total = ready.page_count();
     let (start, end) = ready.doc_window();
-    let mut col = column![].spacing(DOC_GAP).width(Length::Fixed(ready.doc_stage_max_width()));
+    let mut col = column![]
+        .spacing(DOC_GAP)
+        .width(Length::Fixed(ready.doc_stage_max_width()));
     if start > 0 {
         // Offset acumulado menos um gap (o spacing da coluna já conta um).
         let h = (ready.page_offset(PageNo::from_index(start)) - DOC_GAP).max(0.0);
@@ -1848,8 +1864,7 @@ fn signatures_panel(ready: &Ready, t: Tokens) -> Element<'_, Message> {
                     .and_then(|c| c.common_name.as_deref()))
                 .unwrap_or("Assinante");
             // Mesmo veredito do escudo da toolbar (status_dot_color).
-            let dot = kiri::status_dot_color(t, std::iter::once(sig.status))
-                .unwrap_or(t.muted);
+            let dot = kiri::status_dot_color(t, std::iter::once(sig.status)).unwrap_or(t.muted);
             col = col.push(
                 container(
                     column![
