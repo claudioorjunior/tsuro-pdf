@@ -2283,16 +2283,20 @@ impl Ready {
     /// Guarda <1.0 (campo ainda desconhecido) como 1.0.
     /// Ajuste usa a mídia girada: 90°/270° trocam largura ↔ altura.
     fn page_scale(&self, page: PageNo) -> Scale {
-        let css = self
-            .zoom
-            .scale(self.viewport, self.rotated_media(page))
-            .factor();
+        let css = self.sheet_css(page);
         let dpr = if self.render_scale >= 1.0 {
             self.render_scale
         } else {
             1.0
         };
         Scale::from_factor(css * dpr)
+    }
+
+    /// Fator de zoom exibido (CSS, 1.0 = 100%) de onde partem os passos de
+    /// +/− da barra. Ajuste na mídia girada, como o render: com a vista a
+    /// 90°/270° o passo parte do que está na tela, não da página original.
+    pub(crate) fn zoom_step_factor(&self) -> f32 {
+        self.sheet_css(self.visible)
     }
 
     fn thumb_scale_for(&self, media: MediaBox) -> Scale {
@@ -2360,6 +2364,8 @@ impl Ready {
     }
 
     /// Largura útil do documento: espelha `page_pane`/`ready_body` (view.rs).
+    /// É a referência do ajuste à largura — a folha desenhada (`sheet_width`)
+    /// parte daqui e aplica o zoom.
     pub(crate) fn doc_content_width(&self) -> f32 {
         let mut w = self.viewport.width - CHROME_PAD;
         if self.pages_open {
@@ -2371,18 +2377,75 @@ impl Ready {
         (w - 2.0 * DOC_PAD_X).max(1.0)
     }
 
-    /// Altura da célula (padding + folha proporcional à mídia girada).
-    pub(crate) fn doc_cell_height(&self, page: PageNo, content_width: f32) -> f32 {
+    /// Altura útil do painel: a janela menos o chrome menos o respiro da
+    /// moldura (`CHROME_PAD`, espelha `chrome()` em view.rs). A faixa de abas
+    /// já vem descontada no `WindowMetrics`.
+    pub(crate) fn doc_content_height(&self) -> f32 {
+        (self.viewport.height - CHROME_PAD).max(1.0)
+    }
+
+    /// Fator CSS do zoom (1.0 = 100%, 1pt = 1px) na página: ajuste à largura
+    /// usa a largura útil, ajuste à página cabe na moldura, manual é absoluto.
+    /// Mesma base do render (`page_scale`), do desenho (`sheet_size`) e do
+    /// rótulo (`zoom_step_factor`) — os quatro andam juntos, senão a folha,
+    /// o bitmap e o % divergem.
+    pub(crate) fn sheet_css(&self, page: PageNo) -> f32 {
         let media = self.rotated_media(page);
-        DOC_PAD_TOP + content_width * media.height.max(1.0) / media.width.max(1.0) + DOC_PAD_BOTTOM
+        match self.zoom {
+            Zoom::Manual(z) => z.get(),
+            Zoom::Width => self.doc_content_width() / media.width.max(1.0),
+            Zoom::Page => (self.doc_content_width() / media.width.max(1.0))
+                .min(self.doc_content_height() / media.height.max(1.0)),
+        }
+    }
+
+    /// Largura da folha na janela (px CSS): mídia girada × `sheet_css`. É o
+    /// que a vista desenha — em `Zoom::Width` coincide com a largura útil.
+    pub(crate) fn sheet_width(&self, page: PageNo) -> f32 {
+        (self.rotated_media(page).width.max(1.0) * self.sheet_css(page)).max(1.0)
+    }
+
+    /// Largura do palco rolável na página: a moldura útil ou a folha +
+    /// respiro, o que for maior. Conteúdo direto do `scrollable` não pode ser
+    /// `Fill` no eixo de rolagem (o iced dá assert), então o palco mede aqui:
+    /// folha estreita centraliza no palco cheio, folha larga rola na
+    /// horizontal. O −1px evita barra horizontal por erro de float (o fundo é
+    /// a mesma cor, invisível).
+    pub(crate) fn doc_stage_width(&self, page: PageNo) -> f32 {
+        let pane = self.doc_content_width() + 2.0 * DOC_PAD_X;
+        (pane - 1.0).max(self.sheet_width(page) + 2.0 * DOC_PAD_X)
+    }
+
+    /// Palco do modo contínuo: cobre a página mais larga (páginas mistas).
+    pub(crate) fn doc_stage_max_width(&self) -> f32 {
+        let mut w = self.doc_content_width() + 2.0 * DOC_PAD_X - 1.0;
+        for i in 0..self.pages.total {
+            let p = PageNo::from_index(i);
+            w = w.max(self.sheet_width(p) + 2.0 * DOC_PAD_X);
+        }
+        w.max(1.0)
+    }
+
+    /// Tamanho da folha na janela (px CSS): largura da folha × proporção da
+    /// mídia girada — o mesmo par que a vista usa para desenhar (`with_marks`).
+    pub(crate) fn sheet_size(&self, page: PageNo) -> [f32; 2] {
+        let sw = self.sheet_width(page);
+        let rotated = self.rotated_media(page);
+        [sw, sw * rotated.height.max(1.0) / rotated.width.max(1.0)]
+    }
+
+    /// Altura da célula (padding + folha proporcional à mídia girada).
+    pub(crate) fn doc_cell_height(&self, page: PageNo, sheet_width: f32) -> f32 {
+        let media = self.rotated_media(page);
+        DOC_PAD_TOP + sheet_width * media.height.max(1.0) / media.width.max(1.0) + DOC_PAD_BOTTOM
     }
 
     /// Offset Y do topo da página na coluna contínua.
     pub(crate) fn page_offset(&self, page: PageNo) -> f32 {
-        let cw = self.doc_content_width();
         let mut y = 0.0;
         for i in 0..page.index().min(self.pages.total) {
-            y += self.doc_cell_height(PageNo::from_index(i), cw) + DOC_GAP;
+            let p = PageNo::from_index(i);
+            y += self.doc_cell_height(p, self.sheet_width(p)) + DOC_GAP;
         }
         y
     }
@@ -2392,10 +2455,10 @@ impl Ready {
         if self.pages.total == 0 {
             return PageNo::first();
         }
-        let cw = self.doc_content_width();
         let mut top = 0.0;
         for i in 0..self.pages.total {
-            top += self.doc_cell_height(PageNo::from_index(i), cw);
+            let p = PageNo::from_index(i);
+            top += self.doc_cell_height(p, self.sheet_width(p));
             if y < top {
                 return PageNo::from_index(i);
             }
@@ -2409,7 +2472,7 @@ impl Ready {
             return 0.0;
         }
         let last = PageNo::from_index(self.pages.total - 1);
-        self.page_offset(last) + self.doc_cell_height(last, self.doc_content_width())
+        self.page_offset(last) + self.doc_cell_height(last, self.sheet_width(last))
     }
 
     /// Janela com widget montado: visíveis na viewport estimada ± 2 páginas.
@@ -3570,6 +3633,33 @@ mod tests {
         Some(ready)
     }
 
+    /// Zoom out encolhe a folha, não o palco: manual 25% numa mídia 100pt →
+    /// folha 25px, palco na moldura útil (sem barra horizontal). Zoom in 8× →
+    /// folha 800px, palco acompanha (com barra horizontal).
+    #[test]
+    fn sheet_scales_with_zoom_and_stage_covers_it() {
+        let Some(mut ready) = uniform_ready() else {
+            return;
+        };
+        let page = PageNo::first();
+        let pane = 744.0 + 2.0 * DOC_PAD_X;
+        // Ajuste à largura: folha coincide com a largura útil.
+        ready.zoom = Zoom::Width;
+        assert!((ready.sheet_width(page) - 744.0).abs() < 0.001);
+        // Zoom out: folha 25px, palco segue na moldura (menor que o painel).
+        ready.zoom = Zoom::Manual(ZoomFactor::new(0.25));
+        assert!((ready.sheet_width(page) - 25.0).abs() < 0.001);
+        assert!((ready.doc_stage_width(page) - (pane - 1.0)).abs() < 0.001);
+        assert!(ready.doc_stage_width(page) < pane);
+        // Zoom in: folha 800px, palco acompanha para rolar.
+        ready.zoom = Zoom::Manual(ZoomFactor::new(8.0));
+        assert!((ready.sheet_width(page) - 800.0).abs() < 0.001);
+        assert!((ready.doc_stage_width(page) - (800.0 + 2.0 * DOC_PAD_X)).abs() < 0.001);
+        assert!(ready.doc_stage_width(page) > pane);
+        // Contínuo cobre a página mais larga.
+        assert!((ready.doc_stage_max_width() - ready.doc_stage_width(page)).abs() < 0.001);
+    }
+
     /// Largura útil 744 (800 − 8 − 48); célula 1548 (28 + 744×2 + 32); passo 1564.
     #[test]
     fn continuous_offsets_match_cell_geometry() {
@@ -4709,10 +4799,37 @@ mod tests {
             width: media.height,
             height: media.width,
         };
-        assert_eq!(
-            ready.page_scale(page),
-            Zoom::Page.scale(ready.viewport, swapped)
-        );
+        // Ajuste à página cabe na moldura útil (não na janela cheia).
+        let avail_w = 800.0 - CHROME_PAD - 2.0 * DOC_PAD_X;
+        let avail_h = 600.0 - CHROME_PAD;
+        let expect = (avail_w / swapped.width).min(avail_h / swapped.height);
+        assert!((ready.page_scale(page).factor() - expect).abs() < 0.002);
+    }
+
+    #[test]
+    fn zoom_step_follows_rotated_fit() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.zoom = Zoom::Page;
+        let page = ready.visible;
+        let media = ready.media(page);
+        let upright = ready.zoom_step_factor();
+        ready.view_rotation = 1;
+        let rotated = ready.rotated_media(page);
+        let avail_w = 800.0 - CHROME_PAD - 2.0 * DOC_PAD_X;
+        let avail_h = 600.0 - CHROME_PAD;
+        let expect = (avail_w / rotated.width).min(avail_h / rotated.height);
+        assert!((ready.zoom_step_factor() - expect).abs() < 0.001);
+        // Página não quadrada: girar muda o ajuste, então o passo de +/− tem
+        // de partir do fator girado (antes partia do original e o + encolhia).
+        if media.width != media.height {
+            assert_ne!(ready.zoom_step_factor(), upright);
+        }
     }
 
     #[test]
@@ -5057,15 +5174,14 @@ mod tests {
         let Some(mut ready) = sample_ready() else {
             return;
         };
-        let css = ready.zoom.scale(ready.viewport, ready.media(ready.visible));
-        assert_eq!(ready.page_scale(ready.visible), css);
+        // `Scale` quantiza em 1/1000: compara fator com tolerância, senão o
+        // arredondado × 2 diverge do dobro arredondado em 1 unidade.
+        let css = ready.sheet_css(ready.visible);
+        assert!((ready.page_scale(ready.visible).factor() - css).abs() < 0.002);
         ready.render_scale = 2.0;
-        assert_eq!(
-            ready.page_scale(ready.visible),
-            Scale::from_factor(css.factor() * 2.0)
-        );
+        assert!((ready.page_scale(ready.visible).factor() - css * 2.0).abs() < 0.002);
         ready.render_scale = 0.0;
-        assert_eq!(ready.page_scale(ready.visible), css);
+        assert!((ready.page_scale(ready.visible).factor() - css).abs() < 0.002);
     }
 
     #[test]

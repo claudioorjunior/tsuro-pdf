@@ -110,13 +110,7 @@ fn hud_icon(
 fn hud(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let n = ready.page_count().max(1);
     let page = ready.visible.index() + 1;
-    let current = match ready.zoom {
-        Zoom::Manual(z) => z.get(),
-        Zoom::Width | Zoom::Page => ready
-            .zoom
-            .scale(ready.viewport(), ready.media(ready.visible))
-            .factor(),
-    };
+    let current = ready.zoom_step_factor();
     let out = Zoom::Manual(ZoomFactor::new(current / 1.1));
     let into = Zoom::Manual(ZoomFactor::new(current * 1.1));
     let mono = |s: String, color: Color| {
@@ -1442,30 +1436,47 @@ fn page_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 }
 
 fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    let cw = ready.doc_content_width();
+    let sw = ready.sheet_width(ready.visible);
+    let stage_w = ready.doc_stage_width(ready.visible);
+    let rotated = ready.rotated_media(ready.visible);
+    let sh = sw * rotated.height.max(1.0) / rotated.width.max(1.0);
     let page_view: Element<'_, Message> = match ready.visible_surface() {
         Some(surface) => with_marks(
             ready,
             ready.visible,
-            cw,
-            image(surface.image.clone()).width(Length::Fixed(cw)).into(),
+            sw,
+            image(surface.image.clone())
+                .width(Length::Fixed(sw))
+                .height(Length::Fixed(sh))
+                .into(),
         ),
-        None if ready.visible_render_failed() => {
-            text("Não foi possível renderizar esta página.").into()
+        // Sem bitmap: caixa do tamanho da folha (mesma geometria do
+        // placeholder do contínuo) — sem salto de layout quando chega.
+        None => {
+            let msg = if ready.visible_render_failed() {
+                "Não foi possível renderizar esta página."
+            } else {
+                "Renderizando página…"
+            };
+            container(text(msg).size(13).color(t.muted))
+                .width(Length::Fixed(sw))
+                .height(Length::Fixed(sh))
+                .center_x(Length::Fixed(sw))
+                .align_y(Alignment::Center)
+                .into()
         }
-        None => text("Renderizando página…").into(),
     };
 
     scrollable(
         container(
+            // A moldura abraça a folha: só ela escala com o zoom, o palco
+            // fora segue estável.
             container(page_view)
-                .width(Length::Fill)
-                .center_x(Length::Fill)
+                .center_x(Length::Shrink)
                 .padding(0)
                 .style(kiri::page_frame(&t)),
         )
-        .width(Length::Fill)
-        .center_x(Length::Fill)
+        .center_x(Length::Fixed(stage_w))
         .padding(Padding {
             top: DOC_PAD_TOP,
             right: DOC_PAD_X,
@@ -1478,6 +1489,14 @@ fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             ..container::Style::default()
         }),
     )
+    .id(doc_scroll_id())
+    .direction(scrollable::Direction::Both {
+        vertical: scrollable::Scrollbar::default(),
+        horizontal: scrollable::Scrollbar::default(),
+    })
+    // A rolagem do modo página também entra no estado: o post-it aberto segue
+    // a folha (a âncora é janela, a rolagem é o delta).
+    .on_scroll(|viewport| Message::DocScrolled(viewport.absolute_offset().y))
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
@@ -1486,17 +1505,16 @@ fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 /// Rolagem contínua: coluna de células com a mesma estrutura da página única;
 /// fora da janela, placeholders de altura exata (sem montar bitmaps).
 fn continuous_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    let cw = ready.doc_content_width();
     let total = ready.page_count();
     let (start, end) = ready.doc_window();
-    let mut col = column![].spacing(DOC_GAP).width(Length::Fill);
+    let mut col = column![].spacing(DOC_GAP).width(Length::Fixed(ready.doc_stage_max_width()));
     if start > 0 {
         // Offset acumulado menos um gap (o spacing da coluna já conta um).
         let h = (ready.page_offset(PageNo::from_index(start)) - DOC_GAP).max(0.0);
         col = col.push(Space::with_height(Length::Fixed(h)));
     }
     for i in start..end {
-        col = col.push(doc_cell(ready, PageNo::from_index(i), cw, t));
+        col = col.push(doc_cell(ready, PageNo::from_index(i), t));
     }
     if end < total {
         let h = (ready.doc_total_height() - ready.page_offset(PageNo::from_index(end)) - DOC_GAP)
@@ -1505,34 +1523,45 @@ fn continuous_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     }
     scrollable(col)
         .id(doc_scroll_id())
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::default(),
+            horizontal: scrollable::Scrollbar::default(),
+        })
         .on_scroll(|viewport| Message::DocScrolled(viewport.absolute_offset().y))
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
 
-fn doc_cell(ready: &Ready, page: PageNo, cw: f32, t: Tokens) -> Element<'_, Message> {
+fn doc_cell(ready: &Ready, page: PageNo, t: Tokens) -> Element<'_, Message> {
+    let sw = ready.sheet_width(page);
+    let rotated = ready.rotated_media(page);
+    let sh = sw * rotated.height.max(1.0) / rotated.width.max(1.0);
     let inner: Element<'_, Message> = match ready.page_surface(page) {
         Some(surface) => with_marks(
             ready,
             page,
-            cw,
-            image(surface.image.clone()).width(Length::Fixed(cw)).into(),
+            sw,
+            image(surface.image.clone())
+                .width(Length::Fixed(sw))
+                .height(Length::Fixed(sh))
+                .into(),
         ),
         None => {
-            let h = (ready.doc_cell_height(page, cw) - DOC_PAD_TOP - DOC_PAD_BOTTOM).max(1.0);
+            let h = (ready.doc_cell_height(page, sw) - DOC_PAD_TOP - DOC_PAD_BOTTOM).max(1.0);
             container(text("Renderizando página…").size(13).color(t.muted))
-                .width(Length::Fill)
+                .width(Length::Fixed(sw))
                 .height(Length::Fixed(h))
-                .center_x(Length::Fill)
+                .center_x(Length::Fixed(sw))
                 .align_y(Alignment::Center)
                 .into()
         }
     };
     container(
+        // A moldura abraça a folha: só ela escala com o zoom, o palco fora
+        // segue estável.
         container(inner)
-            .width(Length::Fill)
-            .center_x(Length::Fill)
+            .center_x(Length::Shrink)
             .padding(0)
             .style(kiri::page_frame(&t)),
     )
