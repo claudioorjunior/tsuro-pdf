@@ -578,26 +578,37 @@ fn overflow_layer(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         .into()
 }
 
-/// Menu ⋯ (PR 4): zoom página, copiar, fechar, aparência.
+/// Menu ⋯ (PR 4): zoom, girar, imprimir, histórico, modo, copiar,
+/// desfazer/refazer, salvar, fechar, aparência.
+/// Ícones Ori nas linhas acionáveis: fit-page, rotate, print,
+/// chevron-left, chevron-right, page-single, pages, copy, undo, redo,
+/// save, x. Headers "Modo de página"/"Aparência" e Escuro/Claro sem ícone.
 fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let mut items = column![].spacing(2).width(Length::Fill);
     items = items.push(menu_item(
         t,
+        "fit-page",
         "Ajustar página inteira",
         Message::SetZoom(Zoom::Page),
     ));
-    items = items.push(menu_item(t, "Girar vista (90°)", Message::RotateView));
-    items = items.push(print_menu_item(t));
+    items = items.push(menu_item(t, "rotate", "Girar vista (90°)", Message::RotateView));
+    items = items.push(menu_item(t, "print", "Imprimir", Message::OpenPrintDialog));
     if ready.can_history_back() {
-        items = items.push(menu_item(t, "Voltar", Message::HistoryBack));
+        items = items.push(menu_item(t, "chevron-left", "Voltar", Message::HistoryBack));
     }
     if ready.can_history_forward() {
-        items = items.push(menu_item(t, "Avançar", Message::HistoryForward));
+        items = items.push(menu_item(
+            t,
+            "chevron-right",
+            "Avançar",
+            Message::HistoryForward,
+        ));
     }
     items = items.push(text("Modo de página").size(12).color(t.muted));
     let single = ready.view_mode == ViewMode::Single;
     items = items.push(menu_item(
         t,
+        "page-single",
         if single {
             "● Página única"
         } else {
@@ -607,6 +618,7 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     ));
     items = items.push(menu_item(
         t,
+        "pages",
         if single {
             "○ Rolagem contínua"
         } else {
@@ -615,22 +627,23 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         Message::SetViewMode(ViewMode::Continuous),
     ));
     if ready.selection_plain_text().is_some() {
-        items = items.push(menu_item(t, "Copiar seleção", Message::CopySelection));
+        items = items.push(menu_item(t, "copy", "Copiar seleção", Message::CopySelection));
     }
     if ready.can_annot_undo() {
-        items = items.push(menu_item(t, "Desfazer marcação", Message::AnnotUndo));
+        items = items.push(menu_item(t, "undo", "Desfazer marcação", Message::AnnotUndo));
     }
     if ready.can_annot_redo() {
-        items = items.push(menu_item(t, "Refazer marcação", Message::AnnotRedo));
+        items = items.push(menu_item(t, "redo", "Refazer marcação", Message::AnnotRedo));
     }
     if !ready.annotations.is_empty() {
         items = items.push(menu_item(
             t,
+            "save",
             "Salvar cópia com marcações…",
             Message::SaveCopyRequested,
         ));
     }
-    items = items.push(menu_item(t, "Fechar documento", Message::Close));
+    items = items.push(menu_item(t, "x", "Fechar documento", Message::Close));
     items = items.push(
         container(Space::with_height(Length::Fixed(1.0)))
             .width(Length::Fill)
@@ -655,26 +668,21 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         .into()
 }
 
-fn menu_item(t: Tokens, label: &'static str, message: Message) -> Element<'static, Message> {
-    button(text(label).size(13))
-        .width(Length::Fill)
-        .padding(Padding::from([8, 10]))
-        .style(kiri::menu_item_style(t))
-        .on_press(message)
-        .into()
-}
-
-/// ⋯ → Imprimir: abre o diálogo próprio.
-fn print_menu_item(t: Tokens) -> Element<'static, Message> {
+fn menu_item(
+    t: Tokens,
+    icon: &str,
+    label: &'static str,
+    message: Message,
+) -> Element<'static, Message> {
     button(
-        row![kiri::ori!("print"), text("Imprimir").size(13)]
+        row![kiri::ori_icon(icon, 16.0), text(label).size(13)]
             .spacing(8)
             .align_y(Alignment::Center),
     )
     .width(Length::Fill)
     .padding(Padding::from([8, 10]))
     .style(kiri::menu_item_style(t))
-    .on_press(Message::OpenPrintDialog)
+    .on_press(message)
     .into()
 }
 
@@ -1382,8 +1390,7 @@ fn tab_strip(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
                 tip(
                     control(
                         t,
-                        button(text("×").size(14).color(t.muted))
-                            .on_press(Message::CloseTab(index)),
+                        button(kiri::ori!("x")).on_press(Message::CloseTab(index)),
                     ),
                     "Fechar aba (⌘W)",
                 ),
