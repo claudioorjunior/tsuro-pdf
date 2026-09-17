@@ -94,9 +94,10 @@ fn hex(r: u8, g: u8, b: u8) -> Color {
 
 /// Ícone Ori (origami tsuru) — cor fixa no SVG, sem `.style()`.
 /// Uso: `ori!("folder-open")` → 16×16. Pílula de busca usa `ori_small!`.
-/// V2 (21 ícones): folder, file-text, x, copy, highlighter, underline,
+/// V2 (26 ícones): folder, file-text, x, copy, highlighter, underline,
 /// strike, note, fit-page, folder-open, search, chevron-left, chevron-right,
-/// minus, plus, fit-width, pages, shield, home, more, print.
+/// minus, plus, fit-width, pages, shield, home, more, print, rotate, undo,
+/// redo, save, page-single.
 #[allow(unused_macros)]
 macro_rules! ori {
     ($file:literal) => {
@@ -140,6 +141,11 @@ pub fn ori_icon<Message: 'static>(file: &str, size: f32) -> iced::Element<'stati
         "strike" => include_bytes!("../assets/icons/ori/strike.svg"),
         "note" => include_bytes!("../assets/icons/ori/note.svg"),
         "fit-page" => include_bytes!("../assets/icons/ori/fit-page.svg"),
+        "rotate" => include_bytes!("../assets/icons/ori/rotate.svg"),
+        "undo" => include_bytes!("../assets/icons/ori/undo.svg"),
+        "redo" => include_bytes!("../assets/icons/ori/redo.svg"),
+        "save" => include_bytes!("../assets/icons/ori/save.svg"),
+        "page-single" => include_bytes!("../assets/icons/ori/page-single.svg"),
         _ => include_bytes!("../assets/icons/ori/more.svg"),
     };
     svg(svg::Handle::from_memory(bytes))
