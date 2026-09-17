@@ -1155,7 +1155,7 @@ fn empty_browser(empty: &EmptyState, t: Tokens) -> Element<'_, Message> {
     .spacing(8)
     .align_y(Alignment::Center);
 
-    let drop_h = 180.0;
+    let drop_h = 248.0;
     let dropzone = container(
         container(stack![
             Canvas::new(EmptyDash { color: t.line })
@@ -1163,10 +1163,14 @@ fn empty_browser(empty: &EmptyState, t: Tokens) -> Element<'_, Message> {
                 .height(Length::Fixed(drop_h)),
             container(
                 column![
-                    image(image::Handle::from_bytes(
-                        &include_bytes!("../../../public/tsuro-horizontal.png")[..],
-                    ))
-                    .width(Length::Fixed(180.0)),
+                    container(
+                        image(image::Handle::from_bytes(
+                            &include_bytes!("../../../public/tsuro-horizontal-pdf.png")[..],
+                        ))
+                        .width(Length::Fixed(200.0)),
+                    )
+                    .padding(8)
+                    .style(kiri::logo_stage_style()),
                     text("Nenhum documento aberto").size(18),
                     text("Arraste e solte um arquivo PDF aqui")
                         .size(13)

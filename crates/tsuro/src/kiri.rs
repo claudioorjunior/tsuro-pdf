@@ -508,6 +508,19 @@ pub fn empty_badge_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::
     }
 }
 
+/// Palco do lockup Tsuro: fundo escuro fixo, não segue o tema. O lockup
+/// foi desenhado para fundo escuro — sem o palco ele some no tema claro.
+pub fn logo_stage_style() -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(Color::from_rgb8(0x18, 0x18, 0x18))),
+        border: Border {
+            radius: 10.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
 // ── Fatia painéis laterais (Stitch §5 Miniaturas) ─────────────────────────
 
 /// Painel lateral (navegação / assinaturas): fundo chrome, hairline `line`,
