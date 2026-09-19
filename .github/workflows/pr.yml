@@ -1,0 +1,59 @@
+name: PR
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset: pdfium-mac-arm64.tgz
+            lib: libpdfium.dylib
+            plant: target/debug/deps target/debug/Frameworks target/debug
+          - os: windows-latest
+            asset: pdfium-win-x64.tgz
+            lib: pdfium.dll
+            plant: target/debug/deps target/debug
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Pdfium
+        shell: bash
+        env:
+          PDFIUM_RELEASE: chromium/8044
+        run: |
+          curl -fsSL --max-time 180 -o pdfium.tgz \
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_RELEASE}/${{ matrix.asset }}"
+          mkdir -p pdfium-extract
+          tar xzf pdfium.tgz -C pdfium-extract
+          FOUND="$(find pdfium-extract -name '${{ matrix.lib }}' -type f | head -n 1)"
+          test -n "$FOUND"
+          cp "$FOUND" "$GITHUB_WORKSPACE/${{ matrix.lib }}"
+          echo "$GITHUB_WORKSPACE" >> "$GITHUB_PATH"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            echo "DYLD_LIBRARY_PATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          fi
+      - name: Testes Rust
+        shell: bash
+        run: |
+          cargo test -p tsuro --no-run -- --test-threads=1
+          cargo test -p tsuro-sign --no-run -- --test-threads=1
+          # Bind looks next to current_exe and at ../Frameworks, never cwd.
+          for dest in ${{ matrix.plant }}; do
+            mkdir -p "$dest"
+            cp "$GITHUB_WORKSPACE/${{ matrix.lib }}" "$dest/${{ matrix.lib }}"
+          done
+          cargo test -p tsuro -- --test-threads=1
+          cargo test -p tsuro-sign -- --test-threads=1

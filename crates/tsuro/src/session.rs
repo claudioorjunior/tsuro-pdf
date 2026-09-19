@@ -471,6 +471,68 @@ pub enum OutlineKey {
     Next,
     Activate,
 }
+/// Pilha de páginas visitadas, como um navegador: `current()` é onde o leitor
+/// está. Separada do `Ready` para poder ser testada sem documento.
+#[derive(Debug, Clone)]
+struct History {
+    pages: Vec<PageNo>,
+    pos: usize,
+}
+
+impl History {
+    fn new(page: PageNo) -> Self {
+        Self {
+            pages: vec![page],
+            pos: 0,
+        }
+    }
+
+    /// Tamanho da pilha (inclui o "futuro" ainda não descartado).
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    fn current(&self) -> PageNo {
+        self.pages[self.pos]
+    }
+
+    /// Visita efetiva: descarta o "futuro" e ignora repetição consecutiva.
+    fn visit(&mut self, page: PageNo) {
+        if page == self.current() {
+            return;
+        }
+        self.pages.truncate(self.pos + 1);
+        self.pages.push(page);
+        self.pos = self.pages.len() - 1;
+    }
+
+    /// Um passo (`forward` = avançar); `None` no limite.
+    fn step(&mut self, forward: bool) -> Option<PageNo> {
+        let next = if forward {
+            self.pos.checked_add(1)?
+        } else {
+            self.pos.checked_sub(1)?
+        };
+        if next >= self.pages.len() {
+            return None;
+        }
+        self.pos = next;
+        Some(self.pages[next])
+    }
+
+    /// Reinicia a pilha numa página (abrir documento ou restaurar posição).
+    fn reset(&mut self, page: PageNo) {
+        *self = Self::new(page);
+    }
+
+    fn can_back(&self) -> bool {
+        self.pos > 0
+    }
+
+    fn can_forward(&self) -> bool {
+        self.pos + 1 < self.pages.len()
+    }
+}
 
 pub enum Session {
     Empty(EmptyState),
@@ -502,10 +564,10 @@ pub struct Ready {
     pub signatures: PdfAnalysis,
     pub zoom: Zoom,
     pub visible: PageNo,
-    /// Histórico voltar/avançar: `history[hpos] == visible` sempre.
-    history: Vec<PageNo>,
-    hpos: usize,
-    /// Página única ou rolagem contínua (⋯ → Modo de página); zera ao abrir.
+    /// Histórico voltar/avançar; `current()` acompanha `visible` (página alcançada
+    /// por rolagem entra na pilha ao andar). Restaurar posição zera a pilha.
+    history: History,
+    /// Página única ou rolagem contínua (⋯ → Modo de página); restaurada ao abrir.
     pub view_mode: ViewMode,
     /// Vista girada em quartos de volta horários (0..=3, sessão; zera ao abrir).
     pub view_rotation: u8,
@@ -1099,7 +1161,12 @@ impl Session {
             }
             Message::Opened { gen, result } => {
                 self.apply_open(gen, result);
-                self.schedule_work()
+                // Modo contínuo restaurado: a primeira vista já fica na página.
+                let follow = match self {
+                    Session::Ready(ready) => nav_follow(ready),
+                    _ => Task::none(),
+                };
+                Task::batch([self.schedule_work(), follow])
             }
             Message::PageData {
                 page,
@@ -1181,6 +1248,7 @@ impl Session {
                     ready.zoom = zoom;
                     ready.overflow_open = false;
                     ready.bump_render_gen();
+                    ready.save_position();
                     nav_follow(ready)
                 } else {
                     Task::none()
@@ -1904,6 +1972,7 @@ impl Session {
                         if page != ready.visible {
                             ready.visible = page;
                             ready.sync_page_input();
+                            ready.save_position();
                         }
                     }
                 }
@@ -1913,6 +1982,7 @@ impl Session {
                 let follow = if let Session::Ready(ready) = self {
                     ready.view_mode = mode;
                     ready.overflow_open = false;
+                    ready.save_position();
                     nav_follow(ready)
                 } else {
                     Task::none()
@@ -2361,6 +2431,19 @@ impl Ready {
             1.0
         };
         Scale::from_factor(css * dpr)
+    }
+
+    /// Fator de zoom exibido (CSS, 1.0 = 100%) de onde partem os passos de
+    /// +/− da barra. Ajuste na mídia girada, como o render: com a vista a
+    /// 90°/270° o passo parte do que está na tela, não da página original.
+    pub(crate) fn zoom_step_factor(&self) -> f32 {
+        match self.zoom {
+            Zoom::Manual(z) => z.get(),
+            Zoom::Width | Zoom::Page => self
+                .zoom
+                .scale(self.viewport, self.rotated_media(self.visible))
+                .factor(),
+        }
     }
 
     fn thumb_scale_for(&self, media: MediaBox) -> Scale {
@@ -2856,10 +2939,7 @@ impl Ready {
 
     fn navigate_to(&mut self, page: PageNo) {
         if self.go_to(page) {
-            // Empilha a nova posição, descartando o "futuro" (como navegador).
-            self.history.truncate(self.hpos + 1);
-            self.history.push(self.visible);
-            self.hpos = self.history.len() - 1;
+            self.history.visit(self.visible);
             self.save_position();
         }
     }
@@ -2885,28 +2965,25 @@ impl Ready {
 
     /// Um passo no histórico (`forward` = avançar). Limites são no-op.
     fn history_go(&mut self, forward: bool) {
-        let next = if forward {
-            self.hpos.checked_add(1)
-        } else {
-            self.hpos.checked_sub(1)
-        };
-        let Some(i) = next.filter(|i| *i < self.history.len()) else {
+        // Página alcançada por rolagem (fora da pilha) entra antes de andar, para
+        // o "voltar" cair de fato na página anterior; repetida é ignorada.
+        self.history.visit(self.visible);
+        let Some(page) = self.history.step(forward) else {
             return;
         };
-        self.hpos = i;
-        self.go_to(self.history[i]);
+        self.go_to(page);
         self.save_position();
     }
 
     pub fn can_history_back(&self) -> bool {
-        self.hpos > 0
+        self.history.can_back()
     }
 
     pub fn can_history_forward(&self) -> bool {
-        self.hpos + 1 < self.history.len()
+        self.history.can_forward()
     }
 
-    /// Persiste página+zoom atuais; silencioso em erro ou arquivo ilegível.
+    /// Persiste página, zoom e modo atuais; silencioso se ilegível/erro.
     fn save_position(&self) {
         let path = self.source.path();
         let Some((size, mtime)) = file_identity(path) else {
@@ -2915,6 +2992,7 @@ impl Ready {
         let pos = DocPosition {
             page: self.visible.index(),
             zoom: self.zoom,
+            mode: self.view_mode,
             size,
             mtime,
         };
@@ -2922,17 +3000,21 @@ impl Ready {
         let _ = save_positions(&entries);
     }
 
-    /// Restaura página+zoom do arquivo (identidade precisa); zera o histórico.
+    /// Restaura página+zoom+modo do arquivo (identidade precisa); zera o histórico.
     fn restore_position(&mut self) {
         let path = self.source.path().to_path_buf();
         let Some(pos) = find_position(&read_positions(), &path) else {
             return;
         };
         self.zoom = pos.zoom;
+        self.view_mode = pos.mode;
         let idx = pos.page.min(self.pages.total.saturating_sub(1));
         self.visible = PageNo::from_index(idx);
-        self.history = vec![self.visible];
-        self.hpos = 0;
+        if self.view_mode == ViewMode::Continuous {
+            // Primeira renderização já parte da página restaurada.
+            self.doc_scroll_y = self.page_offset(self.visible);
+        }
+        self.history.reset(self.visible);
     }
 
     fn apply_nav(&mut self, cmd: NavCmd) {
@@ -3201,8 +3283,7 @@ impl Document {
             signatures,
             zoom: Zoom::Width,
             visible: PageNo::first(),
-            history: vec![PageNo::first()],
-            hpos: 0,
+            history: History::new(PageNo::first()),
             view_mode: ViewMode::default(),
             view_rotation: 0,
             page_input: String::new(),
@@ -3824,7 +3905,7 @@ mod tests {
             _ => unreachable!(),
         };
         let hist_len = |s: &Session| match s {
-            Session::Ready(r) => (r.history.len(), r.hpos),
+            Session::Ready(r) => (r.history.pages.len(), r.history.pos),
             _ => unreachable!(),
         };
         assert_eq!(hist_len(&session), (1, 0));
@@ -3856,11 +3937,95 @@ mod tests {
         assert_eq!(visible(&session), first);
         match &session {
             Session::Ready(r) => {
-                assert!(!r.can_history_back() || r.hpos > 0);
-                assert_eq!(r.can_history_forward(), r.hpos + 1 < r.history.len());
+                assert!(!r.can_history_back() || r.history.pos > 0);
+                assert_eq!(r.can_history_forward(), r.history.can_forward());
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Pilha pura (sem documento/fixture): 1→5→3, voltar/avançar, colapso,
+    /// reset e página alcançada por rolagem entrando antes de andar.
+    #[test]
+    fn history_stack_walks_visits_without_document() {
+        let (p1, p5, p3) = (
+            PageNo::first(),
+            PageNo::from_index(4),
+            PageNo::from_index(2),
+        );
+        let mut history = History::new(p1);
+        assert_eq!(history.current(), p1);
+        history.visit(p5);
+        history.visit(p3);
+        assert_eq!(history.pages, vec![p1, p5, p3]);
+        assert_eq!(history.pos, 2);
+        // Voltar/avançar como navegador.
+        assert_eq!(history.step(false), Some(p5));
+        assert_eq!(history.current(), p5);
+        assert_eq!(history.step(false), Some(p1));
+        assert_eq!(history.current(), p1);
+        // Limite é no-op.
+        assert_eq!(history.step(false), None);
+        assert_eq!(history.current(), p1);
+        assert_eq!(history.step(true), Some(p5));
+        // Visita nova descarta o "futuro".
+        history.visit(p3);
+        assert_eq!(history.pages, vec![p1, p5, p3]);
+        assert!(!history.can_forward());
+        // Repetida consecutiva não entra.
+        history.visit(p3);
+        assert_eq!(history.pages.len(), 3);
+        // Rolagem leva a página fora da pilha: entra antes de andar.
+        let p9 = PageNo::from_index(8);
+        history.visit(p9);
+        assert_eq!(history.step(false), Some(p3));
+        assert_eq!(history.step(true), Some(p9));
+        // Abrir outro documento (ou restaurar posição) zera a pilha.
+        history.reset(p5);
+        assert_eq!(history.pages, vec![p5]);
+        assert!(!history.can_back());
+        assert!(!history.can_forward());
+        assert_eq!(history.step(false), None);
+    }
+
+    /// Busca salta para o hit e o "voltar" devolve a página original (fixture
+    /// real para a contagem de páginas; camada de texto injetada como o engine
+    /// entregaria).
+    #[test]
+    fn search_jump_then_back_returns_to_reading_page() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let last = ready.page_count().saturating_sub(1);
+        if last < 1 {
+            return;
+        }
+        let hit_page = PageNo::from_index(last);
+        ready.pages.text[last as usize] = Some(TextLayer {
+            page: hit_page,
+            plain: "cláusula".into(),
+            glyphs: vec![Glyph {
+                cluster: "cláusula".into(),
+                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+            }],
+        });
+        let file =
+            std::env::temp_dir().join(format!("tsuro-positions-unit-{}-search", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        crate::positions::with_positions_path(file.clone(), || {
+            let mut session = Session::Ready(ready);
+            let visible = |s: &Session| match s {
+                Session::Ready(r) => r.visible,
+                _ => unreachable!(),
+            };
+            apply(&mut session, Message::SearchChanged("cláusula".into()));
+            assert_eq!(visible(&session), hit_page);
+            apply(&mut session, Message::HistoryBack);
+            assert_eq!(visible(&session), PageNo::first());
+            apply(&mut session, Message::HistoryForward);
+            assert_eq!(visible(&session), hit_page);
+        });
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]
@@ -4421,6 +4586,7 @@ mod tests {
                 crate::positions::DocPosition {
                     page: last,
                     zoom: Zoom::Page,
+                    mode: ViewMode::Continuous,
                     size,
                     mtime,
                 },
@@ -4429,10 +4595,62 @@ mod tests {
             ready.restore_position();
             assert_eq!(ready.visible.index(), last);
             assert!(matches!(ready.zoom, Zoom::Page));
-            assert_eq!(ready.history, vec![ready.visible]);
-            assert_eq!(ready.hpos, 0);
+            assert_eq!(ready.view_mode, ViewMode::Continuous);
+            // Contínuo restaurado já abre na página certa (janela + scroll).
+            assert_eq!(ready.doc_scroll_y, ready.page_offset(ready.visible));
+            assert_eq!(ready.history.pages, vec![ready.visible]);
+            assert_eq!(ready.history.pos, 0);
         });
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// Smoke de estado (fixture real): navegar até a última página, fechar e
+    /// reabrir pelo caminho de produção (`begin_open`+`finish_open`) volta pra lá,
+    /// com zoom e modo persistidos.
+    #[test]
+    fn reopen_restores_page_zoom_and_mode_after_close() {
+        isolated(|| {
+            let Some(ready) = sample_ready() else {
+                return;
+            };
+            let last = ready.page_count().saturating_sub(1);
+            if last < 1 {
+                return;
+            }
+            let path = ready.source.path().to_path_buf();
+            let file = std::env::temp_dir().join(format!(
+                "tsuro-positions-unit-{}-reopen",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&file);
+            crate::positions::with_positions_path(file.clone(), || {
+                let target = PageNo::from_index(last);
+                let mut session = Session::Ready(ready);
+                apply(&mut session, Message::Nav(NavCmd::GoTo(target)));
+                apply(&mut session, Message::SetZoom(Zoom::Page));
+                apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
+                apply(&mut session, Message::Close);
+                let Some(reopened) = sample_ready() else {
+                    return;
+                };
+                let _ = session.begin_open(OpenSource::Path(path.clone()));
+                session.finish_open(Ok(reopened));
+                match &session {
+                    Session::Ready(ready) => {
+                        assert_eq!(ready.visible, target);
+                        assert!(matches!(ready.zoom, Zoom::Page));
+                        assert_eq!(ready.view_mode, ViewMode::Continuous);
+                        assert_eq!(ready.doc_scroll_y, ready.page_offset(ready.visible));
+                        // Restaurar não gera entrada: a pilha reinicia aqui.
+                        assert_eq!(ready.history.pages, vec![target]);
+                        assert_eq!(ready.history.pos, 0);
+                        assert!(!ready.can_history_back());
+                    }
+                    other => panic!("expected Ready, got {other:?}"),
+                }
+            });
+            let _ = std::fs::remove_file(&file);
+        });
     }
 
     #[test]
@@ -4922,6 +5140,95 @@ mod tests {
             ready.page_scale(page),
             Zoom::Page.scale(ready.viewport, swapped)
         );
+    }
+
+    #[test]
+    fn zoom_step_follows_rotated_fit() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.zoom = Zoom::Page;
+        let page = ready.visible;
+        let media = ready.media(page);
+        let upright = ready.zoom_step_factor();
+        ready.view_rotation = 1;
+        assert_eq!(
+            ready.zoom_step_factor(),
+            Zoom::Page.scale(ready.viewport, ready.rotated_media(page)).factor()
+        );
+        // Página não quadrada: girar muda o ajuste, então o passo de +/− tem
+        // de partir do fator girado (antes partia do original e o + encolhia).
+        if media.width != media.height {
+            assert_ne!(ready.zoom_step_factor(), upright);
+        }
+    }
+
+    /// Spec rotação (smoke): com a vista girada, clicar na geometria
+    /// exibida de um glifo seleciona esse glifo e o quad pintado cobre o
+    /// ponto clicado — a seleção acompanha a página girada.
+    #[test]
+    fn click_on_rotated_page_selects_the_clicked_glyph() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 900.0,
+            height: 700.0,
+        };
+        ready.zoom = Zoom::Page;
+        let page = PageNo::first();
+        ready.visible = page;
+        let media = ready.media(page);
+        let Some(layer) = ready.pages.text[page.index() as usize].clone() else {
+            return;
+        };
+        // Glifo com texto real (espaço não gera seleção), do meio da página.
+        let middle = layer.glyphs.len() / 2;
+        let Some(k) = (middle..layer.glyphs.len()).chain(0..middle).find(|&i| {
+            let (start, end) = glyph_byte_range(&layer, i);
+            !layer
+                .slice(TextRange { start, end })
+                .trim()
+                .is_empty()
+        }) else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        for step in 0..4u8 {
+            if step > 0 {
+                apply(&mut session, Message::RotateView);
+            }
+            let Session::Ready(ready) = &session else {
+                panic!("expected Ready");
+            };
+            assert_eq!(ready.view_rotation, step);
+            let rotated = ready.rotated_media(page);
+            let (dw, dh) = (900.0, 900.0 * rotated.height / rotated.width.max(1.0));
+            let [x, y, w, h] = display_rect(layer.glyphs[k].quad, media, step, dw, dh);
+            let at = [x + w / 2.0, y + h / 2.0];
+            let page_pt = page_pt_at(at, media, step, dw, dh);
+            apply(&mut session, Message::PointerDown { page, page_pt });
+            let Session::Ready(ready) = &session else {
+                panic!("expected Ready");
+            };
+            let (sel_page, quads) = ready
+                .selection_quads()
+                .unwrap_or_else(|| panic!("rotação {step}: clique no texto não selecionou"));
+            assert_eq!(sel_page, page);
+            assert!(
+                quads.iter().any(|q| {
+                    let [qx, qy, qw, qh] = display_rect(*q, media, step, dw, dh);
+                    (qx - 1.0..=qx + qw + 1.0).contains(&at[0])
+                        && (qy - 1.0..=qy + qh + 1.0).contains(&at[1])
+                }),
+                "rotação {step}: quad pintado não cobriu o clique"
+            );
+            apply(&mut session, Message::PointerUp { page, page_pt });
+        }
     }
 
     #[test]
