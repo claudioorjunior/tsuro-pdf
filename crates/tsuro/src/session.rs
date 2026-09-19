@@ -53,7 +53,7 @@ const PANES_GAP: f32 = 12.0;
 const CHROME_PAD: f32 = 8.0;
 /// Célula do contínuo replica o padding de `page_pane` (view.rs).
 pub(crate) const DOC_PAD_TOP: f32 = 28.0;
-pub(crate) const DOC_PAD_BOTTOM: f32 = 32.0;
+pub(crate) const DOC_PAD_BOTTOM: f32 = 56.0;
 pub(crate) const DOC_PAD_X: f32 = 24.0;
 pub(crate) const DOC_GAP: f32 = 16.0;
 
@@ -1644,6 +1644,7 @@ impl Session {
                     ready.note_draft = None;
                     // Idem para o aviso de documento assinado.
                     ready.save_warning = false;
+                    ready.overflow_open = false;
                     // Enviando: ignora (Esc) para não perder o resultado na volta.
                     if ready
                         .print_dialog
@@ -2421,10 +2422,7 @@ impl Ready {
     /// Guarda <1.0 (campo ainda desconhecido) como 1.0.
     /// Ajuste usa a mídia girada: 90°/270° trocam largura ↔ altura.
     fn page_scale(&self, page: PageNo) -> Scale {
-        let css = self
-            .zoom
-            .scale(self.viewport, self.rotated_media(page))
-            .factor();
+        let css = self.sheet_css(page);
         let dpr = if self.render_scale >= 1.0 {
             self.render_scale
         } else {
@@ -2437,13 +2435,7 @@ impl Ready {
     /// +/− da barra. Ajuste na mídia girada, como o render: com a vista a
     /// 90°/270° o passo parte do que está na tela, não da página original.
     pub(crate) fn zoom_step_factor(&self) -> f32 {
-        match self.zoom {
-            Zoom::Manual(z) => z.get(),
-            Zoom::Width | Zoom::Page => self
-                .zoom
-                .scale(self.viewport, self.rotated_media(self.visible))
-                .factor(),
-        }
+        self.sheet_css(self.visible)
     }
 
     fn thumb_scale_for(&self, media: MediaBox) -> Scale {
@@ -2511,6 +2503,8 @@ impl Ready {
     }
 
     /// Largura útil do documento: espelha `page_pane`/`ready_body` (view.rs).
+    /// É a referência do ajuste à largura — a folha desenhada (`sheet_width`)
+    /// parte daqui e aplica o zoom.
     pub(crate) fn doc_content_width(&self) -> f32 {
         let mut w = self.viewport.width - CHROME_PAD;
         if self.pages_open {
@@ -2522,18 +2516,75 @@ impl Ready {
         (w - 2.0 * DOC_PAD_X).max(1.0)
     }
 
-    /// Altura da célula (padding + folha proporcional à mídia girada).
-    pub(crate) fn doc_cell_height(&self, page: PageNo, content_width: f32) -> f32 {
+    /// Altura útil do painel: a janela menos o chrome menos o respiro da
+    /// moldura (`CHROME_PAD`, espelha `chrome()` em view.rs). A faixa de abas
+    /// já vem descontada no `WindowMetrics`.
+    pub(crate) fn doc_content_height(&self) -> f32 {
+        (self.viewport.height - CHROME_PAD).max(1.0)
+    }
+
+    /// Fator CSS do zoom (1.0 = 100%, 1pt = 1px) na página: ajuste à largura
+    /// usa a largura útil, ajuste à página cabe na moldura, manual é absoluto.
+    /// Mesma base do render (`page_scale`), do desenho (`sheet_size`) e do
+    /// rótulo (`zoom_step_factor`) — os quatro andam juntos, senão a folha,
+    /// o bitmap e o % divergem.
+    pub(crate) fn sheet_css(&self, page: PageNo) -> f32 {
         let media = self.rotated_media(page);
-        DOC_PAD_TOP + content_width * media.height.max(1.0) / media.width.max(1.0) + DOC_PAD_BOTTOM
+        match self.zoom {
+            Zoom::Manual(z) => z.get(),
+            Zoom::Width => self.doc_content_width() / media.width.max(1.0),
+            Zoom::Page => (self.doc_content_width() / media.width.max(1.0))
+                .min(self.doc_content_height() / media.height.max(1.0)),
+        }
+    }
+
+    /// Largura da folha na janela (px CSS): mídia girada × `sheet_css`. É o
+    /// que a vista desenha — em `Zoom::Width` coincide com a largura útil.
+    pub(crate) fn sheet_width(&self, page: PageNo) -> f32 {
+        (self.rotated_media(page).width.max(1.0) * self.sheet_css(page)).max(1.0)
+    }
+
+    /// Largura do palco rolável na página: a moldura útil ou a folha +
+    /// respiro, o que for maior. Conteúdo direto do `scrollable` não pode ser
+    /// `Fill` no eixo de rolagem (o iced dá assert), então o palco mede aqui:
+    /// folha estreita centraliza no palco cheio, folha larga rola na
+    /// horizontal. O −1px evita barra horizontal por erro de float (o fundo é
+    /// a mesma cor, invisível).
+    pub(crate) fn doc_stage_width(&self, page: PageNo) -> f32 {
+        let pane = self.doc_content_width() + 2.0 * DOC_PAD_X;
+        (pane - 1.0).max(self.sheet_width(page) + 2.0 * DOC_PAD_X)
+    }
+
+    /// Palco do modo contínuo: cobre a página mais larga (páginas mistas).
+    pub(crate) fn doc_stage_max_width(&self) -> f32 {
+        let mut w = self.doc_content_width() + 2.0 * DOC_PAD_X - 1.0;
+        for i in 0..self.pages.total {
+            let p = PageNo::from_index(i);
+            w = w.max(self.sheet_width(p) + 2.0 * DOC_PAD_X);
+        }
+        w.max(1.0)
+    }
+
+    /// Tamanho da folha na janela (px CSS): largura da folha × proporção da
+    /// mídia girada — o mesmo par que a vista usa para desenhar (`with_marks`).
+    pub(crate) fn sheet_size(&self, page: PageNo) -> [f32; 2] {
+        let sw = self.sheet_width(page);
+        let rotated = self.rotated_media(page);
+        [sw, sw * rotated.height.max(1.0) / rotated.width.max(1.0)]
+    }
+
+    /// Altura da célula (padding + folha proporcional à mídia girada).
+    pub(crate) fn doc_cell_height(&self, page: PageNo, sheet_width: f32) -> f32 {
+        let media = self.rotated_media(page);
+        DOC_PAD_TOP + sheet_width * media.height.max(1.0) / media.width.max(1.0) + DOC_PAD_BOTTOM
     }
 
     /// Offset Y do topo da página na coluna contínua.
     pub(crate) fn page_offset(&self, page: PageNo) -> f32 {
-        let cw = self.doc_content_width();
         let mut y = 0.0;
         for i in 0..page.index().min(self.pages.total) {
-            y += self.doc_cell_height(PageNo::from_index(i), cw) + DOC_GAP;
+            let p = PageNo::from_index(i);
+            y += self.doc_cell_height(p, self.sheet_width(p)) + DOC_GAP;
         }
         y
     }
@@ -2543,10 +2594,10 @@ impl Ready {
         if self.pages.total == 0 {
             return PageNo::first();
         }
-        let cw = self.doc_content_width();
         let mut top = 0.0;
         for i in 0..self.pages.total {
-            top += self.doc_cell_height(PageNo::from_index(i), cw);
+            let p = PageNo::from_index(i);
+            top += self.doc_cell_height(p, self.sheet_width(p));
             if y < top {
                 return PageNo::from_index(i);
             }
@@ -2560,7 +2611,7 @@ impl Ready {
             return 0.0;
         }
         let last = PageNo::from_index(self.pages.total - 1);
-        self.page_offset(last) + self.doc_cell_height(last, self.doc_content_width())
+        self.page_offset(last) + self.doc_cell_height(last, self.sheet_width(last))
     }
 
     /// Janela com widget montado: visíveis na viewport estimada ± 2 páginas.
@@ -3757,20 +3808,49 @@ mod tests {
         Some(ready)
     }
 
-    /// Largura útil 744 (800 − 8 − 48); célula 1548 (28 + 744×2 + 32); passo 1564.
+    /// Zoom out encolhe a folha, não o palco: manual 25% numa mídia 100pt →
+    /// folha 25px, palco na moldura útil (sem barra horizontal). Zoom in 8× →
+    /// folha 800px, palco acompanha (com barra horizontal).
+    #[test]
+    fn sheet_scales_with_zoom_and_stage_covers_it() {
+        let Some(mut ready) = uniform_ready() else {
+            return;
+        };
+        let page = PageNo::first();
+        let pane = 744.0 + 2.0 * DOC_PAD_X;
+        // Ajuste à largura: folha coincide com a largura útil.
+        ready.zoom = Zoom::Width;
+        assert!((ready.sheet_width(page) - 744.0).abs() < 0.001);
+        // Zoom out: folha 25px, palco segue na moldura (menor que o painel).
+        ready.zoom = Zoom::Manual(ZoomFactor::new(0.25));
+        assert!((ready.sheet_width(page) - 25.0).abs() < 0.001);
+        assert!((ready.doc_stage_width(page) - (pane - 1.0)).abs() < 0.001);
+        assert!(ready.doc_stage_width(page) < pane);
+        // Zoom in: folha 800px, palco acompanha para rolar.
+        ready.zoom = Zoom::Manual(ZoomFactor::new(8.0));
+        assert!((ready.sheet_width(page) - 800.0).abs() < 0.001);
+        assert!((ready.doc_stage_width(page) - (800.0 + 2.0 * DOC_PAD_X)).abs() < 0.001);
+        assert!(ready.doc_stage_width(page) > pane);
+        // Contínuo cobre a página mais larga.
+        assert!((ready.doc_stage_max_width() - ready.doc_stage_width(page)).abs() < 0.001);
+    }
+
+    /// Largura útil 744 (800 − 8 − 48); célula e passo derivam dos pads
+    /// (não literais: DOC_PAD_BOTTOM já mudou 32→56 uma vez).
     #[test]
     fn continuous_offsets_match_cell_geometry() {
         let Some(ready) = uniform_ready() else {
             return;
         };
         assert_eq!(ready.doc_content_width(), 744.0);
+        let cell = DOC_PAD_TOP + 744.0 * 2.0 + DOC_PAD_BOTTOM;
         let n = ready.page_count();
         assert_eq!(ready.page_offset(PageNo::first()), 0.0);
         if n > 1 {
-            assert_eq!(ready.page_offset(PageNo::from_index(1)), 1564.0);
+            assert_eq!(ready.page_offset(PageNo::from_index(1)), cell + DOC_GAP);
         }
         let last = PageNo::from_index(n - 1);
-        assert_eq!(ready.doc_total_height(), ready.page_offset(last) + 1548.0);
+        assert_eq!(ready.doc_total_height(), ready.page_offset(last) + cell);
     }
 
     #[test]
@@ -3778,12 +3858,13 @@ mod tests {
         let Some(ready) = uniform_ready() else {
             return;
         };
+        let cell = DOC_PAD_TOP + 744.0 * 2.0 + DOC_PAD_BOTTOM;
         let last = ready.page_count() - 1;
         assert_eq!(ready.page_at_offset(0.0).index(), 0);
-        assert_eq!(ready.page_at_offset(1547.0).index(), 0);
+        assert_eq!(ready.page_at_offset(cell - 1.0).index(), 0);
         // No gap entre células, a próxima página já responde.
         let gap_page = if last > 0 { 1 } else { 0 };
-        assert_eq!(ready.page_at_offset(1548.0).index(), gap_page);
+        assert_eq!(ready.page_at_offset(cell).index(), gap_page);
         assert_eq!(ready.page_at_offset(-5.0).index(), 0);
         assert_eq!(ready.page_at_offset(1e9).index(), last);
     }
@@ -5138,10 +5219,11 @@ mod tests {
             width: media.height,
             height: media.width,
         };
-        assert_eq!(
-            ready.page_scale(page),
-            Zoom::Page.scale(ready.viewport, swapped)
-        );
+        // Ajuste à página cabe na moldura útil (não na janela cheia).
+        let avail_w = 800.0 - CHROME_PAD - 2.0 * DOC_PAD_X;
+        let avail_h = 600.0 - CHROME_PAD;
+        let expect = (avail_w / swapped.width).min(avail_h / swapped.height);
+        assert!((ready.page_scale(page).factor() - expect).abs() < 0.002);
     }
 
     #[test]
@@ -5158,12 +5240,11 @@ mod tests {
         let media = ready.media(page);
         let upright = ready.zoom_step_factor();
         ready.view_rotation = 1;
-        assert_eq!(
-            ready.zoom_step_factor(),
-            Zoom::Page
-                .scale(ready.viewport, ready.rotated_media(page))
-                .factor()
-        );
+        let rotated = ready.rotated_media(page);
+        let avail_w = 800.0 - CHROME_PAD - 2.0 * DOC_PAD_X;
+        let avail_h = 600.0 - CHROME_PAD;
+        let expect = (avail_w / rotated.width).min(avail_h / rotated.height);
+        assert!((ready.zoom_step_factor() - expect).abs() < 0.001);
         // Página não quadrada: girar muda o ajuste, então o passo de +/− tem
         // de partir do fator girado (antes partia do original e o + encolhia).
         if media.width != media.height {
@@ -5574,15 +5655,14 @@ mod tests {
         let Some(mut ready) = sample_ready() else {
             return;
         };
-        let css = ready.zoom.scale(ready.viewport, ready.media(ready.visible));
-        assert_eq!(ready.page_scale(ready.visible), css);
+        // `Scale` quantiza em 1/1000: compara fator com tolerância, senão o
+        // arredondado × 2 diverge do dobro arredondado em 1 unidade.
+        let css = ready.sheet_css(ready.visible);
+        assert!((ready.page_scale(ready.visible).factor() - css).abs() < 0.002);
         ready.render_scale = 2.0;
-        assert_eq!(
-            ready.page_scale(ready.visible),
-            Scale::from_factor(css.factor() * 2.0)
-        );
+        assert!((ready.page_scale(ready.visible).factor() - css * 2.0).abs() < 0.002);
         ready.render_scale = 0.0;
-        assert_eq!(ready.page_scale(ready.visible), css);
+        assert!((ready.page_scale(ready.visible).factor() - css).abs() < 0.002);
     }
 
     #[test]
@@ -6223,5 +6303,150 @@ mod tests {
             panic!("expected Ready, got {session:?}");
         };
         assert!(ready.save_status.is_none());
+    }
+    #[test]
+    fn zoom_out_to_min_renders_and_views_every_step() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        let mut current = 1.0f32;
+        for step in 0..40 {
+            current /= 1.1;
+            apply(
+                &mut session,
+                Message::SetZoom(Zoom::Manual(ZoomFactor::new(current))),
+            );
+            let (page, scale, doc_gen, render_gen, surface) = {
+                let Session::Ready(ready) = &session else {
+                    panic!("sessao saiu de Ready no passo {step}");
+                };
+                let Zoom::Manual(z) = ready.zoom else {
+                    panic!("zoom trocado sozinho no passo {step}");
+                };
+                assert!(z.get() >= 0.25, "clamp furou: {}", z.get());
+                let page = ready.visible;
+                let scale = ready.page_scale(page);
+                let surface = crate::page::PageEngine::render(&ready.engine, page, scale, 0)
+                    .expect("render real falhou");
+                assert!(surface.bitmap.width > 0 && surface.bitmap.height > 0);
+                assert_eq!(
+                    surface.bitmap.rgba.len(),
+                    surface.bitmap.width as usize * surface.bitmap.height as usize * 4
+                );
+                (page, scale, ready.open_gen, ready.render_gen, surface)
+            };
+            apply(
+                &mut session,
+                Message::Rendered {
+                    page,
+                    scale,
+                    rotation: 0,
+                    doc_gen,
+                    render_gen,
+                    surface: Some(surface),
+                },
+            );
+            let _ = session.view();
+        }
+    }
+    #[test]
+    fn stale_and_failed_renders_recover_on_next_zoom() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        let gen0 = match &session {
+            Session::Ready(r) => r.render_gen,
+            _ => unreachable!(),
+        };
+        // Rajada de zoom-out sem alimentar completions (inflight acumula).
+        let mut current = 1.0f32;
+        for _ in 0..10 {
+            current /= 1.1;
+            apply(
+                &mut session,
+                Message::SetZoom(Zoom::Manual(ZoomFactor::new(current))),
+            );
+            let _ = session.view();
+        }
+        let (page, doc_gen, render_gen) = match &session {
+            Session::Ready(r) => (r.visible, r.open_gen, r.render_gen),
+            _ => panic!("saiu de Ready na rajada"),
+        };
+        assert!(render_gen > gen0);
+        // Completion velha (gen antiga, escala errada): tem que ignorar.
+        apply(
+            &mut session,
+            Message::Rendered {
+                page,
+                scale: Scale::from_factor(9.0),
+                rotation: 0,
+                doc_gen,
+                render_gen: gen0,
+                surface: Some(fake_surface(page, Scale::from_factor(9.0))),
+            },
+        );
+        let _ = session.view();
+        // Falha na gen atual: marca failed, nao quebra.
+        let scale_now = match &session {
+            Session::Ready(r) => r.page_scale(page),
+            _ => panic!("saiu de Ready"),
+        };
+        apply(
+            &mut session,
+            Message::Rendered {
+                page,
+                scale: scale_now,
+                rotation: 0,
+                doc_gen,
+                render_gen,
+                surface: None,
+            },
+        );
+        let _ = session.view();
+        // Zoom novo (nova chave) + render real: recupera com superficie.
+        apply(
+            &mut session,
+            Message::SetZoom(Zoom::Manual(ZoomFactor::new(0.5))),
+        );
+        let (scale2, dg2, rg2, surface) = match &session {
+            Session::Ready(r) => {
+                let s = r.page_scale(page);
+                let surf = crate::page::PageEngine::render(&r.engine, page, s, 0)
+                    .expect("render real falhou");
+                (s, r.open_gen, r.render_gen, surf)
+            }
+            _ => panic!("saiu de Ready"),
+        };
+        apply(
+            &mut session,
+            Message::Rendered {
+                page,
+                scale: scale2,
+                rotation: 0,
+                doc_gen: dg2,
+                render_gen: rg2,
+                surface: Some(surface),
+            },
+        );
+        let Session::Ready(r) = &session else {
+            panic!("saiu de Ready na recuperacao");
+        };
+        assert!(
+            r.surface(page, scale2).is_some(),
+            "sem superficie apos recuperar"
+        );
+        let _ = session.view();
+    }
+    #[test]
+    fn continuous_placeholders_do_not_panic_scrollable() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        let _ = session.view();
+        apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
+        let _ = session.view();
     }
 }

@@ -4,7 +4,7 @@
 //! Folha PDF é sempre branca (`Tokens::page`), independente do tema.
 //! Ícones Ori têm cor fixa no SVG — nunca aplique `svg::Style { color }`.
 
-use iced::widget::{button, container, svg, Space};
+use iced::widget::{button, container, svg, text_input, Space};
 use iced::{Background, Border, Color, Length, Shadow, Vector};
 
 /// Tema do chrome. Vive no estado da app, não no `Theme` global do iced.
@@ -68,16 +68,16 @@ impl Tokens {
             },
             Theme::Light => Self {
                 is_dark: false,
-                bg: hex(0xf4, 0xf3, 0xf0),
-                surface: hex(0xe8, 0xe6, 0xe0),
-                chrome: hex(0xee, 0xed, 0xe9),
+                bg: hex(0xef, 0xef, 0xed),
+                surface: Color::WHITE,
+                chrome: hex(0xf7, 0xf7, 0xf6),
                 elevated: Color::WHITE,
-                ink: hex(0x1a, 0x1a, 0x18),
-                muted: hex(0x6b, 0x68, 0x60),
-                line: hex(0xd4, 0xd2, 0xcc),
-                accent: hex(0x2a, 0x6f, 0x6a),
-                accent_bg: hex(0xe4, 0xf0, 0xef),
-                hover: hex(0xe4, 0xe2, 0xdc),
+                ink: hex(0x1c, 0x1c, 0x1a),
+                muted: hex(0x78, 0x76, 0x70),
+                line: hex(0xe0, 0xde, 0xd9),
+                accent: hex(0x1f, 0x7d, 0x76),
+                accent_bg: hex(0xe0, 0xf2, 0xf0),
+                hover: hex(0xe8, 0xe8, 0xe5),
                 ok: hex(0x5c, 0xb8, 0x5c),
                 warn: hex(0xd4, 0xa0, 0x17),
                 danger: hex(0xc0, 0x39, 0x2b),
@@ -94,7 +94,10 @@ fn hex(r: u8, g: u8, b: u8) -> Color {
 
 /// Ícone Ori (origami tsuru) — cor fixa no SVG, sem `.style()`.
 /// Uso: `ori!("folder-open")` → 16×16. Pílula de busca usa `ori_small!`.
-/// (PR 3 troca o Lucide temporário em `view.rs` por estes.)
+/// V2 (27 ícones): folder, file-text, x, copy, highlighter, underline,
+/// strike, note, fit-page, folder-open, search, chevron-left, chevron-right,
+/// minus, plus, fit-width, pages, shield, home, more, print, rotate, undo,
+/// redo, save, page-single, continuous.
 #[allow(unused_macros)]
 macro_rules! ori {
     ($file:literal) => {
@@ -128,6 +131,22 @@ pub fn ori_icon<Message: 'static>(file: &str, size: f32) -> iced::Element<'stati
         "home" => include_bytes!("../assets/icons/ori/home.svg"),
         "more" => include_bytes!("../assets/icons/ori/more.svg"),
         "print" => include_bytes!("../assets/icons/ori/print.svg"),
+        // v2
+        "folder" => include_bytes!("../assets/icons/ori/folder.svg"),
+        "file-text" => include_bytes!("../assets/icons/ori/file-text.svg"),
+        "x" => include_bytes!("../assets/icons/ori/x.svg"),
+        "copy" => include_bytes!("../assets/icons/ori/copy.svg"),
+        "highlighter" => include_bytes!("../assets/icons/ori/highlighter.svg"),
+        "underline" => include_bytes!("../assets/icons/ori/underline.svg"),
+        "strike" => include_bytes!("../assets/icons/ori/strike.svg"),
+        "note" => include_bytes!("../assets/icons/ori/note.svg"),
+        "fit-page" => include_bytes!("../assets/icons/ori/fit-page.svg"),
+        "rotate" => include_bytes!("../assets/icons/ori/rotate.svg"),
+        "undo" => include_bytes!("../assets/icons/ori/undo.svg"),
+        "redo" => include_bytes!("../assets/icons/ori/redo.svg"),
+        "save" => include_bytes!("../assets/icons/ori/save.svg"),
+        "page-single" => include_bytes!("../assets/icons/ori/page-single.svg"),
+        "continuous" => include_bytes!("../assets/icons/ori/continuous.svg"),
         _ => include_bytes!("../assets/icons/ori/more.svg"),
     };
     svg(svg::Handle::from_memory(bytes))
@@ -315,6 +334,349 @@ pub fn page_frame(tokens: &Tokens) -> impl Fn(&iced::Theme) -> container::Style 
     }
 }
 
+// ── Fatia HUD / overlays (Stitch) ──────────────────────────────────────────
+
+/// Pílula do HUD flutuante (Stitch): fundo `elevated`, borda hairline `line`,
+/// raio 99 e sombra difusa — 3º nível de elevação, sobre o canvas.
+pub fn hud_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tokens.elevated)),
+        border: Border {
+            color: tokens.line,
+            width: 1.0,
+            radius: 99.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, if tokens.is_dark { 0.45 } else { 0.12 }),
+            offset: Vector::new(0.0, 8.0),
+            blur_radius: 32.0,
+        },
+        text_color: Some(tokens.ink),
+        ..container::Style::default()
+    }
+}
+
+/// Ação primária teal do HUD/overlays (Stitch): fundo `accent`, texto escuro
+/// (`bg`, que inverte no tema claro), raio 99.
+pub fn hud_primary_style(tokens: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => lift(tokens.accent, 0.08),
+            button::Status::Disabled => Color {
+                a: 0.4,
+                ..tokens.accent
+            },
+            _ => tokens.accent,
+        };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: tokens.bg,
+            border: Border {
+                radius: 99.0.into(),
+                ..Border::default()
+            },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+/// Ação secundária ghost do HUD/overlays (Stitch): só texto `muted`, que
+/// sobe para `ink` com fundo `hover`.
+pub fn hud_ghost_style(tokens: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let interactive = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if interactive {
+                tokens.hover
+            } else {
+                Color::TRANSPARENT
+            })),
+            text_color: if interactive {
+                tokens.ink
+            } else {
+                tokens.muted
+            },
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+/// Clareia `color` rumo ao branco — hover do primário (Stitch `#5DC7BF`).
+fn lift(color: Color, amount: f32) -> Color {
+    Color {
+        r: color.r + (1.0 - color.r) * amount,
+        g: color.g + (1.0 - color.g) * amount,
+        b: color.b + (1.0 - color.b) * amount,
+        a: color.a,
+    }
+}
+
+/// Pílula do documento (toolbar): fundo `surface`, hairline `line`, raio 4.
+pub fn bar_doc_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tokens.surface)),
+        border: Border {
+            color: tokens.line,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        text_color: Some(tokens.ink),
+        ..container::Style::default()
+    }
+}
+
+/// Dot da pílula do documento (marcas ainda não salvas): `accent`, redondo.
+/// O tamanho vem do `container` no uso.
+pub fn bar_dot_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tokens.accent)),
+        border: Border {
+            radius: 99.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Barra de anotar (Destacar · Sublinhar · Riscar · Nota): fundo `elevated`,
+/// borda `accent` a 30%, raio 99.
+pub fn bar_mark_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tokens.elevated)),
+        border: Border {
+            color: Color {
+                a: 0.3,
+                ..tokens.accent
+            },
+            width: 1.0,
+            radius: 99.0.into(),
+        },
+        text_color: Some(tokens.ink),
+        ..container::Style::default()
+    }
+}
+
+/// Campo de busca/página dentro da pílula: transparente, sem borda própria
+/// (a moldura é do `pill_style`), placeholder `muted`.
+pub fn bar_input_style(
+    tokens: Tokens,
+) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style {
+    move |_theme, _status| text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
+        icon: tokens.muted,
+        placeholder: tokens.muted,
+        value: tokens.ink,
+        selection: Color {
+            a: 0.4,
+            ..tokens.accent
+        },
+    }
+}
+
+// ── Fatia estado vazio (Stitch) ────────────────────────────────────────────
+
+/// Dropzone do estado vazio (Stitch): fundo `surface`, raio 12. O tracejado
+/// é canvas (`EmptyDash` em `view.rs`) — `Border` do iced não tem dash.
+pub fn empty_drop_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tokens.surface)),
+        border: Border {
+            radius: 12.0.into(),
+            ..Border::default()
+        },
+        text_color: Some(tokens.ink),
+        ..container::Style::default()
+    }
+}
+
+/// Pílula de contagem da seção "Documentos recentes": fundo `elevated`,
+/// raio 99, texto `muted` (o tamanho vem do `container` no uso).
+pub fn empty_badge_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tokens.elevated)),
+        border: Border {
+            radius: 99.0.into(),
+            ..Border::default()
+        },
+        text_color: Some(tokens.muted),
+        ..container::Style::default()
+    }
+}
+
+/// Palco do lockup Tsuro: fundo escuro fixo, não segue o tema. O lockup
+/// foi desenhado para fundo escuro — sem o palco ele some no tema claro.
+pub fn logo_stage_style() -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(Color::from_rgb8(0x18, 0x18, 0x18))),
+        border: Border {
+            radius: 10.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+// ── Fatia painéis laterais (Stitch §5 Miniaturas) ─────────────────────────
+
+/// Painel lateral (navegação / assinaturas): fundo chrome, hairline `line`,
+/// raio 8 — camada 1 do DESIGN (sidebar docked).
+pub fn panel_bg_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tokens.chrome)),
+        border: Border {
+            color: tokens.line,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Trilho do segmento Miniaturas | Sumário: fundo `surface` (chrome no light),
+/// hairline `line`, raio 6.
+pub fn panel_seg_track_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(if tokens.is_dark {
+            tokens.surface
+        } else {
+            tokens.chrome
+        })),
+        border: Border {
+            color: tokens.line,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Segmento do controle Miniaturas|Sumário: `accent_bg`+`accent` quando ativo,
+/// `hover` só no hover; raio 4.
+pub fn panel_seg_style(
+    tokens: Tokens,
+    active: bool,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let background = if active {
+            tokens.accent_bg
+        } else {
+            match status {
+                button::Status::Hovered | button::Status::Pressed => tokens.hover,
+                _ => Color::TRANSPARENT,
+            }
+        };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: if active { tokens.accent } else { tokens.ink },
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+/// Halo da miniatura ativa: 2px `accent` (transparente fora da ativa) — a
+/// borda ocupa sempre o mesmo espaço, sem shift de layout.
+pub fn panel_thumb_style(
+    tokens: Tokens,
+    active: bool,
+) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: None,
+        border: Border {
+            color: if active {
+                tokens.accent
+            } else {
+                Color::TRANSPARENT
+            },
+            width: 2.0,
+            radius: 5.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Moldura da folha na miniatura: branca, 1px `line`, raio 3 (corte de papel).
+pub fn panel_thumb_frame_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tokens.page)),
+        border: Border {
+            color: tokens.line,
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Item do sumário: `accent_bg`+`accent` quando ativo, `hover` no hover;
+/// raio 6, texto body-md definido no uso.
+pub fn panel_toc_item_style(
+    tokens: Tokens,
+    active: bool,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let background = if active {
+            tokens.accent_bg
+        } else {
+            match status {
+                button::Status::Hovered | button::Status::Pressed => tokens.hover,
+                _ => Color::TRANSPARENT,
+            }
+        };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: if active { tokens.accent } else { tokens.ink },
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+/// Botão ▸/▾ de expandir/colapsar do sumário: quadrado compacto, `hover` suave.
+pub fn panel_fold_style(tokens: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => tokens.hover,
+            _ => Color::TRANSPARENT,
+        };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: tokens.muted,
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+/// Cartão de assinatura (painel lateral): fundo `elevated`, hairline `line`,
+/// raio 8 — mesmo vocabulário do cartão de menu/recente.
+pub fn panel_card_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tokens.elevated)),
+        border: Border {
+            color: tokens.line,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        text_color: Some(tokens.ink),
+        ..container::Style::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,7 +695,7 @@ mod tests {
         assert_eq!(t.bg, hex(0x18, 0x18, 0x18));
         assert_eq!(t.accent, hex(0x4d, 0xb8, 0xb0));
         let l = Tokens::for_theme(Theme::Light);
-        assert_eq!(l.bg, hex(0xf4, 0xf3, 0xf0));
+        assert_eq!(l.bg, hex(0xef, 0xef, 0xed));
         assert_eq!(l.elevated, Color::WHITE);
     }
 
