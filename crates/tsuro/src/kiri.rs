@@ -94,9 +94,10 @@ fn hex(r: u8, g: u8, b: u8) -> Color {
 
 /// Ícone Ori (origami tsuru) — cor fixa no SVG, sem `.style()`.
 /// Uso: `ori!("folder-open")` → 16×16. Pílula de busca usa `ori_small!`.
-/// V2 (21 ícones): folder, file-text, x, copy, highlighter, underline,
+/// V2 (27 ícones): folder, file-text, x, copy, highlighter, underline,
 /// strike, note, fit-page, folder-open, search, chevron-left, chevron-right,
-/// minus, plus, fit-width, pages, shield, home, more, print.
+/// minus, plus, fit-width, pages, shield, home, more, print, rotate, undo,
+/// redo, save, page-single, continuous.
 #[allow(unused_macros)]
 macro_rules! ori {
     ($file:literal) => {
@@ -140,6 +141,12 @@ pub fn ori_icon<Message: 'static>(file: &str, size: f32) -> iced::Element<'stati
         "strike" => include_bytes!("../assets/icons/ori/strike.svg"),
         "note" => include_bytes!("../assets/icons/ori/note.svg"),
         "fit-page" => include_bytes!("../assets/icons/ori/fit-page.svg"),
+        "rotate" => include_bytes!("../assets/icons/ori/rotate.svg"),
+        "undo" => include_bytes!("../assets/icons/ori/undo.svg"),
+        "redo" => include_bytes!("../assets/icons/ori/redo.svg"),
+        "save" => include_bytes!("../assets/icons/ori/save.svg"),
+        "page-single" => include_bytes!("../assets/icons/ori/page-single.svg"),
+        "continuous" => include_bytes!("../assets/icons/ori/continuous.svg"),
         _ => include_bytes!("../assets/icons/ori/more.svg"),
     };
     svg(svg::Handle::from_memory(bytes))
@@ -351,9 +358,7 @@ pub fn hud_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::Style {
 
 /// Ação primária teal do HUD/overlays (Stitch): fundo `accent`, texto escuro
 /// (`bg`, que inverte no tema claro), raio 99.
-pub fn hud_primary_style(
-    tokens: Tokens,
-) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+pub fn hud_primary_style(tokens: Tokens) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let background = match status {
             button::Status::Hovered | button::Status::Pressed => lift(tokens.accent, 0.08),
@@ -386,7 +391,11 @@ pub fn hud_ghost_style(tokens: Tokens) -> impl Fn(&iced::Theme, button::Status) 
             } else {
                 Color::TRANSPARENT
             })),
-            text_color: if interactive { tokens.ink } else { tokens.muted },
+            text_color: if interactive {
+                tokens.ink
+            } else {
+                tokens.muted
+            },
             border: Border {
                 radius: 6.0.into(),
                 ..Border::default()
@@ -499,6 +508,18 @@ pub fn empty_badge_style(tokens: Tokens) -> impl Fn(&iced::Theme) -> container::
     }
 }
 
+/// Palco do lockup Tsuro: fundo escuro fixo, não segue o tema. O lockup
+/// foi desenhado para fundo escuro — sem o palco ele some no tema claro.
+pub fn logo_stage_style() -> impl Fn(&iced::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(Color::from_rgb8(0x18, 0x18, 0x18))),
+        border: Border {
+            radius: 10.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
 // ── Fatia painéis laterais (Stitch §5 Miniaturas) ─────────────────────────
 
 /// Painel lateral (navegação / assinaturas): fundo chrome, hairline `line`,
@@ -569,7 +590,11 @@ pub fn panel_thumb_style(
     move |_| container::Style {
         background: None,
         border: Border {
-            color: if active { tokens.accent } else { Color::TRANSPARENT },
+            color: if active {
+                tokens.accent
+            } else {
+                Color::TRANSPARENT
+            },
             width: 2.0,
             radius: 5.0.into(),
         },

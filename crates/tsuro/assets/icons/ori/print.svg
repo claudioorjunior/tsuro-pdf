@@ -1,9 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-  <!-- Ori · print · Tsuro -->
-  <path fill="#5ec9c1" d="M7.6 4.2h8.8l-1.1 4.3H8.7z"/>
-  <path fill="#247870" d="M4 8.5h10v8.5H4z"/>
-  <path fill="#3a9d95" d="M14 8.5h6v8.5h-6z"/>
-  <path fill="#5ec9c1" d="M7 15.5h10v4H7z"/>
-  <path fill="#3a9d95" d="M14.8 19.5 17 17.3v2.2z"/>
-  <path stroke="#1a5c56" stroke-width=".6" stroke-linejoin="round" d="M7.6 4.2h8.8l-1.1 4.3M8.7 8.5 7.6 4.2M4 8.5h16M4 8.5v8.5H7M20 8.5v8.5H17M14 8.5v7M7 15.5h10v4H7zM14.8 19.5 17 17.3"/>
+  <!-- Ori · print · Tsuro · gen -->
+  <path fill="#5ec9c1" d="M7 3H17V9H7Z"/>
+  <path fill="#3a9d95" d="M4 9H20V17H4Z"/>
+  <path fill="#247870" d="M6 11H18V12.6H6Z"/>
+  <path fill="#5ec9c1" d="M7.5 14H16.5V20.5H7.5Z"/>
 </svg>

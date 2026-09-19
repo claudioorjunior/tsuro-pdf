@@ -1,7 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-  <!-- Ori · fit-page · Tsuro -->
-  <path fill="#5ec9c1" d="M7.5 5.5h6.5l2.5 2.5v1.5H7.5z"/>
-  <path fill="#3a9d95" d="M7.5 9.5h9v9H7.5z"/>
-  <path fill="#247870" d="M14 5.5l2.5 2.5H14z"/>
-  <path stroke="#1a5c56" stroke-width=".65" stroke-linejoin="round" d="M7.5 5.5h6.5l2.5 2.5v10.5h-9zM14 5.5v2.5h2.5M4 4h3M4 4v3M20 4h-3M20 4v3M4 20h3M4 20v-3M20 20h-3M20 20v-3"/>
+  <!-- Ori · fit-page · Tsuro · gen -->
+  <path fill="#3a9d95" d="M8 4H16V17H8Z"/>
+  <path fill="#5ec9c1" d="M13.5 4L16 6.5H13.5Z"/>
+  <path fill="#247870" d="M8 15.4H16V17H8Z"/>
+  <path fill="none" stroke="#3a9d95" stroke-width="2" d="M3.5 7V3.5H7"/>
+  <path fill="none" stroke="#3a9d95" stroke-width="2" d="M17 3.5H20.5V7"/>
+  <path fill="none" stroke="#3a9d95" stroke-width="2" d="M3.5 17V20.5H7"/>
+  <path fill="none" stroke="#3a9d95" stroke-width="2" d="M17 20.5H20.5V17"/>
 </svg>
