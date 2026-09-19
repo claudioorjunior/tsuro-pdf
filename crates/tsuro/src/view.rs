@@ -1337,7 +1337,6 @@ fn ready_body(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     }
 }
 
-
 /// Painel de navegação (Stitch sidebar): cabeçalho `Navegação`, abas segmentadas
 /// Miniaturas | Sumário e lista virtualizada (miniaturas ou sumário).
 fn pages_panel(ready: &Ready, t: Tokens) -> Element<'_, Message> {
