@@ -560,20 +560,30 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
     toolbar_frame(t, row(items).spacing(4).align_y(Alignment::Center).into())
 }
 
-/// Camada do menu ⋯: ocupa tudo mas só os botões capturam clique.
+/// Camada do menu ⋯: fundo fecha ao clicar, menu no canto.
 fn overflow_layer(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    container(overflow_menu(ready, t))
+    let dim = container(Space::with_width(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.25))),
+            ..container::Style::default()
+        });
+    // Pré-tabs: sem faixa de abas, o menu sempre soma só a topbar (44px).
+    // A soma de TAB_STRIP_HEIGHT volta com a PR #56.
+    let top = 44.0;
+    let card = container(overflow_menu(ready, t))
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(Alignment::End)
         .align_y(Alignment::Start)
         .padding(Padding {
-            top: 44.0,
+            top,
             right: 8.0,
             bottom: 0.0,
             left: 0.0,
-        })
-        .into()
+        });
+    stack![mouse_area(dim).on_press(Message::ToggleOverflow), card].into()
 }
 
 /// Menu ⋯ (PR 4): zoom, girar, imprimir, histórico, modo, copiar,
@@ -591,19 +601,37 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         Message::SetZoom(Zoom::Page),
         false,
     ));
-    items = items.push(menu_item(t, "rotate", "Girar vista (90°)", Message::RotateView, false));
-    items = items.push(menu_item(t, "print", "Imprimir", Message::OpenPrintDialog, false));
-    if ready.can_history_back() {
-        items = items.push(menu_item(t, "chevron-left", "Voltar", Message::HistoryBack, false));
-    }
-    if ready.can_history_forward() {
     items = items.push(menu_item(
         t,
-        "chevron-right",
-        "Avançar",
-        Message::HistoryForward,
+        "rotate",
+        "Girar vista (90°)",
+        Message::RotateView,
         false,
     ));
+    items = items.push(menu_item(
+        t,
+        "print",
+        "Imprimir",
+        Message::OpenPrintDialog,
+        false,
+    ));
+    if ready.can_history_back() {
+        items = items.push(menu_item(
+            t,
+            "chevron-left",
+            "Voltar",
+            Message::HistoryBack,
+            false,
+        ));
+    }
+    if ready.can_history_forward() {
+        items = items.push(menu_item(
+            t,
+            "chevron-right",
+            "Avançar",
+            Message::HistoryForward,
+            false,
+        ));
     }
     items = items.push(text("Modo de página").size(12).color(t.muted));
     let single = ready.view_mode == ViewMode::Single;
@@ -622,13 +650,31 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         !single,
     ));
     if ready.selection_plain_text().is_some() {
-        items = items.push(menu_item(t, "copy", "Copiar seleção", Message::CopySelection, false));
+        items = items.push(menu_item(
+            t,
+            "copy",
+            "Copiar seleção",
+            Message::CopySelection,
+            false,
+        ));
     }
     if ready.can_annot_undo() {
-        items = items.push(menu_item(t, "undo", "Desfazer marcação", Message::AnnotUndo, false));
+        items = items.push(menu_item(
+            t,
+            "undo",
+            "Desfazer marcação",
+            Message::AnnotUndo,
+            false,
+        ));
     }
     if ready.can_annot_redo() {
-        items = items.push(menu_item(t, "redo", "Refazer marcação", Message::AnnotRedo, false));
+        items = items.push(menu_item(
+            t,
+            "redo",
+            "Refazer marcação",
+            Message::AnnotRedo,
+            false,
+        ));
     }
     if !ready.annotations.is_empty() {
         items = items.push(menu_item(

@@ -46,7 +46,7 @@ const PANES_GAP: f32 = 12.0;
 const CHROME_PAD: f32 = 8.0;
 /// Célula do contínuo replica o padding de `page_pane` (view.rs).
 pub(crate) const DOC_PAD_TOP: f32 = 28.0;
-pub(crate) const DOC_PAD_BOTTOM: f32 = 32.0;
+pub(crate) const DOC_PAD_BOTTOM: f32 = 56.0;
 pub(crate) const DOC_PAD_X: f32 = 24.0;
 pub(crate) const DOC_GAP: f32 = 16.0;
 
@@ -1523,6 +1523,7 @@ impl Session {
                     ready.note_draft = None;
                     // Idem para o aviso de documento assinado.
                     ready.save_warning = false;
+                    ready.overflow_open = false;
                     // Enviando: ignora (Esc) para não perder o resultado na volta.
                     if ready
                         .print_dialog
@@ -3660,20 +3661,22 @@ mod tests {
         assert!((ready.doc_stage_max_width() - ready.doc_stage_width(page)).abs() < 0.001);
     }
 
-    /// Largura útil 744 (800 − 8 − 48); célula 1548 (28 + 744×2 + 32); passo 1564.
+    /// Largura útil 744 (800 − 8 − 48); célula e passo derivam dos pads
+    /// (não literais: DOC_PAD_BOTTOM já mudou 32→56 uma vez).
     #[test]
     fn continuous_offsets_match_cell_geometry() {
         let Some(ready) = uniform_ready() else {
             return;
         };
         assert_eq!(ready.doc_content_width(), 744.0);
+        let cell = DOC_PAD_TOP + 744.0 * 2.0 + DOC_PAD_BOTTOM;
         let n = ready.page_count();
         assert_eq!(ready.page_offset(PageNo::first()), 0.0);
         if n > 1 {
-            assert_eq!(ready.page_offset(PageNo::from_index(1)), 1564.0);
+            assert_eq!(ready.page_offset(PageNo::from_index(1)), cell + DOC_GAP);
         }
         let last = PageNo::from_index(n - 1);
-        assert_eq!(ready.doc_total_height(), ready.page_offset(last) + 1548.0);
+        assert_eq!(ready.doc_total_height(), ready.page_offset(last) + cell);
     }
 
     #[test]
@@ -3681,12 +3684,13 @@ mod tests {
         let Some(ready) = uniform_ready() else {
             return;
         };
+        let cell = DOC_PAD_TOP + 744.0 * 2.0 + DOC_PAD_BOTTOM;
         let last = ready.page_count() - 1;
         assert_eq!(ready.page_at_offset(0.0).index(), 0);
-        assert_eq!(ready.page_at_offset(1547.0).index(), 0);
+        assert_eq!(ready.page_at_offset(cell - 1.0).index(), 0);
         // No gap entre células, a próxima página já responde.
         let gap_page = if last > 0 { 1 } else { 0 };
-        assert_eq!(ready.page_at_offset(1548.0).index(), gap_page);
+        assert_eq!(ready.page_at_offset(cell).index(), gap_page);
         assert_eq!(ready.page_at_offset(-5.0).index(), 0);
         assert_eq!(ready.page_at_offset(1e9).index(), last);
     }
