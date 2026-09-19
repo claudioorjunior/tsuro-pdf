@@ -579,8 +579,9 @@ fn overflow_layer(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 /// Menu ⋯ (PR 4): zoom, girar, imprimir, histórico, modo, copiar,
 /// desfazer/refazer, salvar, fechar, aparência.
 /// Ícones Ori nas linhas acionáveis: fit-page, rotate, print,
-/// chevron-left, chevron-right, page-single, pages, copy, undo, redo,
-/// save, x. Headers "Modo de página"/"Aparência" e Escuro/Claro sem ícone.
+/// chevron-left, chevron-right, page-single, continuous, copy, undo,
+/// redo, save, x. O modo vigente leva destaque `accent` (sem ●/○ —
+/// faltam na fonte e viram `?`). Headers e Escuro/Claro sem ícone.
 fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let mut items = column![].spacing(2).width(Length::Fill);
     items = items.push(menu_item(
@@ -588,50 +589,46 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         "fit-page",
         "Ajustar página inteira",
         Message::SetZoom(Zoom::Page),
+        false,
     ));
-    items = items.push(menu_item(t, "rotate", "Girar vista (90°)", Message::RotateView));
-    items = items.push(menu_item(t, "print", "Imprimir", Message::OpenPrintDialog));
+    items = items.push(menu_item(t, "rotate", "Girar vista (90°)", Message::RotateView, false));
+    items = items.push(menu_item(t, "print", "Imprimir", Message::OpenPrintDialog, false));
     if ready.can_history_back() {
-        items = items.push(menu_item(t, "chevron-left", "Voltar", Message::HistoryBack));
+        items = items.push(menu_item(t, "chevron-left", "Voltar", Message::HistoryBack, false));
     }
     if ready.can_history_forward() {
-        items = items.push(menu_item(
-            t,
-            "chevron-right",
-            "Avançar",
-            Message::HistoryForward,
-        ));
+    items = items.push(menu_item(
+        t,
+        "chevron-right",
+        "Avançar",
+        Message::HistoryForward,
+        false,
+    ));
     }
     items = items.push(text("Modo de página").size(12).color(t.muted));
     let single = ready.view_mode == ViewMode::Single;
     items = items.push(menu_item(
         t,
         "page-single",
-        if single {
-            "● Página única"
-        } else {
-            "○ Página única"
-        },
+        "Página única",
         Message::SetViewMode(ViewMode::Single),
+        single,
     ));
     items = items.push(menu_item(
         t,
-        "pages",
-        if single {
-            "○ Rolagem contínua"
-        } else {
-            "● Rolagem contínua"
-        },
+        "continuous",
+        "Rolagem contínua",
         Message::SetViewMode(ViewMode::Continuous),
+        !single,
     ));
     if ready.selection_plain_text().is_some() {
-        items = items.push(menu_item(t, "copy", "Copiar seleção", Message::CopySelection));
+        items = items.push(menu_item(t, "copy", "Copiar seleção", Message::CopySelection, false));
     }
     if ready.can_annot_undo() {
-        items = items.push(menu_item(t, "undo", "Desfazer marcação", Message::AnnotUndo));
+        items = items.push(menu_item(t, "undo", "Desfazer marcação", Message::AnnotUndo, false));
     }
     if ready.can_annot_redo() {
-        items = items.push(menu_item(t, "redo", "Refazer marcação", Message::AnnotRedo));
+        items = items.push(menu_item(t, "redo", "Refazer marcação", Message::AnnotRedo, false));
     }
     if !ready.annotations.is_empty() {
         items = items.push(menu_item(
@@ -639,9 +636,10 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             "save",
             "Salvar cópia com marcações…",
             Message::SaveCopyRequested,
+            false,
         ));
     }
-    items = items.push(menu_item(t, "x", "Fechar documento", Message::Close));
+    items = items.push(menu_item(t, "x", "Fechar documento", Message::Close, false));
     items = items.push(
         container(Space::with_height(Length::Fixed(1.0)))
             .width(Length::Fill)
@@ -666,11 +664,14 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         .into()
 }
 
+/// Linha do menu ⋯: ícone Ori + rótulo; `active` pinta o modo vigente
+/// (`accent_bg` + texto `accent`, via `panel_seg_style`).
 fn menu_item(
     t: Tokens,
     icon: &str,
     label: &'static str,
     message: Message,
+    active: bool,
 ) -> Element<'static, Message> {
     button(
         row![kiri::ori_icon(icon, 16.0), text(label).size(13)]
@@ -679,7 +680,7 @@ fn menu_item(
     )
     .width(Length::Fill)
     .padding(Padding::from([8, 10]))
-    .style(kiri::menu_item_style(t))
+    .style(kiri::panel_seg_style(t, active))
     .on_press(message)
     .into()
 }
