@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-  <path fill="#5ec9c1" d="M10 6v12l6-6-6-6z"/>
-  <path fill="#3a9d95" d="M10 6l-2 2v8l2 2V6z"/>
-  <path stroke="#1a5c56" stroke-width=".65" stroke-linejoin="round" d="M10 6l6 6-6 6"/>
+  <!-- Ori · chevron-right · Tsuro · gen -->
+  <path fill="none" stroke="#3a9d95" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" d="M8 6L15 12L8 18"/>
+  <path fill="none" stroke="#5ec9c1" stroke-width="3.6" stroke-linecap="butt" d="M8 6L15 12"/>
 </svg>

@@ -53,7 +53,9 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
     let body: Element<'_, Message> = match session {
         Session::Empty(empty) => empty_browser(empty, t),
         Session::Loading { source, phase, .. } => opening(source, *phase, t),
-        Session::Failed { source, message, .. } => failed(source, message, t),
+        Session::Failed {
+            source, message, ..
+        } => failed(source, message, t),
         Session::Ready(ready) => ready_body(ready, t),
     };
 
@@ -128,29 +130,33 @@ fn hud_icon(
 fn hud(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let n = ready.page_count().max(1);
     let page = ready.visible.index() + 1;
-    let current = match ready.zoom {
-        Zoom::Manual(z) => z.get(),
-        Zoom::Width | Zoom::Page => ready
-            .zoom
-            .scale(ready.viewport(), ready.media(ready.visible))
-            .factor(),
-    };
+    let current = ready.zoom_step_factor();
     let out = Zoom::Manual(ZoomFactor::new(current / 1.1));
     let into = Zoom::Manual(ZoomFactor::new(current * 1.1));
-    let mono = |s: String, color: Color| {
-        text(s)
-            .size(12)
-            .font(iced::Font::MONOSPACE)
-            .color(color)
-    };
+    let mono = |s: String, color: Color| text(s).size(12).font(iced::Font::MONOSPACE).color(color);
     let mut pill = row![
-        hud_icon("chevron-left", "Página anterior", t, Message::Nav(NavCmd::Previous)),
+        hud_icon(
+            "chevron-left",
+            "Página anterior",
+            t,
+            Message::Nav(NavCmd::Previous)
+        ),
         mono(page.to_string(), t.ink),
         mono("/".to_string(), t.muted),
         mono(n.to_string(), t.muted),
-        hud_icon("chevron-right", "Próxima página", t, Message::Nav(NavCmd::Next)),
+        hud_icon(
+            "chevron-right",
+            "Próxima página",
+            t,
+            Message::Nav(NavCmd::Next)
+        ),
         kiri::vsep(t),
-        hud_icon("fit-width", "Ajustar à largura", t, Message::SetZoom(Zoom::Width)),
+        hud_icon(
+            "fit-width",
+            "Ajustar à largura",
+            t,
+            Message::SetZoom(Zoom::Width)
+        ),
         hud_icon("minus", "Diminuir zoom", t, Message::SetZoom(out)),
         mono(format!("{}%", (current * 100.0).round() as i32), t.ink),
         hud_icon("plus", "Aumentar zoom", t, Message::SetZoom(into)),
@@ -376,13 +382,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
         })
         .style(kiri::pill_style(t))
         .max_width(520.0);
-        let current = match ready.zoom {
-            Zoom::Manual(z) => z.get(),
-            Zoom::Width | Zoom::Page => ready
-                .zoom
-                .scale(ready.viewport(), ready.media(ready.visible))
-                .factor(),
-        };
+        let current = ready.zoom_step_factor();
         let out = Zoom::Manual(ZoomFactor::new(current / 1.1));
         let into = Zoom::Manual(ZoomFactor::new(current * 1.1));
 
@@ -574,75 +574,135 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
     toolbar_frame(t, row(items).spacing(4).align_y(Alignment::Center).into())
 }
 
-/// Camada do menu ⋯: ocupa tudo mas só os botões capturam clique.
-fn overflow_layer(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    container(overflow_menu(ready, t))
+/// Camada do menu ⋯: fundo fecha ao clicar, menu no canto.
+fn overflow_layer(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
+    let dim = container(Space::with_width(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.25))),
+            ..container::Style::default()
+        });
+    // Com 2+ abas a faixa soma TAB_STRIP_HEIGHT à topbar (44px).
+    let top = if tabs.len() > 1 {
+        44.0 + TAB_STRIP_HEIGHT
+    } else {
+        44.0
+    };
+    let card = container(overflow_menu(tabs, t))
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(Alignment::End)
         .align_y(Alignment::Start)
         .padding(Padding {
-            top: 44.0,
+            top,
             right: 8.0,
             bottom: 0.0,
             left: 0.0,
-        })
-        .into()
+        });
+    stack![mouse_area(dim).on_press(Message::ToggleOverflow), card].into()
 }
 
-/// Menu ⋯ (PR 4): zoom página, copiar, fechar, aparência.
+/// Menu ⋯ (PR 4): zoom, girar, imprimir, histórico, modo, copiar,
+/// desfazer/refazer, salvar, fechar, aparência.
+/// Ícones Ori nas linhas acionáveis: fit-page, rotate, print,
+/// chevron-left, chevron-right, page-single, continuous, copy, undo,
+/// redo, save, x. O modo vigente leva destaque `accent` (sem ●/○ —
+/// faltam na fonte e viram `?`). Headers e Escuro/Claro sem ícone.
 fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let mut items = column![].spacing(2).width(Length::Fill);
     items = items.push(menu_item(
         t,
+        "fit-page",
         "Ajustar página inteira",
         Message::SetZoom(Zoom::Page),
+        false,
     ));
-    items = items.push(menu_item(t, "Girar vista (90°)", Message::RotateView));
-    items = items.push(print_menu_item(t));
+    items = items.push(menu_item(
+        t,
+        "rotate",
+        "Girar vista (90°)",
+        Message::RotateView,
+        false,
+    ));
+    items = items.push(menu_item(
+        t,
+        "print",
+        "Imprimir",
+        Message::OpenPrintDialog,
+        false,
+    ));
     if ready.can_history_back() {
-        items = items.push(menu_item(t, "Voltar", Message::HistoryBack));
+        items = items.push(menu_item(
+            t,
+            "chevron-left",
+            "Voltar",
+            Message::HistoryBack,
+            false,
+        ));
     }
     if ready.can_history_forward() {
-        items = items.push(menu_item(t, "Avançar", Message::HistoryForward));
+        items = items.push(menu_item(
+            t,
+            "chevron-right",
+            "Avançar",
+            Message::HistoryForward,
+            false,
+        ));
     }
     items = items.push(text("Modo de página").size(12).color(t.muted));
     let single = ready.view_mode == ViewMode::Single;
     items = items.push(menu_item(
         t,
-        if single {
-            "● Página única"
-        } else {
-            "○ Página única"
-        },
+        "page-single",
+        "Página única",
         Message::SetViewMode(ViewMode::Single),
+        single,
     ));
     items = items.push(menu_item(
         t,
-        if single {
-            "○ Rolagem contínua"
-        } else {
-            "● Rolagem contínua"
-        },
+        "continuous",
+        "Rolagem contínua",
         Message::SetViewMode(ViewMode::Continuous),
+        !single,
     ));
     if ready.selection_plain_text().is_some() {
-        items = items.push(menu_item(t, "Copiar seleção", Message::CopySelection));
+        items = items.push(menu_item(
+            t,
+            "copy",
+            "Copiar seleção",
+            Message::CopySelection,
+            false,
+        ));
     }
     if ready.can_annot_undo() {
-        items = items.push(menu_item(t, "Desfazer marcação", Message::AnnotUndo));
+        items = items.push(menu_item(
+            t,
+            "undo",
+            "Desfazer marcação",
+            Message::AnnotUndo,
+            false,
+        ));
     }
     if ready.can_annot_redo() {
-        items = items.push(menu_item(t, "Refazer marcação", Message::AnnotRedo));
+        items = items.push(menu_item(
+            t,
+            "redo",
+            "Refazer marcação",
+            Message::AnnotRedo,
+            false,
+        ));
     }
     if !ready.annotations.is_empty() {
         items = items.push(menu_item(
             t,
+            "save",
             "Salvar cópia com marcações…",
             Message::SaveCopyRequested,
+            false,
         ));
     }
-    items = items.push(menu_item(t, "Fechar documento", Message::Close));
+    items = items.push(menu_item(t, "x", "Fechar documento", Message::Close, false));
     items = items.push(
         container(Space::with_height(Length::Fixed(1.0)))
             .width(Length::Fill)
@@ -667,26 +727,24 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         .into()
 }
 
-fn menu_item(t: Tokens, label: &'static str, message: Message) -> Element<'static, Message> {
-    button(text(label).size(13))
-        .width(Length::Fill)
-        .padding(Padding::from([8, 10]))
-        .style(kiri::menu_item_style(t))
-        .on_press(message)
-        .into()
-}
-
-/// ⋯ → Imprimir: abre o diálogo próprio.
-fn print_menu_item(t: Tokens) -> Element<'static, Message> {
+/// Linha do menu ⋯: ícone Ori + rótulo; `active` pinta o modo vigente
+/// (`accent_bg` + texto `accent`, via `panel_seg_style`).
+fn menu_item(
+    t: Tokens,
+    icon: &str,
+    label: &'static str,
+    message: Message,
+    active: bool,
+) -> Element<'static, Message> {
     button(
-        row![kiri::ori!("print"), text("Imprimir").size(13)]
+        row![kiri::ori_icon(icon, 16.0), text(label).size(13)]
             .spacing(8)
             .align_y(Alignment::Center),
     )
     .width(Length::Fill)
     .padding(Padding::from([8, 10]))
-    .style(kiri::menu_item_style(t))
-    .on_press(Message::OpenPrintDialog)
+    .style(kiri::panel_seg_style(t, active))
+    .on_press(message)
     .into()
 }
 
@@ -1228,14 +1286,18 @@ fn empty_browser(empty: &EmptyState, t: Tokens) -> Element<'_, Message> {
 
     let header = row![
         section_title("Documentos recentes", t),
-        container(text(empty.recents.len().to_string()).size(10).color(t.muted))
-            .padding(Padding::from([1, 6]))
-            .style(kiri::empty_badge_style(t)),
+        container(
+            text(empty.recents.len().to_string())
+                .size(10)
+                .color(t.muted)
+        )
+        .padding(Padding::from([1, 6]))
+        .style(kiri::empty_badge_style(t)),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
 
-    let drop_h = 180.0;
+    let drop_h = 248.0;
     let dropzone = container(
         container(stack![
             Canvas::new(EmptyDash { color: t.line })
@@ -1243,10 +1305,14 @@ fn empty_browser(empty: &EmptyState, t: Tokens) -> Element<'_, Message> {
                 .height(Length::Fixed(drop_h)),
             container(
                 column![
-                    image(image::Handle::from_bytes(
-                        &include_bytes!("../../../public/tsuro-horizontal.png")[..],
-                    ))
-                    .width(Length::Fixed(180.0)),
+                    container(
+                        image(image::Handle::from_bytes(
+                            &include_bytes!("../../../public/tsuro-horizontal-pdf.png")[..],
+                        ))
+                        .width(Length::Fixed(200.0)),
+                    )
+                    .padding(8)
+                    .style(kiri::logo_stage_style()),
                     text("Nenhum documento aberto").size(18),
                     text("Arraste e solte um arquivo PDF aqui")
                         .size(13)
@@ -1298,7 +1364,11 @@ fn empty_card(path: &std::path::Path, t: Tokens) -> Element<'static, Message> {
         .unwrap_or_else(|| path.display().to_string());
     let mut info = column![text(name).size(13)].spacing(2);
     if let Some(parent) = path.parent().and_then(|p| p.file_name()) {
-        info = info.push(text(parent.to_string_lossy().into_owned()).size(11).color(t.muted));
+        info = info.push(
+            text(parent.to_string_lossy().into_owned())
+                .size(11)
+                .color(t.muted),
+        );
     }
     container(
         button(
@@ -1429,13 +1499,11 @@ fn short_name(path: &std::path::Path) -> String {
 /// Painel de navegação (Stitch sidebar): cabeçalho `Navegação`, abas segmentadas
 /// Miniaturas | Sumário e lista virtualizada (miniaturas ou sumário).
 fn pages_panel(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    let mut col = column![
-        column![
-            text("Navegação").size(13).color(t.ink),
-            text("Documento ativo").size(11).color(t.muted),
-        ]
-        .spacing(2),
+    let mut col = column![column![
+        text("Navegação").size(13).color(t.ink),
+        text("Documento ativo").size(11).color(t.muted),
     ]
+    .spacing(2),]
     .spacing(8);
     if ready.outline.is_some() {
         col = col.push(panel_tabs(ready, t));
@@ -1462,24 +1530,28 @@ fn panel_tabs(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             .style(kiri::panel_seg_style(t, active))
             .on_press(msg)
     };
-    container(
-        row![
-            seg("Miniaturas", !ready.outline_open, Message::OutlineTab(false)),
-            seg("Sumário", ready.outline_open, Message::OutlineTab(true)),
-        ],
-    )
+    container(row![
+        seg(
+            "Miniaturas",
+            !ready.outline_open,
+            Message::OutlineTab(false)
+        ),
+        seg("Sumário", ready.outline_open, Message::OutlineTab(true)),
+    ])
     .padding(Padding::from(2))
     .style(kiri::panel_seg_track_style(t))
     .into()
 }
-
 /// Aba Sumário: árvore clicável com expandir/colapsar (body-md + indent) e
 /// destaque da ativa.
 fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let active = ready.outline_active();
-    let mut col = column![].spacing(2);
+    let focus = ready.outline_focus();
+    let mut col = column![panel_tabs(ready, t)].spacing(8);
     for (path, depth, title, page, has_children) in ready.outline_rows() {
         let is_active = active.as_ref() == Some(&path);
+        // O cursor do teclado é a pílula; a página ativa, o texto em accent.
+        let is_focus = focus.as_ref() == Some(&path);
         let fold: Element<'_, Message> = if has_children {
             let collapsed = ready.outline_collapsed.contains(&path);
             button(text(if collapsed { "▸" } else { "▾" }).size(11))
@@ -1491,15 +1563,19 @@ fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             Space::with_width(Length::Fixed(24.0)).into()
         };
         let label = format!("{} · {}", outline_title(title), page.index() + 1);
-        let entry = button(
-            text(label)
-                .size(12)
-                .color(if is_active { t.accent } else { t.ink }),
-        )
-        .width(Length::Fill)
-        .padding(Padding::from([4, 6]))
-        .style(kiri::panel_toc_item_style(t, is_active))
-        .on_press(Message::OutlineJump(page));
+        let entry = control_active(
+            t,
+            button(
+                text(label)
+                    .size(12)
+                    .color(if is_active { t.accent } else { t.ink }),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([4, 6]))
+            .style(kiri::panel_toc_item_style(t, is_active))
+            .on_press(Message::OutlineJump(page)),
+            is_focus,
+        );
         col = col.push(
             row![
                 Space::with_width(Length::Fixed(depth as f32 * 12.0)),
@@ -1547,11 +1623,9 @@ fn thumbs_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             Some(surface) => image(surface.image.clone())
                 .width(Length::Fixed(120.0))
                 .into(),
-            None => container(
-                Space::new(Length::Fixed(120.0), Length::Fixed(150.0)),
-            )
-            .style(kiri::panel_thumb_frame_style(t))
-            .into(),
+            None => container(Space::new(Length::Fixed(120.0), Length::Fixed(150.0)))
+                .style(kiri::panel_thumb_frame_style(t))
+                .into(),
         };
         let active = ready.visible == page;
         col = col.push(
@@ -1561,11 +1635,9 @@ fn thumbs_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
                     column![
                         // Halo 2px `accent` na ativa (transparente fora) + gap 2px —
                         // borda sempre ocupando o mesmo espaço, sem shift de layout.
-                        container(
-                            container(preview).style(kiri::panel_thumb_frame_style(t)),
-                        )
-                        .padding(2)
-                        .style(kiri::panel_thumb_style(t, active)),
+                        container(container(preview).style(kiri::panel_thumb_frame_style(t)),)
+                            .padding(2)
+                            .style(kiri::panel_thumb_style(t, active)),
                         text(format!("Pág. {}", i + 1))
                             .size(11)
                             .font(iced::Font::MONOSPACE)
@@ -1602,30 +1674,47 @@ fn page_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 }
 
 fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    let cw = ready.doc_content_width();
+    let sw = ready.sheet_width(ready.visible);
+    let stage_w = ready.doc_stage_width(ready.visible);
+    let rotated = ready.rotated_media(ready.visible);
+    let sh = sw * rotated.height.max(1.0) / rotated.width.max(1.0);
     let page_view: Element<'_, Message> = match ready.visible_surface() {
         Some(surface) => with_marks(
             ready,
             ready.visible,
-            cw,
-            image(surface.image.clone()).width(Length::Fixed(cw)).into(),
+            sw,
+            image(surface.image.clone())
+                .width(Length::Fixed(sw))
+                .height(Length::Fixed(sh))
+                .into(),
         ),
-        None if ready.visible_render_failed() => {
-            text("Não foi possível renderizar esta página.").into()
+        // Sem bitmap: caixa do tamanho da folha (mesma geometria do
+        // placeholder do contínuo) — sem salto de layout quando chega.
+        None => {
+            let msg = if ready.visible_render_failed() {
+                "Não foi possível renderizar esta página."
+            } else {
+                "Renderizando página…"
+            };
+            container(text(msg).size(13).color(t.muted))
+                .width(Length::Fixed(sw))
+                .height(Length::Fixed(sh))
+                .center_x(Length::Fixed(sw))
+                .align_y(Alignment::Center)
+                .into()
         }
-        None => text("Renderizando página…").into(),
     };
 
     scrollable(
         container(
+            // A moldura abraça a folha: só ela escala com o zoom, o palco
+            // fora segue estável.
             container(page_view)
-                .width(Length::Fill)
-                .center_x(Length::Fill)
+                .center_x(Length::Shrink)
                 .padding(0)
                 .style(kiri::page_frame(&t)),
         )
-        .width(Length::Fill)
-        .center_x(Length::Fill)
+        .center_x(Length::Fixed(stage_w))
         .padding(Padding {
             top: DOC_PAD_TOP,
             right: DOC_PAD_X,
@@ -1639,6 +1728,10 @@ fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         }),
     )
     .id(doc_scroll_id())
+    .direction(scrollable::Direction::Both {
+        vertical: scrollable::Scrollbar::default(),
+        horizontal: scrollable::Scrollbar::default(),
+    })
     // A rolagem do modo página também entra no estado: o post-it aberto segue
     // a folha (a âncora é janela, a rolagem é o delta).
     .on_scroll(|viewport| Message::DocScrolled(viewport.absolute_offset().y))
@@ -1650,17 +1743,18 @@ fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 /// Rolagem contínua: coluna de células com a mesma estrutura da página única;
 /// fora da janela, placeholders de altura exata (sem montar bitmaps).
 fn continuous_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
-    let cw = ready.doc_content_width();
     let total = ready.page_count();
     let (start, end) = ready.doc_window();
-    let mut col = column![].spacing(DOC_GAP).width(Length::Fill);
+    let mut col = column![]
+        .spacing(DOC_GAP)
+        .width(Length::Fixed(ready.doc_stage_max_width()));
     if start > 0 {
         // Offset acumulado menos um gap (o spacing da coluna já conta um).
         let h = (ready.page_offset(PageNo::from_index(start)) - DOC_GAP).max(0.0);
         col = col.push(Space::with_height(Length::Fixed(h)));
     }
     for i in start..end {
-        col = col.push(doc_cell(ready, PageNo::from_index(i), cw, t));
+        col = col.push(doc_cell(ready, PageNo::from_index(i), t));
     }
     if end < total {
         let h = (ready.doc_total_height() - ready.page_offset(PageNo::from_index(end)) - DOC_GAP)
@@ -1669,34 +1763,45 @@ fn continuous_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     }
     scrollable(col)
         .id(doc_scroll_id())
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::default(),
+            horizontal: scrollable::Scrollbar::default(),
+        })
         .on_scroll(|viewport| Message::DocScrolled(viewport.absolute_offset().y))
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
 
-fn doc_cell(ready: &Ready, page: PageNo, cw: f32, t: Tokens) -> Element<'_, Message> {
+fn doc_cell(ready: &Ready, page: PageNo, t: Tokens) -> Element<'_, Message> {
+    let sw = ready.sheet_width(page);
+    let rotated = ready.rotated_media(page);
+    let sh = sw * rotated.height.max(1.0) / rotated.width.max(1.0);
     let inner: Element<'_, Message> = match ready.page_surface(page) {
         Some(surface) => with_marks(
             ready,
             page,
-            cw,
-            image(surface.image.clone()).width(Length::Fixed(cw)).into(),
+            sw,
+            image(surface.image.clone())
+                .width(Length::Fixed(sw))
+                .height(Length::Fixed(sh))
+                .into(),
         ),
         None => {
-            let h = (ready.doc_cell_height(page, cw) - DOC_PAD_TOP - DOC_PAD_BOTTOM).max(1.0);
+            let h = (ready.doc_cell_height(page, sw) - DOC_PAD_TOP - DOC_PAD_BOTTOM).max(1.0);
             container(text("Renderizando página…").size(13).color(t.muted))
-                .width(Length::Fill)
+                .width(Length::Fixed(sw))
                 .height(Length::Fixed(h))
-                .center_x(Length::Fill)
+                .center_x(Length::Fixed(sw))
                 .align_y(Alignment::Center)
                 .into()
         }
     };
     container(
+        // A moldura abraça a folha: só ela escala com o zoom, o palco fora
+        // segue estável.
         container(inner)
-            .width(Length::Fill)
-            .center_x(Length::Fill)
+            .center_x(Length::Shrink)
             .padding(0)
             .style(kiri::page_frame(&t)),
     )
@@ -1997,13 +2102,7 @@ fn with_marks<'a>(
             // arrasto o deixou (`Annotation::marker`); o trecho não se move.
             if a.kind == AnnotKind::Note && i == 0 {
                 let side = marker_side(&a.quads, media, ready.view_rotation, cw, ch);
-                let [mx, my] = display_pt(
-                    a.marker_pt(),
-                    media,
-                    ready.view_rotation,
-                    cw,
-                    ch,
-                );
+                let [mx, my] = display_pt(a.marker_pt(), media, ready.view_rotation, cw, ch);
                 marks.push(DrawMark {
                     x: mx,
                     y: my,
@@ -2068,8 +2167,7 @@ fn signatures_panel(ready: &Ready, t: Tokens) -> Element<'_, Message> {
                     .and_then(|c| c.common_name.as_deref()))
                 .unwrap_or("Assinante");
             // Mesmo veredito do escudo da toolbar (status_dot_color).
-            let dot = kiri::status_dot_color(t, std::iter::once(sig.status))
-                .unwrap_or(t.muted);
+            let dot = kiri::status_dot_color(t, std::iter::once(sig.status)).unwrap_or(t.muted);
             col = col.push(
                 container(
                     column![
@@ -2153,16 +2251,14 @@ fn loading_bar(phase: u16, t: Tokens) -> Element<'static, Message> {
             background: Some(Background::Color(t.accent)),
             ..container::Style::default()
         });
-    container(
-        row![Space::with_width(Length::Fixed(sweep_x(phase))), segment].spacing(0),
-    )
-    .width(Length::Fixed(LOADING_BAR_W))
-    .height(Length::Fixed(2.0))
-    .style(move |_| container::Style {
-        background: Some(Background::Color(t.surface)),
-        ..container::Style::default()
-    })
-    .into()
+    container(row![Space::with_width(Length::Fixed(sweep_x(phase))), segment].spacing(0))
+        .width(Length::Fixed(LOADING_BAR_W))
+        .height(Length::Fixed(2.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.surface)),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// Nome do arquivo no chrome de abertura/falha (o caminho completo não cabe).
@@ -2231,7 +2327,6 @@ mod tests {
         assert_eq!(sweep_x(LOADING_STEPS), sweep_x(0));
         assert_eq!(sweep_x(u16::MAX), sweep_x(u16::MAX % LOADING_STEPS));
     }
-
 
     #[test]
     fn outline_title_truncates_long_labels() {
