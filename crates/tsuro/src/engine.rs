@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, LazyLock};
 
 use pdfium_render::prelude::*;
 use unicode_normalization::UnicodeNormalization;
@@ -13,11 +14,14 @@ use crate::session::{AnnotKind, Annotation};
 const PDFIUM_MISSING: &str =
     "Não foi possível carregar a biblioteca Pdfium (.dylib/.dll). Coloque-a na pasta do aplicativo ou instale-a no sistema.";
 const WORKER_GONE: &str = "motor PDF encerrado";
+const DOC_GONE: &str = "documento fechado";
 const RENDER_TOO_LARGE: &str = "página grande demais para renderizar nesta escala";
 const RENDER_INVALID: &str = "dimensão de render inválida";
 const ANNOT_PAGE_OUT_OF_RANGE: &str = "página da marcação fora do intervalo";
 const ANNOT_MARK_FAILED: &str = "não foi possível gravar a marcação no PDF";
 const ANNOT_SAVE_FAILED: &str = "não foi possível salvar a cópia marcada do PDF";
+#[cfg(test)]
+const ANNOT_READ_FAILED: &str = "não foi possível ler as anotações do PDF";
 
 /// Lado (pt) do marcador de nota gravado no PDF. Mesma âncora do marcador da
 /// UI: canto superior esquerdo do primeiro quad, crescendo para baixo.
@@ -28,26 +32,41 @@ const MAX_RENDER_SIDE: u32 = 16_384;
 /// Teto de pixels RGBA (bytes = este valor × 4). 64M ≈ 256 MiB; A4 a 8× ≈ 32M.
 const MAX_RENDER_PIXELS: u32 = 64_000_000;
 
-// O documento Pdfium fica aberto numa thread dedicada: bind + parse acontecem
-// uma vez por arquivo, e cada operação vira uma ida-e-volta leve pelo canal.
-// `PdfDocument` toma emprestado o `Pdfium`, então os dois vivem como locais
-// na mesma função da worker — nunca atravessam threads.
+// Todos os documentos abertos vivem numa única worker thread do processo, e
+// cada operação é uma ida-e-volta leve pelo canal. Uma thread só (e um
+// `Pdfium` só) não é economia de recurso: o `pdfium-render` embrulha a
+// biblioteca num mutex global e o segura de `FPDF_InitLibrary` até
+// `FPDF_DestroyLibrary`, então um segundo `Pdfium` vivo no mesmo processo
+// trava para sempre. Uma aba por documento (issue #40) exige, portanto, um
+// motor por processo servindo N documentos.
 #[derive(Clone)]
 pub struct PdfiumEngine {
-    shared: Arc<Shared>,
+    worker: Arc<Shared>,
+    /// Documento dentro da worker (o motor serve vários ao mesmo tempo).
+    doc_id: u64,
+    page_count: u32,
 }
 
 struct Shared {
     requests: mpsc::Sender<Request>,
-    page_count: u32,
 }
 
 enum Request {
+    /// Carrega os bytes e devolve o `doc_id` com que a worker vai servir o
+    /// documento (ids são da worker: quem abre não escolhe).
+    Open {
+        bytes: Vec<u8>,
+        reply: mpsc::Sender<Result<(u64, u32), EngineError>>,
+    },
+    /// Esquece o documento (aba fechada). Sem resposta: é limpeza.
+    Close { doc_id: u64 },
     PageData {
+        doc_id: u64,
         page: PageNo,
         reply: mpsc::Sender<Result<(MediaBox, TextLayer), EngineError>>,
     },
     Render {
+        doc_id: u64,
         page: PageNo,
         scale: Scale,
         /// Quartos de volta horários da vista (0..=3); impressão usa 0.
@@ -57,15 +76,156 @@ enum Request {
     /// Lê o outline (bookmarks) do documento. Read-only: não altera o
     /// comportamento interno do Pdfium, apenas percorre a árvore existente.
     Outline {
+        doc_id: u64,
         reply: mpsc::Sender<Result<Option<Outline>, EngineError>>,
     },
     /// Aplica as marcações da sessão ao documento vivo e devolve uma cópia
     /// em bytes (`FPDF_SaveAsCopy`). O documento em memória passa a conter as
     /// anotações; o mesmo motor continua servindo as páginas marcadas.
     SaveCopy {
+        doc_id: u64,
         annotations: Vec<Annotation>,
         reply: mpsc::Sender<Result<Vec<u8>, EngineError>>,
     },
+    #[cfg(test)]
+    /// Lê as anotações de uma página do documento vivo, como dados puros
+    /// (`StoredAnnotation`). Existe para o teste de `save_copy` ler de volta
+    /// pela worker: um segundo `Pdfium` no processo travaria no mutex global.
+    Annotations {
+        doc_id: u64,
+        page: PageNo,
+        reply: mpsc::Sender<Result<Vec<StoredAnnotation>, EngineError>>,
+    },
+}
+
+/// Dono do único `Pdfium` do processo: num `static`, o empréstimo que os
+/// `PdfDocument` fazem dele é `'static` — então os documentos podem morar num
+/// mapa em vez de morrer no fim de cada requisição.
+struct Library(Pdfium);
+
+// O `LazyLock` exige `Send + Sync` do valor, e o handle do pdfium-render não
+// é nenhum dos dois por tipo (guarda um `RefCell` com o token do mutex da
+// biblioteca). Aqui há um dono só e uma thread só: quem inicializa o Pdfium
+// (`FPDF_InitLibrary`, chamado de dentro de `serve`) e quem faz as chamadas é
+// a worker, que nunca entrega o handle a ninguém — os documentos vivem todos
+// dentro dela. Não existe acesso concorrente; os markers só registram esse
+// contrato, sem estender lifetime nenhum.
+unsafe impl Send for Library {}
+unsafe impl Sync for Library {}
+
+/// Worker do processo: nasce no primeiro `open` e vive até o processo acabar
+/// (uma `Pdfium` por processo — ver o comentário de `PdfiumEngine`).
+static WORKER: LazyLock<Arc<Shared>> = LazyLock::new(|| {
+    let (requests, incoming) = mpsc::channel::<Request>();
+    std::thread::Builder::new()
+        .name("tsuro-pdfium".into())
+        .spawn(move || serve(incoming))
+        .expect("não foi possível iniciar a thread do motor PDF");
+    Arc::new(Shared { requests })
+});
+
+/// A biblioteca do processo. O erro do bind é cacheado junto: sem Pdfium
+/// nenhuma aba abre, e é isso que cada `open` responde.
+static LIBRARY: LazyLock<Result<Library, String>> = LazyLock::new(|| {
+    PdfiumEngine::bind()
+        .map(Library)
+        .map_err(|err| err.to_string())
+});
+
+fn worker() -> Arc<Shared> {
+    WORKER.clone()
+}
+
+/// Corpo da worker: a `Pdfium` do processo (static) e um `PdfDocument` por
+/// aba, identificado pelo `doc_id` que a worker mesma distribui.
+fn serve(incoming: mpsc::Receiver<Request>) {
+    let mut documents: HashMap<u64, PdfDocument<'static>> = HashMap::new();
+    let mut next_id = 1u64;
+    for request in incoming {
+        match request {
+            Request::Open { bytes, reply } => {
+                let pdfium = match LIBRARY.as_ref() {
+                    Ok(library) => &library.0,
+                    Err(err) => {
+                        let _ = reply.send(Err(EngineError(err.clone())));
+                        continue;
+                    }
+                };
+                match pdfium.load_pdf_from_byte_vec(bytes, None) {
+                    Ok(document) => {
+                        let doc_id = next_id;
+                        next_id += 1;
+                        let count = u32::from(document.pages().len());
+                        documents.insert(doc_id, document);
+                        let _ = reply.send(Ok((doc_id, count)));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(EngineError(format!(
+                            "não foi possível abrir o PDF: {e}"
+                        ))));
+                    }
+                }
+            }
+            Request::Close { doc_id } => {
+                documents.remove(&doc_id);
+            }
+            Request::PageData {
+                doc_id,
+                page,
+                reply,
+            } => {
+                let _ = reply.send(with_doc(&documents, doc_id, |doc| {
+                    page_data_from_doc(doc, page)
+                }));
+            }
+            Request::Render {
+                doc_id,
+                page,
+                scale,
+                rotation,
+                reply,
+            } => {
+                let _ = reply.send(with_doc(&documents, doc_id, |doc| {
+                    render_from_doc(doc, page, scale, rotation)
+                }));
+            }
+            Request::Outline { doc_id, reply } => {
+                let _ = reply.send(with_doc(&documents, doc_id, outline_from_doc));
+            }
+            Request::SaveCopy {
+                doc_id,
+                annotations,
+                reply,
+            } => {
+                let _ = reply.send(with_doc(&documents, doc_id, |doc| {
+                    save_copy_from_doc(doc, &annotations)
+                }));
+            }
+            #[cfg(test)]
+            Request::Annotations {
+                doc_id,
+                page,
+                reply,
+            } => {
+                let _ = reply.send(with_doc(&documents, doc_id, |doc| {
+                    annotations_from_doc(doc, page)
+                }));
+            }
+        }
+    }
+}
+
+/// Roda `f` no documento `doc_id`; sem ele (aba fechada no meio do caminho) o
+/// pedido falha, nunca entra em pânico.
+fn with_doc<T>(
+    documents: &HashMap<u64, PdfDocument<'static>>,
+    doc_id: u64,
+    f: impl FnOnce(&PdfDocument<'_>) -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    match documents.get(&doc_id) {
+        Some(document) => f(document),
+        None => Err(EngineError(DOC_GONE.into())),
+    }
 }
 
 impl PdfiumEngine {
@@ -87,7 +247,7 @@ impl PdfiumEngine {
         make: impl FnOnce(mpsc::Sender<Result<T, EngineError>>) -> Request,
     ) -> Result<T, EngineError> {
         let (tx, rx) = mpsc::channel();
-        self.shared
+        self.worker
             .requests
             .send(make(tx))
             .map_err(|_| EngineError(WORKER_GONE.into()))?;
@@ -96,13 +256,31 @@ impl PdfiumEngine {
 
     // Media + texto numa única ida à worker (antes eram dois reloads).
     pub fn page_data(&self, page: PageNo) -> Result<(MediaBox, TextLayer), EngineError> {
-        self.call(|reply| Request::PageData { page, reply })
+        self.call(|reply| Request::PageData {
+            doc_id: self.doc_id,
+            page,
+            reply,
+        })
     }
 
     /// Lê o outline (bookmarks) do documento. Read-only sobre `PdfDocument`;
     /// não altera o estado interno do Pdfium.
     pub fn outline(&self) -> Result<Option<Outline>, EngineError> {
-        self.call(|reply| Request::Outline { reply })
+        self.call(|reply| Request::Outline {
+            doc_id: self.doc_id,
+            reply,
+        })
+    }
+
+    #[cfg(test)]
+    /// Lê as anotações de uma página, como dados puros. Read-only sobre
+    /// `PdfDocument`; serve ao teste de `save_copy` (ver `Request::Annotations`).
+    pub fn annotations(&self, page: PageNo) -> Result<Vec<StoredAnnotation>, EngineError> {
+        self.call(|reply| Request::Annotations {
+            doc_id: self.doc_id,
+            page,
+            reply,
+        })
     }
 
     /// Grava uma cópia do documento aberto com as marcações da sessão
@@ -114,79 +292,48 @@ impl PdfiumEngine {
     /// criar anotações, e `save_to_bytes` recebe `&self`.
     pub fn save_copy(&self, annotations: &[Annotation]) -> Result<Vec<u8>, EngineError> {
         self.call(|reply| Request::SaveCopy {
+            doc_id: self.doc_id,
             annotations: annotations.to_vec(),
             reply,
         })
     }
+
+    /// Solta o documento na worker (aba fechada, issue #40): o parse sai da
+    /// memória. Depois disto qualquer pedido deste motor falha — os clones
+    /// (`Ready` é `Clone`) apontam para o mesmo `doc_id`.
+    pub fn close(&self) {
+        let _ = self.worker.requests.send(Request::Close {
+            doc_id: self.doc_id,
+        });
+    }
 }
 
 impl PageEngine for PdfiumEngine {
-    /// Abre um documento numa worker thread própria. Só um engine vivo por
-    /// vez: um segundo `bind` com outro worker ativo trava (limite do Pdfium,
-    /// não deste código) — o app sempre derruba o `Ready` anterior ao abrir.
+    /// Carrega o documento na worker do processo e devolve o motor desta aba.
+    /// Cada documento tem o seu `doc_id`; várias abas convivem no mesmo
+    /// `Pdfium` (um por processo — ver o comentário de `PdfiumEngine`).
     fn open(bytes: Arc<[u8]>) -> Result<Self, EngineError> {
-        let (req_tx, req_rx) = mpsc::channel::<Request>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, EngineError>>();
-        let owned = bytes.to_vec();
-        std::thread::Builder::new()
-            .name("tsuro-pdfium".into())
-            .spawn(move || {
-                let pdfium = match PdfiumEngine::bind() {
-                    Ok(pdfium) => pdfium,
-                    Err(err) => {
-                        let _ = ready_tx.send(Err(err));
-                        return;
-                    }
-                };
-                let document = match pdfium.load_pdf_from_byte_vec(owned, None) {
-                    Ok(document) => document,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(EngineError(format!(
-                            "não foi possível abrir o PDF: {e}"
-                        ))));
-                        return;
-                    }
-                };
-                let count = u32::from(document.pages().len());
-                if ready_tx.send(Ok(count)).is_err() {
-                    return;
-                }
-                for request in req_rx {
-                    match request {
-                        Request::PageData { page, reply } => {
-                            let _ = reply.send(page_data_from_doc(&document, page));
-                        }
-                        Request::Render {
-                            page,
-                            scale,
-                            rotation,
-                            reply,
-                        } => {
-                            let _ = reply.send(render_from_doc(&document, page, scale, rotation));
-                        }
-                        Request::Outline { reply } => {
-                            let _ = reply.send(outline_from_doc(&document));
-                        }
-                        Request::SaveCopy { annotations, reply } => {
-                            let _ = reply.send(save_copy_from_doc(&document, &annotations));
-                        }
-                    }
-                }
+        let worker = worker();
+        let (reply, answer) = mpsc::channel();
+        worker
+            .requests
+            .send(Request::Open {
+                bytes: bytes.to_vec(),
+                reply,
             })
-            .map_err(|e| EngineError(format!("não foi possível iniciar o motor PDF: {e}")))?;
-        let page_count = ready_rx
+            .map_err(|_| EngineError(WORKER_GONE.into()))?;
+        let (doc_id, page_count) = answer
             .recv()
             .map_err(|_| EngineError(WORKER_GONE.into()))??;
         Ok(Self {
-            shared: Arc::new(Shared {
-                requests: req_tx,
-                page_count,
-            }),
+            worker,
+            doc_id,
+            page_count,
         })
     }
 
     fn page_count(&self) -> u32 {
-        self.shared.page_count
+        self.page_count
     }
 
     fn media(&self, page: PageNo) -> Result<MediaBox, EngineError> {
@@ -195,6 +342,7 @@ impl PageEngine for PdfiumEngine {
 
     fn render(&self, page: PageNo, scale: Scale, rotation: u8) -> Result<PageSurface, EngineError> {
         self.call(|reply| Request::Render {
+            doc_id: self.doc_id,
             page,
             scale,
             rotation,
@@ -497,6 +645,69 @@ fn save_copy_from_doc(
         .map_err(|e| EngineError(format!("{ANNOT_SAVE_FAILED}: {e}")))
 }
 
+#[cfg(test)]
+/// Anotação lida de volta do documento: dados puros, sem handles do Pdfium —
+/// atravessa o canal da worker para o teste de `save_copy`.
+#[derive(Debug, Clone)]
+pub(crate) struct StoredAnnotation {
+    kind: AnnotKind,
+    /// Um quad por ponto de anexo, na ordem (nota não tem: vetor vazio).
+    quads: Vec<Quad>,
+    text: String,
+    /// `(left, bottom, right, top)` do `/Rect`, em espaço PDF.
+    bounds: (f32, f32, f32, f32),
+}
+
+#[cfg(test)]
+/// Lê as anotações de uma página do documento vivo, em ordem de criação.
+/// Tipos que o `save_copy_from_doc` nunca grava são ignorados.
+fn annotations_from_doc(
+    document: &PdfDocument<'_>,
+    page: PageNo,
+) -> Result<Vec<StoredAnnotation>, EngineError> {
+    let read_error = |e: PdfiumError| EngineError(format!("{ANNOT_READ_FAILED}: {e}"));
+    let pdf_page = document
+        .pages()
+        .get(page_index(page)?)
+        .map_err(read_error)?;
+    let annotations = pdf_page.annotations();
+    let mut out = Vec::with_capacity(annotations.len());
+    for index in 0..annotations.len() {
+        let annotation = annotations.get(index).map_err(read_error)?;
+        let kind = match annotation.annotation_type() {
+            PdfPageAnnotationType::Highlight => AnnotKind::Highlight,
+            PdfPageAnnotationType::Underline => AnnotKind::Underline,
+            PdfPageAnnotationType::Strikeout => AnnotKind::Strikeout,
+            PdfPageAnnotationType::Text => AnnotKind::Note,
+            _ => continue,
+        };
+        let points = annotation.attachment_points();
+        let mut quads = Vec::with_capacity(points.len());
+        for point in 0..points.len() {
+            let quad = points.get(point).map_err(read_error)?;
+            quads.push(Quad::from_rect(
+                quad.left().value,
+                quad.bottom().value,
+                quad.right().value,
+                quad.top().value,
+            ));
+        }
+        let rect = annotation.bounds().map_err(read_error)?;
+        out.push(StoredAnnotation {
+            kind,
+            quads,
+            text: annotation.contents().unwrap_or_default(),
+            bounds: (
+                rect.left().value,
+                rect.bottom().value,
+                rect.right().value,
+                rect.top().value,
+            ),
+        });
+    }
+    Ok(out)
+}
+
 fn mark_error(e: PdfiumError) -> EngineError {
     EngineError(format!("{ANNOT_MARK_FAILED}: {e}"))
 }
@@ -726,7 +937,13 @@ mod tests {
 
     #[test]
     fn pdfium_binds_when_ci_requires_it() {
-        match PdfiumEngine::bind() {
+        // Pela worker estática: um segundo `Pdfium::new` no processo travaria
+        // no mutex global do pdfium-render (`InitLibrary` retém o lock) — o
+        // gate abre um documento em vez de dar bind de novo.
+        let Some(bytes) = sample_pdf_bytes() else {
+            return;
+        };
+        match PdfiumEngine::open(bytes) {
             Ok(_) => {}
             Err(e) if std::env::var("CI").is_ok() => panic!("{e}"),
             Err(_) => {}
@@ -780,60 +997,43 @@ mod tests {
         let saved = engine.save_copy(&annotations).expect("cópia marcada");
         assert!(!saved.is_empty(), "cópia marcada não pode ser vazia");
         let pages = engine.page_count();
+        engine.close();
         drop(engine);
 
-        // Read-back cru, num escopo próprio: o documento vivo da cópia precisa
-        // sumir antes de o motor reabrir os mesmos bytes.
-        {
-            let pdfium = PdfiumEngine::bind().expect("bind pdfium");
-            let document = pdfium
-                .load_pdf_from_byte_vec(saved.clone(), None)
-                .expect("reabrir cópia");
-            assert_eq!(u32::from(document.pages().len()), pages);
-            let pdf_page = document.pages().get(0).expect("página 0");
-            assert!((pdf_page.width().value - media.width).abs() < 0.5);
-            assert!((pdf_page.height().value - media.height).abs() < 0.5);
-            assert_eq!(pdf_page.annotations().len(), 2);
-
-            let highlight = pdf_page.annotations().first().expect("highlight");
-            assert_eq!(
-                highlight.annotation_type(),
-                PdfPageAnnotationType::Highlight
-            );
-            let points = highlight.attachment_points();
-            assert_eq!(points.len(), quads.len(), "um ponto por quad");
-            for (index, quad) in quads.iter().enumerate() {
-                let (left, bottom, right, top) = quad_bounds(quad);
-                let got = points.get(index).expect("quad gravado");
-                assert!(
-                    (got.left().value - left).abs() < 0.05
-                        && (got.right().value - right).abs() < 0.05,
-                    "quad {index} horizontal: {got} vs {quad:?}"
-                );
-                assert!(
-                    (got.bottom().value - bottom).abs() < 0.05
-                        && (got.top().value - top).abs() < 0.05,
-                    "quad {index} vertical: {got} vs {quad:?}"
-                );
-            }
-
-            let note = pdf_page.annotations().last().expect("nota");
-            assert_eq!(note.annotation_type(), PdfPageAnnotationType::Text);
-            assert_eq!(note.contents().as_deref(), Some("nota do teste"));
-            let bounds = note.bounds().expect("rect da nota");
-            let (left, _, _, top) = quad_bounds(&first);
-            assert!((bounds.left().value - left).abs() < 0.05);
-            assert!((bounds.top().value - top).abs() < 0.05);
-        }
-
-        // O motor reabre a cópia com a mesma estrutura de páginas.
-        let Ok(reopened) = PdfiumEngine::open(Arc::from(saved)) else {
-            panic!("o motor precisa reabrir a cópia salva");
-        };
+        // Read-back pela worker: a cópia é reaberta como um novo documento
+        // servido pelo mesmo `Pdfium` — um segundo `bind()` no processo
+        // travaria para sempre no mutex global da biblioteca.
+        let reopened =
+            PdfiumEngine::open(Arc::from(saved)).expect("o motor precisa reabrir a cópia salva");
         assert_eq!(reopened.page_count(), pages);
         let (re_media, _) = reopened.page_data(page).expect("media da cópia");
         assert!((re_media.width - media.width).abs() < 0.5);
         assert!((re_media.height - media.height).abs() < 0.5);
+
+        let stored = reopened.annotations(page).expect("anotações da cópia");
+        assert_eq!(stored.len(), 2);
+        let highlight = &stored[0];
+        assert!(matches!(highlight.kind, AnnotKind::Highlight));
+        assert_eq!(highlight.quads.len(), quads.len(), "um ponto por quad");
+        for (index, (got, want)) in highlight.quads.iter().zip(quads.iter()).enumerate() {
+            let (left, bottom, right, top) = quad_bounds(want);
+            let (got_left, got_bottom, got_right, got_top) = quad_bounds(got);
+            assert!(
+                (got_left - left).abs() < 0.05 && (got_right - right).abs() < 0.05,
+                "quad {index} horizontal: {got:?} vs {want:?}"
+            );
+            assert!(
+                (got_bottom - bottom).abs() < 0.05 && (got_top - top).abs() < 0.05,
+                "quad {index} vertical: {got:?} vs {want:?}"
+            );
+        }
+
+        let note = &stored[1];
+        assert!(matches!(note.kind, AnnotKind::Note));
+        assert_eq!(note.text, "nota do teste");
+        let (left, _, _, top) = quad_bounds(&first);
+        assert!((note.bounds.0 - left).abs() < 0.05);
+        assert!((note.bounds.3 - top).abs() < 0.05);
     }
 
     #[test]

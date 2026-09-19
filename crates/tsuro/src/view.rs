@@ -14,13 +14,15 @@ use crate::page::{MediaBox, PageNo};
 use crate::print::{PrintOrientation, MAX_COPIES};
 use crate::session::{
     display_rect, page_pt_at, AnnotKind, Message, NavCmd, NoteDraft, PrintDialog, RangeMode, Ready,
-    Session, ViewMode, Zoom, ZoomFactor, DOC_GAP, DOC_PAD_BOTTOM, DOC_PAD_TOP, DOC_PAD_X,
+    Session, Tabs, ViewMode, Zoom, ZoomFactor, DOC_GAP, DOC_PAD_BOTTOM, DOC_PAD_TOP, DOC_PAD_X,
     PAGES_PANEL_W, SIG_PANEL_W, THUMB_ROW,
 };
 
 /// Altura do chrome Kiri: toolbar 36px + progresso 2px + respiro.
 pub const CHROME_HEIGHT: f32 = 46.0;
 
+/// Altura da faixa de abas (issue #40), reservada só com 2+ documentos.
+pub const TAB_STRIP_HEIGHT: f32 = 30.0;
 pub fn pages_scroll_id() -> scrollable::Id {
     scrollable::Id::new("tsuro-pages")
 }
@@ -47,8 +49,13 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
 
     // Toolbar 36px + progresso 2px + respiro 8px = `CHROME_HEIGHT` (46px).
     let mut col = column![topbar(session, t)];
-    if let Session::Ready(ready) = session {
-        col = col.push(progress(ready, t));
+    if let Session::Ready(tabs) = session {
+        col = col.push(progress(tabs, t));
+        // Faixa de abas (issue #40): com um documento só a janela é a de
+        // sempre — sem faixa nenhuma.
+        if tabs.len() > 1 {
+            col = col.push(tab_strip(tabs, t));
+        }
     }
     col = col.push(body);
     let main: Element<'_, Message> = container(
@@ -555,7 +562,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
 }
 
 /// Camada do menu ⋯: fundo fecha ao clicar, menu no canto.
-fn overflow_layer(ready: &Ready, t: Tokens) -> Element<'_, Message> {
+fn overflow_layer(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
     let dim = container(Space::with_width(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
@@ -563,10 +570,13 @@ fn overflow_layer(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.25))),
             ..container::Style::default()
         });
-    // Pré-tabs: sem faixa de abas, o menu sempre soma só a topbar (44px).
-    // A soma de TAB_STRIP_HEIGHT volta com a PR #56.
-    let top = 44.0;
-    let card = container(overflow_menu(ready, t))
+    // Com 2+ abas a faixa soma TAB_STRIP_HEIGHT à topbar (44px).
+    let top = if tabs.len() > 1 {
+        44.0 + TAB_STRIP_HEIGHT
+    } else {
+        44.0
+    };
+    let card = container(overflow_menu(tabs, t))
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(Alignment::End)
@@ -1311,7 +1321,8 @@ fn entry_row(entry: &FsEntry, t: Tokens) -> Element<'static, Message> {
     .into()
 }
 
-fn ready_body(ready: &Ready, t: Tokens) -> Element<'_, Message> {
+fn ready_body(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
+    let ready = tabs.active();
     let mut panes = row![].spacing(12).height(Length::Fill);
     if ready.pages_open {
         panes = panes.push(pages_panel(ready, t));
@@ -1320,8 +1331,14 @@ fn ready_body(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     if ready.signatures_open {
         panes = panes.push(signatures_panel(ready, t));
     }
-    // Status pós-ação ("Enviado para …", "Cópia salva em …"): 1 linha no topo.
-    if let Some(status) = ready.save_status.as_ref().or(ready.print_status.as_ref()) {
+    // Status pós-ação ("Enviado para …", "Cópia salva em …", falha ao abrir
+    // outra aba): 1 linha no topo.
+    let status = ready
+        .save_status
+        .as_deref()
+        .or(ready.print_status.as_deref())
+        .or(tabs.open_error());
+    if let Some(status) = status {
         column![text(status).size(13).color(t.muted), panes,]
             .spacing(8)
             .height(Length::Fill)
@@ -1329,6 +1346,62 @@ fn ready_body(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     } else {
         panes.into()
     }
+}
+
+/// Faixa de abas sob a toolbar (issue #40): um botão por documento — o ativo
+/// destacado — e o × que fecha a aba. Só existe com 2+ abas.
+fn tab_strip(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
+    let mut strip = row![].spacing(4).align_y(Alignment::Center);
+    for (index, doc) in tabs.docs().iter().enumerate() {
+        let label = short_name(doc.source.path());
+        let active = index == tabs.active_index();
+        strip = strip.push(
+            row![
+                tip(
+                    control_active(
+                        t,
+                        button(text(label).size(13)).on_press(Message::SelectTab(index)),
+                        active,
+                    ),
+                    "Trocar para este documento",
+                ),
+                tip(
+                    control(
+                        t,
+                        button(text("×").size(14).color(t.muted))
+                            .on_press(Message::CloseTab(index)),
+                    ),
+                    "Fechar aba (⌘W)",
+                ),
+            ]
+            .spacing(0)
+            .align_y(Alignment::Center),
+        );
+    }
+    container(strip)
+        .width(Length::Fill)
+        .height(Length::Fixed(TAB_STRIP_HEIGHT))
+        .padding(Padding::from([0, 8]))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.chrome)),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Nome na aba: cortado para caber na faixa (uma linha; um nome inteiro de
+/// caminho longo empurraria as outras abas para fora da janela).
+fn short_name(path: &std::path::Path) -> String {
+    const MAX: usize = 24;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    if name.chars().count() <= MAX {
+        return name;
+    }
+    let head: String = name.chars().take(MAX - 1).collect();
+    format!("{head}…")
 }
 
 /// Painel de navegação (Stitch sidebar): cabeçalho `Navegação`, abas segmentadas
@@ -1377,7 +1450,6 @@ fn panel_tabs(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     .style(kiri::panel_seg_track_style(t))
     .into()
 }
-
 /// Aba Sumário: árvore clicável com expandir/colapsar (body-md + indent) e
 /// destaque da ativa.
 fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {

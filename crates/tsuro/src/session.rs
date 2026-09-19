@@ -544,7 +544,7 @@ pub enum Session {
         /// DPR da janela (1.0 = sem Retina). Via `WindowScale`, como o tema.
         render_scale: f32,
     },
-    Ready(Ready),
+    Ready(Tabs),
     Failed {
         source: OpenSource,
         message: String,
@@ -554,6 +554,178 @@ pub enum Session {
         /// DPR da janela (1.0 = sem Retina). Via `WindowScale`, como o tema.
         render_scale: f32,
     },
+}
+
+/// Abas da janela (issue #40): uma por documento aberto. `docs` nunca fica
+/// vazio e `active` sempre indexa uma aba válida — fechar a última aba volta
+/// para `Session::Empty`.
+///
+/// A aba ativa é a que a vista desenha e a única que o `Session` enxerga:
+/// `Deref`/`DerefMut` entregam o `Ready` ativo, e cada aba guarda o seu
+/// estado de leitura (página, zoom, histórico, busca, marcações, painéis).
+/// O que é da janela (viewport, tema, DPR, recentes) é mantido igual nas abas.
+///
+#[derive(Debug, Clone)]
+pub struct Tabs {
+    docs: Vec<Ready>,
+    active: usize,
+    /// Geração + origem do documento carregando para uma aba nova (⌘T ou
+    /// abrir com uma aba já aberta). `None` = nada pendente.
+    pending: Option<(u64, OpenSource)>,
+    /// Falha ao abrir a aba pendente; a janela segue com as abas que tinha e
+    /// a mensagem aparece na faixa de abas.
+    open_error: Option<String>,
+}
+
+/// Altura reservada pela faixa de abas: zero com um documento só (a janela de
+/// hoje fica idêntica) e `view::TAB_STRIP_HEIGHT` com duas ou mais.
+fn strip_height(count: usize) -> f32 {
+    if count > 1 {
+        crate::view::TAB_STRIP_HEIGHT
+    } else {
+        0.0
+    }
+}
+
+impl Tabs {
+    /// Janela com um documento só.
+    pub fn single(ready: Ready) -> Self {
+        Self {
+            docs: vec![ready],
+            active: 0,
+            pending: None,
+            open_error: None,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.docs.len()
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    /// Abas na ordem da faixa (a ativa inclusa).
+    pub fn docs(&self) -> &[Ready] {
+        &self.docs
+    }
+
+    pub fn open_error(&self) -> Option<&str> {
+        self.open_error.as_deref()
+    }
+
+    /// A aba ativa (a vista desenha esta).
+    pub(crate) fn active(&self) -> &Ready {
+        &self.docs[self.active]
+    }
+
+    fn active_mut(&mut self) -> &mut Ready {
+        let active = self.active;
+        &mut self.docs[active]
+    }
+
+    fn pending_gen(&self) -> Option<u64> {
+        self.pending.as_ref().map(|(gen, _)| *gen)
+    }
+
+    /// Documento dono de uma resposta assíncrona, em qualquer aba: o render (ou
+    /// a impressão) volta para a aba que o pediu, mesmo que a ativa já seja
+    /// outra.
+    fn by_gen(&mut self, gen: u64) -> Option<&mut Ready> {
+        self.docs.iter_mut().find(|doc| doc.open_gen == gen)
+    }
+
+    /// Maior geração em uso; a próxima aba recebe `max + 1`. As gerações não se
+    /// repetem porque é por elas que as respostas assíncronas se acham.
+    fn max_gen(&self) -> u64 {
+        let docs = self.docs.iter().map(|doc| doc.open_gen);
+        docs.chain(self.pending_gen()).max().unwrap_or(0)
+    }
+
+    /// Toda aba vê a mesma janela (as inativas não recebem evento de resize).
+    fn set_viewport(&mut self, viewport: Viewport) {
+        for doc in &mut self.docs {
+            doc.viewport = viewport;
+        }
+    }
+
+    fn set_theme(&mut self, theme: Theme) {
+        for doc in &mut self.docs {
+            doc.theme = theme;
+        }
+    }
+
+    fn set_render_scale(&mut self, scale: f32) {
+        for doc in &mut self.docs {
+            doc.render_scale = scale;
+        }
+    }
+
+    /// Aba nova entrou: vira a ativa e reserva a faixa (o painel encolhe uma
+    /// vez). A aba nova copia a geometria da janela da ativa — o carregamento
+    /// não passa por evento de resize.
+    fn push(&mut self, mut ready: Ready) {
+        ready.viewport = self.active().viewport;
+        let before = self.docs.len();
+        self.pending = None;
+        self.open_error = None;
+        self.docs.push(ready);
+        self.active = self.docs.len() - 1;
+        self.sync_strip(before);
+    }
+
+    /// Fecha a aba `index` e devolve o documento que sai (o chamador solta o
+    /// motor dele). O foco vai para a vizinha da direita — ou para a última,
+    /// quando a fechada era a do fim. A última aba é do chamador.
+    fn remove(&mut self, index: usize) -> Ready {
+        let before = self.docs.len();
+        let gone = self.docs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.docs.len() - 1);
+        self.sync_strip(before);
+        gone
+    }
+
+    fn select(&mut self, index: usize) {
+        if index < self.docs.len() {
+            self.active = index;
+        }
+    }
+
+    /// Ctrl+Tab (e Ctrl+Shift+Tab) dão a volta na faixa.
+    fn cycle(&mut self, step: i32) {
+        let len = self.docs.len() as i32;
+        self.active = (self.active as i32 + step).rem_euclid(len) as usize;
+    }
+
+    /// A faixa só existe com 2+ abas: ao cruzar o limite de uma para duas (e
+    /// de volta) o painel do documento ganha/perde `TAB_STRIP_HEIGHT`.
+    fn sync_strip(&mut self, before: usize) {
+        let delta = strip_height(self.docs.len()) - strip_height(before);
+        if delta == 0.0 {
+            return;
+        }
+        for doc in &mut self.docs {
+            doc.viewport.height = (doc.viewport.height - delta).max(1.0);
+        }
+    }
+}
+
+impl std::ops::Deref for Tabs {
+    type Target = Ready;
+
+    fn deref(&self) -> &Ready {
+        self.active()
+    }
+}
+
+impl std::ops::DerefMut for Tabs {
+    fn deref_mut(&mut self) -> &mut Ready {
+        self.active_mut()
+    }
 }
 
 #[derive(Clone)]
@@ -966,6 +1138,14 @@ pub enum Message {
         result: Result<(MediaBox, TextLayer), String>,
     },
     Close,
+    /// Fecha a aba ativa (⌘W); se for a última, fecha a janela (→ `Empty`).
+    CloseTabActive,
+    /// Fecha a aba `usize` (o × da faixa de abas).
+    CloseTab(usize),
+    /// Troca a aba ativa (clique na faixa de abas).
+    SelectTab(usize),
+    /// Aba seguinte (`+1`) ou anterior (`-1`) — Ctrl+Tab / Ctrl+Shift+Tab.
+    CycleTab(i32),
     Nav(NavCmd),
     PageInput(String),
     PageSubmit,
@@ -1017,8 +1197,12 @@ pub enum Message {
     /// Expande/colapsa um nó da árvore (caminho de índices desde a raiz).
     OutlineFold(Vec<usize>),
     /// Resultado do carregamento preguiçoso do sumário (outline) após abrir
-    /// o documento. `None` indica que o PDF não possui outline.
-    OutlineLoaded(Option<Outline>),
+    /// o documento. `None` indica que o PDF não possui outline; `doc_gen` diz
+    /// de qual aba veio (a ativa pode ter mudado no meio).
+    OutlineLoaded {
+        doc_gen: u64,
+        outline: Option<Outline>,
+    },
     /// Clique em um item do sumário: navega (com clamp) para a página do item.
     OutlineJump(PageNo),
     /// ↑/↓/Enter na árvore do sumário (ignorado sem a aba aberta).
@@ -1173,10 +1357,10 @@ impl Session {
                 doc_gen,
                 result,
             } => {
-                if let Session::Ready(ready) = self {
-                    if doc_gen != ready.open_gen {
+                if let Session::Ready(tabs) = self {
+                    let Some(ready) = tabs.by_gen(doc_gen) else {
                         return Task::none();
-                    }
+                    };
                     ready.page_data_inflight.remove(&page.index());
                     match result {
                         Ok((media, text)) => {
@@ -1198,6 +1382,16 @@ impl Session {
                 self.schedule_work()
             }
             Message::Close => self.close_document(),
+            Message::CloseTabActive => {
+                let index = match self {
+                    Session::Ready(tabs) => tabs.active_index(),
+                    _ => return Task::none(),
+                };
+                self.close_tab(index)
+            }
+            Message::CloseTab(index) => self.close_tab(index),
+            Message::SelectTab(index) => self.select_tab(index),
+            Message::CycleTab(step) => self.cycle_tab(step),
             Message::Nav(cmd) => {
                 let follow = if let Session::Ready(ready) = self {
                     if ready.print_dialog.is_some() {
@@ -1277,10 +1471,13 @@ impl Session {
                 Task::batch([self.schedule_work(), follow])
             }
             Message::WindowMetrics { width, height, id } => {
-                let follow = if let Session::Ready(ready) = self {
-                    ready.viewport = Viewport { width, height };
-                    ready.bump_render_gen();
-                    nav_follow(ready)
+                // A faixa de abas (2+ documentos) tira altura do painel.
+                let height = (height - self.tab_strip_height()).max(1.0);
+                let follow = if let Session::Ready(tabs) = self {
+                    // Toda aba vê a mesma janela: as inativas não recebem evento.
+                    tabs.set_viewport(Viewport { width, height });
+                    tabs.bump_render_gen();
+                    nav_follow(tabs)
                 } else {
                     Task::none()
                 };
@@ -1301,10 +1498,12 @@ impl Session {
                 self.schedule_work()
             }
             Message::SearchChanged(query) => {
-                let follow = if let Session::Ready(ready) = self {
+                let follow = if let Session::Ready(tabs) = self {
+                    let ready = tabs.active_mut();
                     ready.set_query(query);
-                    if let Some(hit) = ready.search.hits.first() {
-                        ready.navigate_to(hit.page);
+                    // Primeiro hit, sem segurar o empréstimo da busca.
+                    if let Some(page) = ready.search.hits.first().map(|hit| hit.page) {
+                        ready.navigate_to(page);
                     }
                     nav_follow(ready)
                 } else {
@@ -1348,7 +1547,8 @@ impl Session {
                 Task::none()
             }
             Message::PointerMove { page, page_pt } => {
-                if let Session::Ready(ready) = self {
+                if let Session::Ready(tabs) = self {
+                    let ready = tabs.active_mut();
                     if let Some(sel) = ready.selection.as_mut() {
                         if sel.page == page {
                             if let Some(Some(layer)) = ready.pages.text.get(page.index() as usize) {
@@ -1466,10 +1666,10 @@ impl Session {
                 render_gen,
                 surface,
             } => {
-                if let Session::Ready(ready) = self {
-                    if doc_gen != ready.open_gen {
+                if let Session::Ready(tabs) = self {
+                    let Some(ready) = tabs.by_gen(doc_gen) else {
                         return Task::none();
-                    }
+                    };
                     let key = render_key(page, scale, rotation);
                     ready.render_inflight.remove(&key);
                     ready.render_inflight_gen.remove(&key);
@@ -1541,9 +1741,11 @@ impl Session {
                 }
                 Task::none()
             }
-            Message::OutlineLoaded(result) => {
-                if let Session::Ready(ready) = self {
-                    ready.outline = result;
+            Message::OutlineLoaded { doc_gen, outline } => {
+                if let Session::Ready(tabs) = self {
+                    if let Some(ready) = tabs.by_gen(doc_gen) {
+                        ready.outline = outline;
+                    }
                 }
                 // O outline destrava o gate em schedule_work: sem reagendar,
                 // nada mais é despachado e a folha trava em "Renderizando…".
@@ -1807,8 +2009,8 @@ impl Session {
                 printer,
                 result,
             } => {
-                if let Session::Ready(ready) = self {
-                    if doc_gen == ready.open_gen {
+                if let Session::Ready(tabs) = self {
+                    if let Some(ready) = tabs.by_gen(doc_gen) {
                         match result {
                             Ok(job) => {
                                 ready.print_dialog = None;
@@ -1869,8 +2071,8 @@ impl Session {
             }
             Message::PrintNop => Task::none(),
             Message::PrintPdfOpened { doc_gen, result } => {
-                if let Session::Ready(ready) = self {
-                    if doc_gen == ready.open_gen {
+                if let Session::Ready(tabs) = self {
+                    if let Some(ready) = tabs.by_gen(doc_gen) {
                         if let Some(dialog) = ready.print_dialog.as_mut() {
                             dialog.busy = false;
                             if let Err(err) = result {
@@ -1917,8 +2119,8 @@ impl Session {
                 path,
                 result,
             } => {
-                if let Session::Ready(ready) = self {
-                    if doc_gen == ready.open_gen {
+                if let Session::Ready(tabs) = self {
+                    if let Some(ready) = tabs.by_gen(doc_gen) {
                         match result {
                             Ok(()) => {
                                 // Registra a cópia nos recentes, mas não a abre:
@@ -2042,6 +2244,8 @@ impl Session {
             Event::Window(window::Event::Opened { size, .. })
             | Event::Window(window::Event::Resized(size)) => Some(Message::WindowMetrics {
                 width: size.width,
+                // A faixa de abas encolhe o painel; quem desconta é
+                // `WindowMetrics` (a altura da faixa é estado, não evento).
                 height: (size.height - crate::view::CHROME_HEIGHT).max(1.0),
                 id,
             }),
@@ -2060,13 +2264,24 @@ impl Session {
         if gen == 0 {
             gen = 1;
         }
-        *self = Session::Loading {
-            source: source.clone(),
-            recents,
-            gen,
-            theme,
-            render_scale,
-        };
+        match self {
+            // Com uma aba já aberta o documento entra em aba nova (issue #40):
+            // a janela segue na aba atual, com página e zoom, até o arquivo
+            // chegar. A `Loading` fica só para a primeira aba (vinda do `Empty`).
+            Session::Ready(tabs) => {
+                tabs.pending = Some((gen, source.clone()));
+                tabs.open_error = None;
+            }
+            _ => {
+                *self = Session::Loading {
+                    source: source.clone(),
+                    recents,
+                    gen,
+                    theme,
+                    render_scale,
+                };
+            }
+        }
         Task::perform(open_ready(source), move |result| Message::Opened {
             gen,
             result,
@@ -2081,10 +2296,19 @@ impl Session {
     }
 
     fn apply_open(&mut self, gen: u64, result: Result<Ready, OpenError>) {
-        match self {
-            Session::Loading { gen: current, .. } if *current == gen => {}
-            _ => return,
-        }
+        // Segunda aba (a janela já estava mostrando um documento) ou primeira?
+        let new_tab = match self {
+            Session::Loading { gen: current, .. } if *current == gen => false,
+            Session::Ready(tabs) if tabs.pending_gen() == Some(gen) => true,
+            _ => {
+                // Documento que já saiu da tela (janela fechada no meio do
+                // carregamento): solta o parse na worker antes de largar.
+                if let Ok(ready) = &result {
+                    ready.close_engine();
+                }
+                return;
+            }
+        };
         let recents = merge_recents(self.recents(), read_recents());
         let theme = self.theme();
         let render_scale = self.render_scale();
@@ -2109,9 +2333,30 @@ impl Session {
                 ready.restore_position();
                 ready.sync_page_input();
                 ready.render_gen = 1;
-                *self = Session::Ready(ready);
+                if new_tab {
+                    // Aba nova: o documento que estava na tela continua inteiro.
+                    let Session::Ready(tabs) = self else {
+                        return;
+                    };
+                    tabs.push(ready);
+                } else {
+                    *self = Session::Ready(Tabs::single(ready));
+                }
             }
             Err(err) => {
+                if new_tab {
+                    // A janela segue com as abas que já estavam abertas; a
+                    // falha vira uma linha na faixa de abas.
+                    if let Session::Ready(tabs) = self {
+                        let name = tabs
+                            .pending
+                            .take()
+                            .map(|(_, source)| source.path().display().to_string())
+                            .unwrap_or_default();
+                        tabs.open_error = Some(format!("Falha ao abrir {name}: {err}"));
+                    }
+                    return;
+                }
                 let source = match self {
                     Session::Loading { source, .. } => source.clone(),
                     Session::Failed { source, .. } => source.clone(),
@@ -2140,6 +2385,13 @@ impl Session {
         let theme = self.theme();
         let open_gen = self.open_gen();
         let render_scale = self.render_scale();
+        // Toda aba solta o seu documento na worker (issue #40): sem isto o
+        // parse de cada uma ficaria vivo até o processo acabar.
+        if let Session::Ready(tabs) = self {
+            for doc in tabs.docs() {
+                doc.close_engine();
+            }
+        }
         *self = Session::Empty(EmptyState {
             recents,
             theme,
@@ -2148,6 +2400,84 @@ impl Session {
             ..EmptyState::default()
         });
         empty_tasks()
+    }
+
+    /// Fecha a aba `index` (⌘W ou o × da faixa). A última aba fecha a janela,
+    /// como sempre: `Empty` com os recentes preservados.
+    fn close_tab(&mut self, index: usize) -> Task<Message> {
+        if self.modal_open() {
+            return Task::none();
+        }
+        if matches!(self, Session::Ready(tabs) if tabs.len() == 1) {
+            return self.close_document();
+        }
+        let Some(tabs) = self.tabs_mut() else {
+            return Task::none();
+        };
+        if index >= tabs.len() {
+            return Task::none();
+        }
+        tabs.remove(index).close_engine();
+        Task::batch([self.schedule_work(), self.nav_follow_active()])
+    }
+
+    /// Troca a aba ativa (clique na faixa).
+    fn select_tab(&mut self, index: usize) -> Task<Message> {
+        if self.modal_open() {
+            return Task::none();
+        }
+        let Some(tabs) = self.tabs_mut() else {
+            return Task::none();
+        };
+        tabs.select(index);
+        Task::batch([self.schedule_work(), self.nav_follow_active()])
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab dão a volta na faixa.
+    fn cycle_tab(&mut self, step: i32) -> Task<Message> {
+        if self.modal_open() {
+            return Task::none();
+        }
+        let Some(tabs) = self.tabs_mut() else {
+            return Task::none();
+        };
+        if tabs.len() < 2 {
+            return Task::none();
+        }
+        tabs.cycle(step);
+        Task::batch([self.schedule_work(), self.nav_follow_active()])
+    }
+
+    /// As abas abertas, quando há alguma.
+    fn tabs_mut(&mut self) -> Option<&mut Tabs> {
+        match self {
+            Session::Ready(tabs) => Some(tabs),
+            _ => None,
+        }
+    }
+
+    /// Modal/overlay que captura a interação (impressão, nota, aviso de
+    /// assinado): trocar ou fechar aba por baixo prenderia o estado na aba de
+    /// origem — a resposta assíncrona voltaria para uma aba que saiu da tela.
+    fn modal_open(&self) -> bool {
+        matches!(self, Session::Ready(tabs)
+            if tabs.print_dialog.is_some() || tabs.note_draft.is_some() || tabs.save_warning)
+    }
+
+    /// `nav_follow` do documento ativo (sem aba aberta é `Task::none`).
+    fn nav_follow_active(&self) -> Task<Message> {
+        match self {
+            Session::Ready(tabs) => nav_follow(tabs),
+            _ => Task::none(),
+        }
+    }
+
+    /// Altura que a faixa de abas toma da janela (zero com um documento só).
+    fn tab_strip_height(&self) -> f32 {
+        match self {
+            Session::Ready(tabs) => strip_height(tabs.len()),
+            _ => 0.0,
+        }
     }
 
     fn recents(&self) -> Vec<PathBuf> {
@@ -2169,7 +2499,7 @@ impl Session {
         match self {
             Session::Empty(empty) => empty.theme = theme,
             Session::Loading { theme: t, .. } | Session::Failed { theme: t, .. } => *t = theme,
-            Session::Ready(ready) => ready.theme = theme,
+            Session::Ready(tabs) => tabs.set_theme(theme),
         }
     }
 
@@ -2197,7 +2527,7 @@ impl Session {
             | Session::Failed {
                 render_scale: s, ..
             } => *s = scale,
-            Session::Ready(ready) => ready.render_scale = scale,
+            Session::Ready(tabs) => tabs.set_render_scale(scale),
         }
     }
 
@@ -2205,13 +2535,18 @@ impl Session {
         match self {
             Session::Empty(empty) => empty.open_gen,
             Session::Loading { gen, .. } | Session::Failed { gen, .. } => *gen,
-            Session::Ready(ready) => ready.open_gen,
+            // Maior geração de todas as abas: a próxima não colide com a de
+            // uma aba que está fora da tela (as respostas casam por geração).
+            Session::Ready(tabs) => tabs.max_gen(),
         }
     }
 
+    /// Geração do documento que está carregando: a primeira aba (`Loading`) ou
+    /// a aba nova pendente de uma janela já aberta (issue #40).
     fn loading_gen(&self) -> Option<u64> {
         match self {
             Session::Loading { gen, .. } => Some(*gen),
+            Session::Ready(tabs) => tabs.pending_gen(),
             _ => None,
         }
     }
@@ -2232,7 +2567,8 @@ impl Session {
         // Carregamento preguiçoso do outline: um por documento, fire-and-forget.
         if ready.outline.is_none() && !ready.outline_load_issued {
             ready.outline_load_issued = true;
-            return outline_task(ready.engine.clone());
+            let doc_gen = ready.open_gen;
+            return outline_task(ready.engine.clone(), doc_gen);
         }
         if !ready.page_data_inflight.is_empty() || !ready.render_inflight.is_empty() {
             return Task::none();
@@ -2280,7 +2616,7 @@ fn page_data_task(engine: PdfiumEngine, page: PageNo, doc_gen: u64) -> Task<Mess
 
 /// Carrega o outline (bookmarks) do documento em background. Read-only sobre
 /// o Pdfium; resulta em `Message::OutlineLoaded`.
-fn outline_task(engine: PdfiumEngine) -> Task<Message> {
+fn outline_task(engine: PdfiumEngine, doc_gen: u64) -> Task<Message> {
     Task::perform(
         async move {
             tokio::task::spawn_blocking(move || engine.outline())
@@ -2289,7 +2625,7 @@ fn outline_task(engine: PdfiumEngine) -> Task<Message> {
                 .and_then(|result| result.ok())
                 .flatten()
         },
-        Message::OutlineLoaded,
+        move |outline| Message::OutlineLoaded { doc_gen, outline },
     )
 }
 
@@ -2352,7 +2688,17 @@ pub(crate) fn keyboard_message(
         match key.as_ref() {
             Key::Character("z" | "Z") if modifiers.shift() => return Some(Message::AnnotRedo),
             Key::Character("z" | "Z") => return Some(Message::AnnotUndo),
+            // Abrir entra em aba nova quando já há documento (issue #40).
+            Key::Character("t" | "T") => return Some(Message::PickFile),
+            Key::Character("w" | "W") => return Some(Message::CloseTabActive),
             _ => {}
+        }
+    }
+    // Ctrl+Tab / Ctrl+Shift+Tab alternam abas (nas duas plataformas; ⌘⇥ é do
+    // sistema no macOS). Antes da guarda de modificadores abaixo.
+    if modifiers.control() && !modifiers.logo() && !modifiers.alt() {
+        if let Key::Named(Named::Tab) = key.as_ref() {
+            return Some(Message::CycleTab(if modifiers.shift() { -1 } else { 1 }));
         }
     }
     // Alt+←/→ (⌘ no mac): histórico voltar/avançar.
@@ -2409,6 +2755,13 @@ pub fn thumbnail_scale(media: MediaBox) -> Scale {
 impl Ready {
     pub fn page_count(&self) -> u32 {
         self.pages.total
+    }
+
+    /// Solta o documento na worker do motor (aba fechada, issue #40). Os
+    /// clones deste `Ready` compartilham o mesmo documento — depois disto os
+    /// pedidos deles falham.
+    pub(crate) fn close_engine(&self) {
+        self.engine.close();
     }
 
     pub fn media(&self, page: PageNo) -> MediaBox {
@@ -3486,6 +3839,115 @@ mod tests {
         result
     }
 
+    /// Documento na tela (a aba ativa).
+    fn active_ready(session: &Session) -> &Ready {
+        match session {
+            Session::Ready(tabs) => tabs.active(),
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+    }
+
+    /// Zoom manual em fator (os assertos de aba comparam números).
+    fn zoom_factor(ready: &Ready) -> f32 {
+        match ready.zoom {
+            Zoom::Manual(factor) => factor.get(),
+            other => panic!("esperava zoom manual, veio {other:?}"),
+        }
+    }
+
+    /// Issue #40: uma aba por documento, cada uma com a sua página e o seu
+    /// zoom; a última aba fechada fecha a janela, como antes.
+    #[test]
+    fn tabs_keep_page_and_zoom_per_document() {
+        isolated(|| {
+            let Some(first) = sample_ready() else {
+                return;
+            };
+            let Some(second) = sample_ready() else {
+                return;
+            };
+            if first.page_count() < 2 {
+                return;
+            }
+            let mut session = Session::Ready(Tabs::single(first));
+            // Aba 1: página 2, zoom 2×.
+            apply(
+                &mut session,
+                Message::Nav(NavCmd::GoTo(PageNo::from_index(1))),
+            );
+            apply(
+                &mut session,
+                Message::SetZoom(Zoom::Manual(ZoomFactor::new(2.0))),
+            );
+
+            // Abrir com uma aba aberta entra em aba nova (não substitui).
+            let _ = session.begin_open(second.source.clone());
+            session.finish_open(Ok(second));
+            apply(&mut session, Message::Nav(NavCmd::GoTo(PageNo::first())));
+            apply(
+                &mut session,
+                Message::SetZoom(Zoom::Manual(ZoomFactor::new(1.0))),
+            );
+            {
+                let Session::Ready(tabs) = &session else {
+                    panic!("esperava Ready, veio {session:?}");
+                };
+                assert_eq!(tabs.len(), 2, "o segundo documento entra como aba");
+                assert_eq!(tabs.active_index(), 1, "a aba nova entra ativa");
+                assert_eq!(zoom_factor(&tabs.docs()[0]), 2.0);
+                assert_eq!(tabs.docs()[0].visible.index(), 1);
+                assert_eq!(zoom_factor(&tabs.docs()[1]), 1.0);
+                assert_eq!(tabs.docs()[1].visible.index(), 0);
+            }
+
+            // Trocar de aba devolve cada documento no seu estado.
+            apply(&mut session, Message::SelectTab(0));
+            assert_eq!(active_ready(&session).visible.index(), 1);
+            assert_eq!(zoom_factor(active_ready(&session)), 2.0);
+            apply(&mut session, Message::CycleTab(1));
+            assert_eq!(active_ready(&session).visible.index(), 0);
+            assert_eq!(zoom_factor(active_ready(&session)), 1.0);
+
+            // Fechar uma aba volta para a outra, intacta.
+            apply(&mut session, Message::CloseTab(1));
+            {
+                let Session::Ready(tabs) = &session else {
+                    panic!("esperava Ready, veio {session:?}");
+                };
+                assert_eq!(tabs.len(), 1);
+                assert_eq!(tabs.active_index(), 0);
+            }
+            assert_eq!(active_ready(&session).visible.index(), 1);
+            assert_eq!(zoom_factor(active_ready(&session)), 2.0);
+
+            // A última aba fecha a janela (comportamento de sempre).
+            apply(&mut session, Message::CloseTabActive);
+            assert!(matches!(session, Session::Empty(_)));
+        });
+    }
+
+    /// Abrir com o motor ausente não derruba a janela: a aba pendente falha e
+    /// as que já estavam abertas seguem na tela.
+    #[test]
+    fn failed_second_open_keeps_open_tabs() {
+        isolated(|| {
+            let Some(ready) = sample_ready() else {
+                return;
+            };
+            let source = ready.source.clone();
+            let mut session = Session::Ready(Tabs::single(ready));
+            let _ = session.begin_open(source);
+            session.finish_open(Err(OpenError::Engine("motor quebrou".into())));
+            let Session::Ready(tabs) = &session else {
+                panic!("esperava Ready, veio {session:?}");
+            };
+            assert_eq!(tabs.len(), 1);
+            assert!(tabs
+                .open_error()
+                .is_some_and(|msg| msg.contains("motor quebrou")));
+        });
+    }
+
     #[test]
     fn search_keeps_portuguese_accents() {
         let layer = TextLayer {
@@ -3737,7 +4199,7 @@ mod tests {
         let Some(ready) = sample_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         match &session {
             Session::Ready(ready) => {
                 assert!(!ready.signatures_open);
@@ -3779,7 +4241,7 @@ mod tests {
         if ready.page_count() < 2 {
             return;
         }
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(
             &mut session,
             Message::Nav(NavCmd::GoTo(PageNo::from_index(1))),
@@ -3876,7 +4338,7 @@ mod tests {
         };
         assert_eq!(ready.view_mode, ViewMode::Single);
         let target = 1.min(ready.page_count() - 1);
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(
             &mut session,
             Message::Nav(NavCmd::GoTo(PageNo::from_index(target))),
@@ -3930,7 +4392,7 @@ mod tests {
         let Some(ready) = uniform_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
         // Rolar não muda nada em página única; aqui deve derivar a página 2.
         apply(&mut session, Message::DocScrolled(2.0 * 1564.0 + 10.0));
@@ -3948,7 +4410,7 @@ mod tests {
         let Some(ready) = uniform_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
         apply(&mut session, Message::DocScrolled(0.0));
         match &session {
@@ -3980,7 +4442,7 @@ mod tests {
         let last = ready.page_count().saturating_sub(1);
         let first = PageNo::first();
         let last_page = PageNo::from_index(last);
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         let visible = |s: &Session| match s {
             Session::Ready(r) => r.visible,
             _ => unreachable!(),
@@ -4096,7 +4558,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&file);
         crate::positions::with_positions_path(file.clone(), || {
-            let mut session = Session::Ready(ready);
+            let mut session = Session::Ready(Tabs::single(ready));
             let visible = |s: &Session| match s {
                 Session::Ready(r) => r.visible,
                 _ => unreachable!(),
@@ -4197,7 +4659,7 @@ mod tests {
             page: PageNo::first(),
             range: TextRange { start: 0, end: 2 },
         });
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         // Marcar limpa a seleção (padrão dos leitores).
         apply(&mut session, Message::Annotate(AnnotKind::Highlight));
         match &session {
@@ -4330,7 +4792,7 @@ mod tests {
         assert_eq!(ready.annotation_at(annot.page, [-1000.0, -1000.0]), None);
         // PointerUp sem arrasto remove via mensagens.
         ready.press_anchor = Some(PressAnchor { sel, exact: true });
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(
             &mut session,
             Message::PointerUp {
@@ -4553,7 +5015,7 @@ mod tests {
             page: PageNo::first(),
             range: TextRange { start: 0, end: 2 },
         });
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         // Press longe de qualquer glifo: ancora no mais próximo (snap).
         apply(
             &mut session,
@@ -4601,7 +5063,7 @@ mod tests {
             return;
         };
         ready.selection = None;
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         // Press no vazio ancora no glifo mais próximo...
         apply(
             &mut session,
@@ -4637,7 +5099,7 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         crate::positions::with_positions_path(file.clone(), || {
             let last = ready.page_count().saturating_sub(1);
-            let mut session = Session::Ready(ready);
+            let mut session = Session::Ready(Tabs::single(ready));
             apply(
                 &mut session,
                 Message::Nav(NavCmd::GoTo(PageNo::from_index(last))),
@@ -4708,7 +5170,7 @@ mod tests {
             let _ = std::fs::remove_file(&file);
             crate::positions::with_positions_path(file.clone(), || {
                 let target = PageNo::from_index(last);
-                let mut session = Session::Ready(ready);
+                let mut session = Session::Ready(Tabs::single(ready));
                 apply(&mut session, Message::Nav(NavCmd::GoTo(target)));
                 apply(&mut session, Message::SetZoom(Zoom::Page));
                 apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
@@ -4769,8 +5231,15 @@ mod tests {
         let Some(ready) = sample_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
-        apply(&mut session, Message::OutlineLoaded(Some(outline_tree())));
+        let mut session = Session::Ready(Tabs::single(ready));
+        let doc_gen = active_ready(&session).open_gen;
+        apply(
+            &mut session,
+            Message::OutlineLoaded {
+                doc_gen,
+                outline: Some(outline_tree()),
+            },
+        );
         // Sem a aba aberta as teclas não andam nem saltam.
         apply(&mut session, Message::OutlineKey(OutlineKey::Next));
         apply(&mut session, Message::OutlineKey(OutlineKey::Activate));
@@ -4873,7 +5342,7 @@ mod tests {
             return;
         };
         let last = ready.page_count().saturating_sub(1);
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         // Sem outline, a aba não abre.
         apply(&mut session, Message::OutlineTab(true));
         match &session {
@@ -4881,7 +5350,14 @@ mod tests {
             _ => unreachable!(),
         }
         // Com outline, abre; jump com clamp; fold alterna.
-        apply(&mut session, Message::OutlineLoaded(Some(outline_tree())));
+        let doc_gen = active_ready(&session).open_gen;
+        apply(
+            &mut session,
+            Message::OutlineLoaded {
+                doc_gen,
+                outline: Some(outline_tree()),
+            },
+        );
         apply(&mut session, Message::OutlineTab(true));
         apply(&mut session, Message::OutlineJump(PageNo::from_index(9999)));
         match &session {
@@ -4920,7 +5396,7 @@ mod tests {
                 return;
             };
             let path = ready.source.path().to_path_buf();
-            let mut session = Session::Ready(ready);
+            let mut session = Session::Ready(Tabs::single(ready));
             apply(&mut session, Message::ToggleSignatures);
             apply(&mut session, Message::TogglePages);
             apply(&mut session, Message::Close);
@@ -5047,7 +5523,7 @@ mod tests {
         let scale = ready.page_scale(page);
         let doc_gen = ready.open_gen;
         let render_gen = ready.render_gen;
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(
             &mut session,
             Message::Rendered {
@@ -5188,7 +5664,7 @@ mod tests {
             return;
         };
         assert_eq!(ready.view_rotation, 0);
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         for expected in [1, 2, 3, 0] {
             apply(&mut session, Message::RotateView);
             let Session::Ready(r) = &session else {
@@ -5196,10 +5672,34 @@ mod tests {
             };
             assert_eq!(r.view_rotation, expected);
         }
-        // Abrir outro documento descarta a sessão (rotação volta a 0 por construção).
+        // Abrir outro documento não descarta mais a sessão (issue #40): o novo
+        // entra como aba e cada uma guarda a sua rotação — a nova nasce em 0.
         apply(&mut session, Message::RotateView);
+        let second = sample_ready();
         let _ = session.begin_open(OpenSource::Path(sample_pdf()));
-        assert!(matches!(session, Session::Loading { .. }));
+        let Session::Ready(tabs) = &session else {
+            panic!("a aba atual continua na tela durante o carregamento");
+        };
+        assert_eq!(tabs.active().view_rotation, 1);
+        assert_eq!(tabs.len(), 1, "a aba só entra quando o arquivo chega");
+        let Some(second) = second else {
+            return;
+        };
+        session.finish_open(Ok(second));
+        let Session::Ready(tabs) = &session else {
+            panic!("expected Ready");
+        };
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(
+            tabs.active().view_rotation,
+            0,
+            "a aba nova nasce sem rotação"
+        );
+        assert_eq!(
+            tabs.docs()[0].view_rotation,
+            1,
+            "a aba de origem fica como está"
+        );
     }
 
     #[test]
@@ -5279,7 +5779,7 @@ mod tests {
         }) else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         for step in 0..4u8 {
             if step > 0 {
                 apply(&mut session, Message::RotateView);
@@ -5367,7 +5867,7 @@ mod tests {
         };
         let page = ready.visible;
         let scale = ready.page_scale(page);
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(
             &mut session,
             Message::Rendered {
@@ -5468,7 +5968,7 @@ mod tests {
         let scale = ready.page_scale(page);
         let stale_doc = ready.open_gen.wrapping_add(1);
         let render_gen = ready.render_gen;
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(
             &mut session,
             Message::Rendered {
@@ -5496,7 +5996,7 @@ mod tests {
         }
         let page = PageNo::from_index(1);
         let doc_gen = ready.open_gen;
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(
             &mut session,
             Message::PageData {
@@ -5701,7 +6201,7 @@ mod tests {
         };
         ready.overflow_open = true;
         ready.print_status = Some("status antigo".into());
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(&mut session, Message::OpenPrintDialog);
         apply(
             &mut session,
@@ -5760,7 +6260,7 @@ mod tests {
         let Some(ready) = sample_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(&mut session, Message::OpenPrintDialog);
         apply(
             &mut session,
@@ -5843,7 +6343,7 @@ mod tests {
         let Some(ready) = sample_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(&mut session, Message::OpenPrintDialog);
         apply(&mut session, Message::PrintersLoaded(vec![]));
         apply(&mut session, Message::PrintSubmit);
@@ -6219,7 +6719,7 @@ mod tests {
         let Some(ready) = sample_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(&mut session, Message::SaveCopyRequested);
         let Session::Ready(ready) = &session else {
             panic!("expected Ready, got {session:?}");
@@ -6239,7 +6739,7 @@ mod tests {
             };
             let dest = std::env::temp_dir().join("contrato (marcado).pdf");
             let doc_gen = ready.open_gen;
-            let mut session = Session::Ready(ready);
+            let mut session = Session::Ready(Tabs::single(ready));
             apply(
                 &mut session,
                 Message::SaveCopyDone {
@@ -6266,7 +6766,7 @@ mod tests {
             return;
         };
         let doc_gen = ready.open_gen;
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(
             &mut session,
             Message::SaveCopyDone {
@@ -6290,7 +6790,7 @@ mod tests {
             return;
         };
         let stale = ready.open_gen.wrapping_add(1);
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         apply(
             &mut session,
             Message::SaveCopyDone {
@@ -6309,7 +6809,7 @@ mod tests {
         let Some(ready) = sample_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         let mut current = 1.0f32;
         for step in 0..40 {
             current /= 1.1;
@@ -6355,7 +6855,7 @@ mod tests {
         let Some(ready) = sample_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         let gen0 = match &session {
             Session::Ready(r) => r.render_gen,
             _ => unreachable!(),
@@ -6444,7 +6944,7 @@ mod tests {
         let Some(ready) = sample_ready() else {
             return;
         };
-        let mut session = Session::Ready(ready);
+        let mut session = Session::Ready(Tabs::single(ready));
         let _ = session.view();
         apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
         let _ = session.view();
