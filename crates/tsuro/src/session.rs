@@ -35,6 +35,13 @@ pub(crate) const THUMB_ROW: f32 = 156.0;
 const THUMB_VISIBLE: u32 = 8;
 const THUMB_PREFETCH: u32 = 3;
 
+/// Passo vertical de uma linha da árvore do sumário, usado só para manter a
+/// linha do cursor visível ao andar com ↑/↓. `outline_tab` em view.rs mede
+/// texto 12 com line-height 1.3 (=15,6) + padding [9,10] (=18) + spacing 8
+/// = 41,6; o valor é arredondado para baixo de propósito: subestimar deixa a
+/// linha um pouco abaixo do topo (visível), superestimar a esconderia.
+pub(crate) const OUTLINE_ROW: f32 = 41.0;
+
 /// RGBA byte budget for neighbor/speculative page surfaces (`visible ± 1`).
 /// The mandatory visible-page bitmap at its current scale is excluded.
 const NEIGHBOR_CACHE_BUDGET: usize = 64 * 1024 * 1024;
@@ -456,6 +463,77 @@ pub enum NavCmd {
     GoTo(PageNo),
 }
 
+/// Teclas da árvore do sumário: ↑/↓ movem o cursor, Enter salta para a página.
+/// Sem a aba Sumário aberta o handler ignora (como R/H/U/S sem seleção).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineKey {
+    Prev,
+    Next,
+    Activate,
+}
+/// Pilha de páginas visitadas, como um navegador: `current()` é onde o leitor
+/// está. Separada do `Ready` para poder ser testada sem documento.
+#[derive(Debug, Clone)]
+struct History {
+    pages: Vec<PageNo>,
+    pos: usize,
+}
+
+impl History {
+    fn new(page: PageNo) -> Self {
+        Self {
+            pages: vec![page],
+            pos: 0,
+        }
+    }
+
+    /// Tamanho da pilha (inclui o "futuro" ainda não descartado).
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    fn current(&self) -> PageNo {
+        self.pages[self.pos]
+    }
+
+    /// Visita efetiva: descarta o "futuro" e ignora repetição consecutiva.
+    fn visit(&mut self, page: PageNo) {
+        if page == self.current() {
+            return;
+        }
+        self.pages.truncate(self.pos + 1);
+        self.pages.push(page);
+        self.pos = self.pages.len() - 1;
+    }
+
+    /// Um passo (`forward` = avançar); `None` no limite.
+    fn step(&mut self, forward: bool) -> Option<PageNo> {
+        let next = if forward {
+            self.pos.checked_add(1)?
+        } else {
+            self.pos.checked_sub(1)?
+        };
+        if next >= self.pages.len() {
+            return None;
+        }
+        self.pos = next;
+        Some(self.pages[next])
+    }
+
+    /// Reinicia a pilha numa página (abrir documento ou restaurar posição).
+    fn reset(&mut self, page: PageNo) {
+        *self = Self::new(page);
+    }
+
+    fn can_back(&self) -> bool {
+        self.pos > 0
+    }
+
+    fn can_forward(&self) -> bool {
+        self.pos + 1 < self.pages.len()
+    }
+}
+
 pub enum Session {
     Empty(EmptyState),
     Loading {
@@ -486,10 +564,10 @@ pub struct Ready {
     pub signatures: PdfAnalysis,
     pub zoom: Zoom,
     pub visible: PageNo,
-    /// Histórico voltar/avançar: `history[hpos] == visible` sempre.
-    history: Vec<PageNo>,
-    hpos: usize,
-    /// Página única ou rolagem contínua (⋯ → Modo de página); zera ao abrir.
+    /// Histórico voltar/avançar; `current()` acompanha `visible` (página alcançada
+    /// por rolagem entra na pilha ao andar). Restaurar posição zera a pilha.
+    history: History,
+    /// Página única ou rolagem contínua (⋯ → Modo de página); restaurada ao abrir.
     pub view_mode: ViewMode,
     /// Vista girada em quartos de volta horários (0..=3, sessão; zera ao abrir).
     pub view_rotation: u8,
@@ -513,6 +591,8 @@ pub struct Ready {
     pub outline: Option<Outline>,
     /// Caminhos colapsados na árvore (`[0, 2]` = 3º filho do 1º item).
     pub outline_collapsed: HashSet<Vec<usize>>,
+    /// Linha sob o cursor do teclado (↑/↓); `None` = nunca andou, usa a ativa.
+    outline_cursor: Option<Vec<usize>>,
     /// Evita disparar mais de um task de carregamento de outline por documento.
     outline_load_issued: bool,
     /// Tema Kiri — sobrevive a `begin_open`/`finish_open`/`close_document`.
@@ -941,6 +1021,8 @@ pub enum Message {
     OutlineLoaded(Option<Outline>),
     /// Clique em um item do sumário: navega (com clamp) para a página do item.
     OutlineJump(PageNo),
+    /// ↑/↓/Enter na árvore do sumário (ignorado sem a aba aberta).
+    OutlineKey(OutlineKey),
     /// ⋯ → Imprimir: abre o diálogo próprio e lista impressoras em background.
     OpenPrintDialog,
     /// Lista do SO pronta; pré-seleciona a default (ou a primeira).
@@ -1079,7 +1161,12 @@ impl Session {
             }
             Message::Opened { gen, result } => {
                 self.apply_open(gen, result);
-                self.schedule_work()
+                // Modo contínuo restaurado: a primeira vista já fica na página.
+                let follow = match self {
+                    Session::Ready(ready) => nav_follow(ready),
+                    _ => Task::none(),
+                };
+                Task::batch([self.schedule_work(), follow])
             }
             Message::PageData {
                 page,
@@ -1161,6 +1248,7 @@ impl Session {
                     ready.zoom = zoom;
                     ready.overflow_open = false;
                     ready.bump_render_gen();
+                    ready.save_position();
                     nav_follow(ready)
                 } else {
                     Task::none()
@@ -1471,16 +1559,49 @@ impl Session {
             Message::OutlineFold(path) => {
                 if let Session::Ready(ready) = self {
                     if !ready.outline_collapsed.remove(&path) {
+                        // Colapsar esconde os filhos: o cursor volta para a ativa.
+                        if ready
+                            .outline_cursor
+                            .as_ref()
+                            .is_some_and(|c| c.starts_with(&path) && *c != path)
+                        {
+                            ready.outline_cursor = None;
+                        }
                         ready.outline_collapsed.insert(path);
                     }
                 }
                 Task::none()
             }
-            Message::OutlineJump(page) => {
-                if let Session::Ready(ready) = self {
-                    ready.navigate_to(page);
+            Message::OutlineJump(page) => self.outline_jump(page),
+            Message::OutlineKey(cmd) => {
+                let Session::Ready(ready) = self else {
+                    return Task::none();
+                };
+                if !ready.outline_open || ready.outline.is_none() {
+                    return Task::none();
                 }
-                self.schedule_work()
+                match cmd {
+                    OutlineKey::Prev | OutlineKey::Next => {
+                        let next = matches!(cmd, OutlineKey::Next);
+                        match ready.outline_step(next) {
+                            // Rola junto (senão o cursor sai da janela): +1
+                            // desconta o cabeçalho das abas, que ocupa uma
+                            // linha e está dentro do mesmo scrollable.
+                            Some(row) => scrollable::scroll_to(
+                                crate::view::pages_scroll_id(),
+                                scrollable::AbsoluteOffset {
+                                    x: 0.0,
+                                    y: (row as f32 + 1.0) * OUTLINE_ROW,
+                                },
+                            ),
+                            None => Task::none(),
+                        }
+                    }
+                    OutlineKey::Activate => match ready.outline_cursor_page() {
+                        Some(page) => self.outline_jump(page),
+                        None => Task::none(),
+                    },
+                }
             }
             Message::OpenPrintDialog => {
                 let Session::Ready(ready) = self else {
@@ -1852,6 +1973,7 @@ impl Session {
                         if page != ready.visible {
                             ready.visible = page;
                             ready.sync_page_input();
+                            ready.save_position();
                         }
                     }
                 }
@@ -1861,6 +1983,7 @@ impl Session {
                 let follow = if let Session::Ready(ready) = self {
                     ready.view_mode = mode;
                     ready.overflow_open = false;
+                    ready.save_position();
                     nav_follow(ready)
                 } else {
                     Task::none()
@@ -1979,6 +2102,7 @@ impl Session {
                 ready.outline_open = false;
                 ready.outline = None;
                 ready.outline_collapsed.clear();
+                ready.outline_cursor = None;
                 ready.outline_load_issued = false;
                 ready.pages_scroll_y = 0.0;
                 ready.overflow_open = false;
@@ -2090,6 +2214,15 @@ impl Session {
             Session::Loading { gen, .. } => Some(*gen),
             _ => None,
         }
+    }
+
+    /// Salto do sumário (clique ou Enter): mesmo caminho de `SetPage` — clamp +
+    /// histórico —, depois reagenda o trabalho de render.
+    fn outline_jump(&mut self, page: PageNo) -> Task<Message> {
+        if let Session::Ready(ready) = self {
+            ready.navigate_to(page);
+        }
+        self.schedule_work()
     }
 
     fn schedule_work(&mut self) -> Task<Message> {
@@ -2255,6 +2388,11 @@ pub(crate) fn keyboard_message(
         Key::Character("n" | "N") => Some(Message::Annotate(AnnotKind::Note)),
         // Sem diálogo aberto o handler ignora; com foco em campo, o iced captura antes.
         Key::Named(Named::Escape) => Some(Message::ClosePrintDialog),
+        // ↑/↓ e Enter andam/saltam na árvore do sumário; sem a aba aberta o
+        // handler ignora (setas horizontais continuam com o histórico e a nav).
+        Key::Named(Named::ArrowUp) => Some(Message::OutlineKey(OutlineKey::Prev)),
+        Key::Named(Named::ArrowDown) => Some(Message::OutlineKey(OutlineKey::Next)),
+        Key::Named(Named::Enter) => Some(Message::OutlineKey(OutlineKey::Activate)),
         _ => None,
     }
 }
@@ -2791,6 +2929,43 @@ impl Ready {
             .last()
     }
 
+    /// Linha sob o cursor do teclado: o movimento explícito (↑/↓) ou, sem
+    /// movimento, a entrada ativa — começar a andar de onde a página está.
+    pub(crate) fn outline_focus(&self) -> Option<Vec<usize>> {
+        self.outline_cursor
+            .clone()
+            .or_else(|| self.outline_active())
+    }
+
+    /// Anda uma linha (↑/↓) sem sair da lista e devolve o índice da nova linha,
+    /// que a view rola para manter o cursor visível.
+    fn outline_step(&mut self, next: bool) -> Option<usize> {
+        let rows = self.outline_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let index = self
+            .outline_focus()
+            .and_then(|path| rows.iter().position(|(row, ..)| *row == path));
+        let target = match (index, next) {
+            (Some(i), true) => (i + 1).min(rows.len() - 1),
+            (Some(i), false) => i.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => rows.len() - 1,
+        };
+        self.outline_cursor = Some(rows[target].0.clone());
+        Some(target)
+    }
+
+    /// Página da linha sob o cursor (Enter); `None` sem cursor válido.
+    fn outline_cursor_page(&self) -> Option<PageNo> {
+        let path = self.outline_focus()?;
+        self.outline_rows()
+            .into_iter()
+            .find(|(row, ..)| *row == path)
+            .map(|(_, _, _, page, _)| page)
+    }
+
     pub(crate) fn thumb_page_window(&self) -> Vec<PageNo> {
         let first = (self.pages_scroll_y / THUMB_ROW).floor().max(0.0) as u32;
         let start = first.saturating_sub(THUMB_PREFETCH);
@@ -2815,10 +2990,7 @@ impl Ready {
 
     fn navigate_to(&mut self, page: PageNo) {
         if self.go_to(page) {
-            // Empilha a nova posição, descartando o "futuro" (como navegador).
-            self.history.truncate(self.hpos + 1);
-            self.history.push(self.visible);
-            self.hpos = self.history.len() - 1;
+            self.history.visit(self.visible);
             self.save_position();
         }
     }
@@ -2844,28 +3016,25 @@ impl Ready {
 
     /// Um passo no histórico (`forward` = avançar). Limites são no-op.
     fn history_go(&mut self, forward: bool) {
-        let next = if forward {
-            self.hpos.checked_add(1)
-        } else {
-            self.hpos.checked_sub(1)
-        };
-        let Some(i) = next.filter(|i| *i < self.history.len()) else {
+        // Página alcançada por rolagem (fora da pilha) entra antes de andar, para
+        // o "voltar" cair de fato na página anterior; repetida é ignorada.
+        self.history.visit(self.visible);
+        let Some(page) = self.history.step(forward) else {
             return;
         };
-        self.hpos = i;
-        self.go_to(self.history[i]);
+        self.go_to(page);
         self.save_position();
     }
 
     pub fn can_history_back(&self) -> bool {
-        self.hpos > 0
+        self.history.can_back()
     }
 
     pub fn can_history_forward(&self) -> bool {
-        self.hpos + 1 < self.history.len()
+        self.history.can_forward()
     }
 
-    /// Persiste página+zoom atuais; silencioso em erro ou arquivo ilegível.
+    /// Persiste página, zoom e modo atuais; silencioso se ilegível/erro.
     fn save_position(&self) {
         let path = self.source.path();
         let Some((size, mtime)) = file_identity(path) else {
@@ -2874,6 +3043,7 @@ impl Ready {
         let pos = DocPosition {
             page: self.visible.index(),
             zoom: self.zoom,
+            mode: self.view_mode,
             size,
             mtime,
         };
@@ -2881,17 +3051,21 @@ impl Ready {
         let _ = save_positions(&entries);
     }
 
-    /// Restaura página+zoom do arquivo (identidade precisa); zera o histórico.
+    /// Restaura página+zoom+modo do arquivo (identidade precisa); zera o histórico.
     fn restore_position(&mut self) {
         let path = self.source.path().to_path_buf();
         let Some(pos) = find_position(&read_positions(), &path) else {
             return;
         };
         self.zoom = pos.zoom;
+        self.view_mode = pos.mode;
         let idx = pos.page.min(self.pages.total.saturating_sub(1));
         self.visible = PageNo::from_index(idx);
-        self.history = vec![self.visible];
-        self.hpos = 0;
+        if self.view_mode == ViewMode::Continuous {
+            // Primeira renderização já parte da página restaurada.
+            self.doc_scroll_y = self.page_offset(self.visible);
+        }
+        self.history.reset(self.visible);
     }
 
     fn apply_nav(&mut self, cmd: NavCmd) {
@@ -3160,8 +3334,7 @@ impl Document {
             signatures,
             zoom: Zoom::Width,
             visible: PageNo::first(),
-            history: vec![PageNo::first()],
-            hpos: 0,
+            history: History::new(PageNo::first()),
             view_mode: ViewMode::default(),
             view_rotation: 0,
             page_input: String::new(),
@@ -3178,6 +3351,7 @@ impl Document {
             outline_open: false,
             outline: None,
             outline_collapsed: HashSet::new(),
+            outline_cursor: None,
             outline_load_issued: false,
             pages_scroll_y: 0.0,
             doc_scroll_y: 0.0,
@@ -3812,7 +3986,7 @@ mod tests {
             _ => unreachable!(),
         };
         let hist_len = |s: &Session| match s {
-            Session::Ready(r) => (r.history.len(), r.hpos),
+            Session::Ready(r) => (r.history.pages.len(), r.history.pos),
             _ => unreachable!(),
         };
         assert_eq!(hist_len(&session), (1, 0));
@@ -3844,11 +4018,97 @@ mod tests {
         assert_eq!(visible(&session), first);
         match &session {
             Session::Ready(r) => {
-                assert!(!r.can_history_back() || r.hpos > 0);
-                assert_eq!(r.can_history_forward(), r.hpos + 1 < r.history.len());
+                assert!(!r.can_history_back() || r.history.pos > 0);
+                assert_eq!(r.can_history_forward(), r.history.can_forward());
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Pilha pura (sem documento/fixture): 1→5→3, voltar/avançar, colapso,
+    /// reset e página alcançada por rolagem entrando antes de andar.
+    #[test]
+    fn history_stack_walks_visits_without_document() {
+        let (p1, p5, p3) = (
+            PageNo::first(),
+            PageNo::from_index(4),
+            PageNo::from_index(2),
+        );
+        let mut history = History::new(p1);
+        assert_eq!(history.current(), p1);
+        history.visit(p5);
+        history.visit(p3);
+        assert_eq!(history.pages, vec![p1, p5, p3]);
+        assert_eq!(history.pos, 2);
+        // Voltar/avançar como navegador.
+        assert_eq!(history.step(false), Some(p5));
+        assert_eq!(history.current(), p5);
+        assert_eq!(history.step(false), Some(p1));
+        assert_eq!(history.current(), p1);
+        // Limite é no-op.
+        assert_eq!(history.step(false), None);
+        assert_eq!(history.current(), p1);
+        assert_eq!(history.step(true), Some(p5));
+        // Visita nova descarta o "futuro".
+        history.visit(p3);
+        assert_eq!(history.pages, vec![p1, p5, p3]);
+        assert!(!history.can_forward());
+        // Repetida consecutiva não entra.
+        history.visit(p3);
+        assert_eq!(history.pages.len(), 3);
+        // Rolagem leva a página fora da pilha: entra antes de andar.
+        let p9 = PageNo::from_index(8);
+        history.visit(p9);
+        assert_eq!(history.step(false), Some(p3));
+        assert_eq!(history.step(true), Some(p9));
+        // Abrir outro documento (ou restaurar posição) zera a pilha.
+        history.reset(p5);
+        assert_eq!(history.pages, vec![p5]);
+        assert!(!history.can_back());
+        assert!(!history.can_forward());
+        assert_eq!(history.step(false), None);
+    }
+
+    /// Busca salta para o hit e o "voltar" devolve a página original (fixture
+    /// real para a contagem de páginas; camada de texto injetada como o engine
+    /// entregaria).
+    #[test]
+    fn search_jump_then_back_returns_to_reading_page() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let last = ready.page_count().saturating_sub(1);
+        if last < 1 {
+            return;
+        }
+        let hit_page = PageNo::from_index(last);
+        ready.pages.text[last as usize] = Some(TextLayer {
+            page: hit_page,
+            plain: "cláusula".into(),
+            glyphs: vec![Glyph {
+                cluster: "cláusula".into(),
+                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+            }],
+        });
+        let file = std::env::temp_dir().join(format!(
+            "tsuro-positions-unit-{}-search",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        crate::positions::with_positions_path(file.clone(), || {
+            let mut session = Session::Ready(ready);
+            let visible = |s: &Session| match s {
+                Session::Ready(r) => r.visible,
+                _ => unreachable!(),
+            };
+            apply(&mut session, Message::SearchChanged("cláusula".into()));
+            assert_eq!(visible(&session), hit_page);
+            apply(&mut session, Message::HistoryBack);
+            assert_eq!(visible(&session), PageNo::first());
+            apply(&mut session, Message::HistoryForward);
+            assert_eq!(visible(&session), hit_page);
+        });
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]
@@ -4409,6 +4669,7 @@ mod tests {
                 crate::positions::DocPosition {
                     page: last,
                     zoom: Zoom::Page,
+                    mode: ViewMode::Continuous,
                     size,
                     mtime,
                 },
@@ -4417,10 +4678,62 @@ mod tests {
             ready.restore_position();
             assert_eq!(ready.visible.index(), last);
             assert!(matches!(ready.zoom, Zoom::Page));
-            assert_eq!(ready.history, vec![ready.visible]);
-            assert_eq!(ready.hpos, 0);
+            assert_eq!(ready.view_mode, ViewMode::Continuous);
+            // Contínuo restaurado já abre na página certa (janela + scroll).
+            assert_eq!(ready.doc_scroll_y, ready.page_offset(ready.visible));
+            assert_eq!(ready.history.pages, vec![ready.visible]);
+            assert_eq!(ready.history.pos, 0);
         });
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// Smoke de estado (fixture real): navegar até a última página, fechar e
+    /// reabrir pelo caminho de produção (`begin_open`+`finish_open`) volta pra lá,
+    /// com zoom e modo persistidos.
+    #[test]
+    fn reopen_restores_page_zoom_and_mode_after_close() {
+        isolated(|| {
+            let Some(ready) = sample_ready() else {
+                return;
+            };
+            let last = ready.page_count().saturating_sub(1);
+            if last < 1 {
+                return;
+            }
+            let path = ready.source.path().to_path_buf();
+            let file = std::env::temp_dir().join(format!(
+                "tsuro-positions-unit-{}-reopen",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&file);
+            crate::positions::with_positions_path(file.clone(), || {
+                let target = PageNo::from_index(last);
+                let mut session = Session::Ready(ready);
+                apply(&mut session, Message::Nav(NavCmd::GoTo(target)));
+                apply(&mut session, Message::SetZoom(Zoom::Page));
+                apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
+                apply(&mut session, Message::Close);
+                let Some(reopened) = sample_ready() else {
+                    return;
+                };
+                let _ = session.begin_open(OpenSource::Path(path.clone()));
+                session.finish_open(Ok(reopened));
+                match &session {
+                    Session::Ready(ready) => {
+                        assert_eq!(ready.visible, target);
+                        assert!(matches!(ready.zoom, Zoom::Page));
+                        assert_eq!(ready.view_mode, ViewMode::Continuous);
+                        assert_eq!(ready.doc_scroll_y, ready.page_offset(ready.visible));
+                        // Restaurar não gera entrada: a pilha reinicia aqui.
+                        assert_eq!(ready.history.pages, vec![target]);
+                        assert_eq!(ready.history.pos, 0);
+                        assert!(!ready.can_history_back());
+                    }
+                    other => panic!("expected Ready, got {other:?}"),
+                }
+            });
+            let _ = std::fs::remove_file(&file);
+        });
     }
 
     #[test]
@@ -4449,6 +4762,109 @@ mod tests {
         assert_eq!(ready.outline_active(), Some(vec![1]));
         ready.visible = PageNo::first();
         assert_eq!(ready.outline_active(), Some(vec![0]));
+    }
+
+    #[test]
+    fn outline_keyboard_walks_tree_and_jumps() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        apply(&mut session, Message::OutlineLoaded(Some(outline_tree())));
+        // Sem a aba aberta as teclas não andam nem saltam.
+        apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        apply(&mut session, Message::OutlineKey(OutlineKey::Activate));
+        match &session {
+            Session::Ready(r) => {
+                assert!(r.outline_cursor.is_none());
+                assert_eq!(r.visible, PageNo::first());
+            }
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::OutlineTab(true));
+        // O cursor parte da entrada ativa (página 1 → primeiro item).
+        match &session {
+            Session::Ready(r) => assert_eq!(r.outline_focus(), Some(vec![0])),
+            _ => unreachable!(),
+        }
+        // ↓ anda pela árvore sem navegar: quem salta é o Enter.
+        apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        match &session {
+            Session::Ready(r) => {
+                assert_eq!(r.outline_focus(), Some(vec![0, 0]));
+                assert_eq!(r.visible, PageNo::first());
+            }
+            _ => unreachable!(),
+        }
+        // Enter salta para a página do cursor e entra no histórico.
+        let history = match &session {
+            Session::Ready(r) => r.history.len(),
+            _ => unreachable!(),
+        };
+        apply(&mut session, Message::OutlineKey(OutlineKey::Activate));
+        match &session {
+            Session::Ready(r) => {
+                // Alvo é a página do cursor, com o mesmo clamp do SetPage
+                // (o fixture tem 2 páginas, então a página 3 cai na última).
+                let last = PageNo::from_index(r.page_count() - 1);
+                assert_eq!(r.visible, PageNo::from_index(2).min(last));
+                assert_eq!(r.history.len(), history + 1);
+            }
+            _ => unreachable!(),
+        }
+        // ↑/↓ não passam das pontas da lista.
+        for _ in 0..4 {
+            apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        }
+        match &session {
+            Session::Ready(r) => assert_eq!(r.outline_focus(), Some(vec![1])),
+            _ => unreachable!(),
+        }
+        for _ in 0..4 {
+            apply(&mut session, Message::OutlineKey(OutlineKey::Prev));
+        }
+        match &session {
+            Session::Ready(r) => assert_eq!(r.outline_focus(), Some(vec![0])),
+            _ => unreachable!(),
+        }
+        // Colapsar o nó esconde os filhos: o cursor volta para a ativa.
+        apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        apply(&mut session, Message::OutlineFold(vec![0]));
+        match &session {
+            Session::Ready(r) => {
+                assert_eq!(r.outline_rows().len(), 2);
+                assert_eq!(r.outline_focus(), Some(vec![0]));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn outline_keys_map_to_outline_messages() {
+        use iced::event::Status;
+        use iced::keyboard::Modifiers;
+        let plain = Modifiers::empty();
+        assert!(matches!(
+            keyboard_message(Key::Named(Named::ArrowUp), plain, Status::Ignored),
+            Some(Message::OutlineKey(OutlineKey::Prev))
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Named(Named::ArrowDown), plain, Status::Ignored),
+            Some(Message::OutlineKey(OutlineKey::Next))
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Named(Named::Enter), plain, Status::Ignored),
+            Some(Message::OutlineKey(OutlineKey::Activate))
+        ));
+        // Com modificador a tecla sai do mapa (⌘/Alt+setas seguem no histórico)
+        // e com foco em campo o evento chega capturado: nada é despachado.
+        assert!(keyboard_message(
+            Key::Named(Named::ArrowUp),
+            Modifiers::SHIFT,
+            Status::Ignored
+        )
+        .is_none());
+        assert!(keyboard_message(Key::Named(Named::Enter), plain, Status::Captured).is_none());
     }
 
     #[test]
@@ -4833,6 +5249,67 @@ mod tests {
         // de partir do fator girado (antes partia do original e o + encolhia).
         if media.width != media.height {
             assert_ne!(ready.zoom_step_factor(), upright);
+        }
+    }
+
+    /// Spec rotação (smoke): com a vista girada, clicar na geometria
+    /// exibida de um glifo seleciona esse glifo e o quad pintado cobre o
+    /// ponto clicado — a seleção acompanha a página girada.
+    #[test]
+    fn click_on_rotated_page_selects_the_clicked_glyph() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 900.0,
+            height: 700.0,
+        };
+        ready.zoom = Zoom::Page;
+        let page = PageNo::first();
+        ready.visible = page;
+        let media = ready.media(page);
+        let Some(layer) = ready.pages.text[page.index() as usize].clone() else {
+            return;
+        };
+        // Glifo com texto real (espaço não gera seleção), do meio da página.
+        let middle = layer.glyphs.len() / 2;
+        let Some(k) = (middle..layer.glyphs.len()).chain(0..middle).find(|&i| {
+            let (start, end) = glyph_byte_range(&layer, i);
+            !layer.slice(TextRange { start, end }).trim().is_empty()
+        }) else {
+            return;
+        };
+        let mut session = Session::Ready(ready);
+        for step in 0..4u8 {
+            if step > 0 {
+                apply(&mut session, Message::RotateView);
+            }
+            let Session::Ready(ready) = &session else {
+                panic!("expected Ready");
+            };
+            assert_eq!(ready.view_rotation, step);
+            let rotated = ready.rotated_media(page);
+            let (dw, dh) = (900.0, 900.0 * rotated.height / rotated.width.max(1.0));
+            let [x, y, w, h] = display_rect(layer.glyphs[k].quad, media, step, dw, dh);
+            let at = [x + w / 2.0, y + h / 2.0];
+            let page_pt = page_pt_at(at, media, step, dw, dh);
+            apply(&mut session, Message::PointerDown { page, page_pt });
+            let Session::Ready(ready) = &session else {
+                panic!("expected Ready");
+            };
+            let (sel_page, quads) = ready
+                .selection_quads()
+                .unwrap_or_else(|| panic!("rotação {step}: clique no texto não selecionou"));
+            assert_eq!(sel_page, page);
+            assert!(
+                quads.iter().any(|q| {
+                    let [qx, qy, qw, qh] = display_rect(*q, media, step, dw, dh);
+                    (qx - 1.0..=qx + qw + 1.0).contains(&at[0])
+                        && (qy - 1.0..=qy + qh + 1.0).contains(&at[1])
+                }),
+                "rotação {step}: quad pintado não cobriu o clique"
+            );
+            apply(&mut session, Message::PointerUp { page, page_pt });
         }
     }
 

@@ -6,12 +6,13 @@
 //! `~/.local/share`, por fim o temp dir. Leitura cega: qualquer erro → vazio.
 //!
 //! Formato (uma entrada por linha, mais recente primeiro, máx 50):
-//! `página\tzoom\ttamanho\tmtime\tcaminho` com `\`/`\t`/`\n` escapados
-//! no caminho. Linha malformada é ignorada, nunca derruba a leitura.
+//! `página\tzoom\ttamanho\tmtime\tmodo\tcaminho` com `\`/`\t`/`\n` escapados
+//! no caminho. Linha no formato antigo (sem o campo `modo`) é lida como
+//! `Single`; linha malformada é ignorada, nunca derruba a leitura.
 
 use std::path::{Path, PathBuf};
 
-use crate::session::{Zoom, ZoomFactor};
+use crate::session::{ViewMode, Zoom, ZoomFactor};
 
 /// Entradas guardadas por arquivo (cap LRU).
 pub const MAX_POSITIONS: usize = 50;
@@ -21,6 +22,8 @@ pub struct DocPosition {
     /// Índice 0-based da última página lida.
     pub page: u32,
     pub zoom: Zoom,
+    /// Modo de página da última leitura (única/contínua).
+    pub mode: ViewMode,
     /// Identidade do arquivo (invalida se o documento mudou).
     pub size: u64,
     pub mtime: u64,
@@ -114,6 +117,20 @@ fn encode_zoom(zoom: Zoom) -> String {
     }
 }
 
+fn encode_mode(mode: ViewMode) -> &'static str {
+    match mode {
+        ViewMode::Single => "single",
+        ViewMode::Continuous => "continuous",
+    }
+}
+
+fn decode_mode(raw: &str) -> ViewMode {
+    match raw {
+        "continuous" => ViewMode::Continuous,
+        _ => ViewMode::Single,
+    }
+}
+
 fn decode_zoom(raw: &str) -> Zoom {
     match raw {
         "page" => Zoom::Page,
@@ -129,23 +146,31 @@ fn decode_zoom(raw: &str) -> Zoom {
 
 fn encode_entry(path: &Path, pos: &DocPosition) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}",
         pos.page,
         encode_zoom(pos.zoom),
         pos.size,
         pos.mtime,
+        encode_mode(pos.mode),
         escape_path(path),
     )
 }
 
 fn decode_entry(line: &str) -> Option<(PathBuf, DocPosition)> {
-    let mut parts = line.split('\t');
-    let page = parts.next()?.parse::<u32>().ok()?;
-    let zoom = decode_zoom(parts.next()?);
-    let size = parts.next()?.parse::<u64>().ok()?;
-    let mtime = parts.next()?.parse::<u64>().ok()?;
-    let path = unescape_path(parts.next()?);
-    if parts.next().is_some() || path.as_os_str().is_empty() {
+    // 6 campos: página, zoom, tamanho, mtime, modo, caminho.
+    // 5 campos: formato anterior ao modo persistido (lido como `Single`).
+    let fields: Vec<&str> = line.split('\t').collect();
+    let (page, zoom, size, mtime, mode, path) = match fields[..] {
+        [page, zoom, size, mtime, mode, path] => (page, zoom, size, mtime, decode_mode(mode), path),
+        [page, zoom, size, mtime, path] => (page, zoom, size, mtime, ViewMode::Single, path),
+        _ => return None,
+    };
+    let page = page.parse::<u32>().ok()?;
+    let zoom = decode_zoom(zoom);
+    let size = size.parse::<u64>().ok()?;
+    let mtime = mtime.parse::<u64>().ok()?;
+    let path = unescape_path(path);
+    if path.as_os_str().is_empty() {
         return None;
     }
     Some((
@@ -153,6 +178,7 @@ fn decode_entry(line: &str) -> Option<(PathBuf, DocPosition)> {
         DocPosition {
             page,
             zoom,
+            mode,
             size,
             mtime,
         },
@@ -221,6 +247,7 @@ mod tests {
         DocPosition {
             page,
             zoom: Zoom::Width,
+            mode: ViewMode::Single,
             size: 10,
             mtime: 20,
         }
@@ -265,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn zoom_and_path_escape_roundtrip() {
+    fn zoom_path_and_mode_roundtrip() {
         let path = temp_positions("escape");
         let _ = std::fs::remove_file(&path);
         with_positions_path(path.clone(), || {
@@ -276,6 +303,7 @@ mod tests {
                 DocPosition {
                     page: 3,
                     zoom: Zoom::Manual(ZoomFactor::new(1.5)),
+                    mode: ViewMode::Continuous,
                     size: 7,
                     mtime: 8,
                 },
@@ -286,6 +314,26 @@ mod tests {
             assert_eq!(back[0].0, tricky);
             assert_eq!(back[0].1.page, 3);
             assert!(matches!(back[0].1.zoom, Zoom::Manual(_)));
+            assert_eq!(back[0].1.mode, ViewMode::Continuous);
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Arquivo escrito antes do campo `modo` continua legível (modo = Single).
+    #[test]
+    fn legacy_five_field_line_reads_as_single() {
+        let path = temp_positions("legacy");
+        let _ = std::fs::remove_file(&path);
+        with_positions_path(path.clone(), || {
+            std::fs::write(&path, "12\tpage\t99\t7\t/tmp/velho.pdf\n").unwrap();
+            let back = read_positions();
+            assert_eq!(back.len(), 1);
+            assert_eq!(back[0].0, PathBuf::from("/tmp/velho.pdf"));
+            assert_eq!(back[0].1.page, 12);
+            assert!(matches!(back[0].1.zoom, Zoom::Page));
+            assert_eq!(back[0].1.mode, ViewMode::Single);
+            assert_eq!(back[0].1.size, 99);
+            assert_eq!(back[0].1.mtime, 7);
         });
         let _ = std::fs::remove_file(&path);
     }
@@ -304,6 +352,7 @@ mod tests {
             DocPosition {
                 page: 5,
                 zoom: Zoom::Page,
+                mode: ViewMode::Continuous,
                 size,
                 mtime,
             },

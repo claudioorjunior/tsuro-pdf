@@ -18,6 +18,8 @@ Check open issues first — duplicates get closed. A good report has:
 - A sample PDF: attach one, or name a file in `public/samples/`
 - For signature reports: the state shown in the signatures panel
 
+A new issue gets the `needs-triage` label from `.github/workflows/issues.yml`. A very short body also gets `needs-info` and a comment asking for the fields above.
+
 ## Pull requests
 
 1. Branch from `main` (`feat/<topic>`, `fix/<topic>`).
@@ -29,7 +31,8 @@ Check open issues first — duplicates get closed. A good report has:
    cargo test -p tsuro-sign   # only if you touched signatures
    ```
 
-   There is no CI gate on PRs — green locally is the gate.
+   `.github/workflows/pr.yml` runs the same commands on macos-14 and windows-latest.
+   `.github/workflows/review.yml` runs rustfmt --check and clippy on those same packages.
 4. New viewer code → `crates/tsuro/...`; signature code → `crates/tsuro-sign/...`.
 
 Commits follow [Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/): `type(scope): description (#issue) (#PR)`.

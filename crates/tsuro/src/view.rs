@@ -362,13 +362,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
         })
         .style(kiri::pill_style(t))
         .max_width(520.0);
-        let current = match ready.zoom {
-            Zoom::Manual(z) => z.get(),
-            Zoom::Width | Zoom::Page => ready
-                .zoom
-                .scale(ready.viewport(), ready.media(ready.visible))
-                .factor(),
-        };
+        let current = ready.zoom_step_factor();
         let out = Zoom::Manual(ZoomFactor::new(current / 1.1));
         let into = Zoom::Manual(ZoomFactor::new(current * 1.1));
 
@@ -1388,9 +1382,12 @@ fn panel_tabs(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 /// destaque da ativa.
 fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let active = ready.outline_active();
-    let mut col = column![].spacing(2);
+    let focus = ready.outline_focus();
+    let mut col = column![panel_tabs(ready, t)].spacing(8);
     for (path, depth, title, page, has_children) in ready.outline_rows() {
         let is_active = active.as_ref() == Some(&path);
+        // O cursor do teclado é a pílula; a página ativa, o texto em accent.
+        let is_focus = focus.as_ref() == Some(&path);
         let fold: Element<'_, Message> = if has_children {
             let collapsed = ready.outline_collapsed.contains(&path);
             button(text(if collapsed { "▸" } else { "▾" }).size(11))
@@ -1402,15 +1399,19 @@ fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             Space::with_width(Length::Fixed(24.0)).into()
         };
         let label = format!("{} · {}", outline_title(title), page.index() + 1);
-        let entry = button(
-            text(label)
-                .size(12)
-                .color(if is_active { t.accent } else { t.ink }),
-        )
-        .width(Length::Fill)
-        .padding(Padding::from([4, 6]))
-        .style(kiri::panel_toc_item_style(t, is_active))
-        .on_press(Message::OutlineJump(page));
+        let entry = control_active(
+            t,
+            button(
+                text(label)
+                    .size(12)
+                    .color(if is_active { t.accent } else { t.ink }),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([4, 6]))
+            .style(kiri::panel_toc_item_style(t, is_active))
+            .on_press(Message::OutlineJump(page)),
+            is_focus,
+        );
         col = col.push(
             row![
                 Space::with_width(Length::Fixed(depth as f32 * 12.0)),

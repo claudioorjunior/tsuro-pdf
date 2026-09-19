@@ -79,11 +79,12 @@ With no argument the window opens empty. Controls live in the toolbar, not in sh
 
 ## Samples
 
-Two PDFs in `public/samples/`:
+Three PDFs in `public/samples/`:
 
 | File | What it exercises |
 | --- | --- |
 | `guia-folio.pdf` | Typography, tables, accents, search |
+| `sumario-folio.pdf` | Bookmarks (outline) driving the Sumário tab |
 | `contrato-assinado.pdf` | `/Sig` field with a demo self-signed certificate |
 
 The contract certificate is **self-signed**. TsuroPDF treats it as cryptographically intact but with no public trust chain. The expected state is "intact (no public trust)".
