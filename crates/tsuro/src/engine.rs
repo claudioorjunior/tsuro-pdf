@@ -615,10 +615,13 @@ fn save_copy_from_doc(
                         if mark.text.trim().is_empty() {
                             continue;
                         }
-                        let Some(first) = mark.quads.first() else {
+                        // O `/Text` acompanha a tela: se o marcador foi
+                        // arrastado, ele manda; senão, a origem do 1º quad.
+                        // Sem marcador e sem trecho não há onde ancorar.
+                        if mark.marker.is_none() && mark.quads.is_empty() {
                             continue;
-                        };
-                        let (left, _, _, top) = quad_bounds(first);
+                        }
+                        let [left, top] = mark.marker_pt();
                         let mut annotation = target
                             .create_text_annotation(&mark.text)
                             .map_err(mark_error)?;
@@ -983,6 +986,7 @@ mod tests {
                 quads: quads.clone(),
                 kind: AnnotKind::Highlight,
                 text: String::new(),
+                marker: None,
             },
             Annotation {
                 id: 2,
@@ -991,6 +995,7 @@ mod tests {
                 quads: vec![first],
                 kind: AnnotKind::Note,
                 text: "nota do teste".into(),
+                marker: None,
             },
         ];
 
@@ -1037,6 +1042,61 @@ mod tests {
     }
 
     #[test]
+    fn save_copy_anchors_moved_note_at_its_marker() {
+        let Some(bytes) = sample_pdf_bytes() else {
+            return;
+        };
+        let Ok(engine) = PdfiumEngine::open(bytes) else {
+            return;
+        };
+        let page = PageNo::first();
+        let (_, text) = engine.page_data(page).expect("page data");
+        let quads: Vec<Quad> = text.glyphs.iter().take(2).map(|g| g.quad).collect();
+        let Some(first) = quads.first().copied() else {
+            return;
+        };
+        // Marcador arrastado para longe do trecho: o `/Text` da cópia nasce
+        // onde o ícone está na tela, não no primeiro quad.
+        let marker = [
+            first.x0.min(first.x1) + 120.0,
+            first.y0.max(first.y1) - 200.0,
+        ];
+        let annotations = vec![Annotation {
+            id: 1,
+            page,
+            range: TextRange {
+                start: 0,
+                end: quads.len(),
+            },
+            quads,
+            kind: AnnotKind::Note,
+            text: "nota movida".into(),
+            marker: Some(marker),
+        }];
+
+        let saved = engine.save_copy(&annotations).expect("cópia marcada");
+        engine.close();
+        drop(engine);
+
+        let reopened = PdfiumEngine::open(Arc::from(saved)).expect("reabrir a cópia");
+        let stored = reopened.annotations(page).expect("anotações da cópia");
+        assert_eq!(stored.len(), 1);
+        let note = &stored[0];
+        assert!(matches!(note.kind, AnnotKind::Note));
+        assert_eq!(note.text, "nota movida");
+        assert!(
+            (note.bounds.0 - marker[0]).abs() < 0.05,
+            "{:?}",
+            note.bounds
+        );
+        assert!(
+            (note.bounds.3 - marker[1]).abs() < 0.05,
+            "{:?}",
+            note.bounds
+        );
+    }
+
+    #[test]
     fn save_copy_without_annotations_keeps_the_document() {
         let Some(bytes) = sample_pdf_bytes() else {
             return;
@@ -1069,6 +1129,7 @@ mod tests {
                 quads: Vec::new(),
                 kind: AnnotKind::Highlight,
                 text: String::new(),
+                marker: None,
             }])
             .unwrap_err();
         assert_eq!(err.0, ANNOT_PAGE_OUT_OF_RANGE);

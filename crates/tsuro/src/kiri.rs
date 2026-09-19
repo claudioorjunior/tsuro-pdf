@@ -520,7 +520,6 @@ pub fn logo_stage_style() -> impl Fn(&iced::Theme) -> container::Style {
         ..container::Style::default()
     }
 }
-
 // ── Fatia painéis laterais (Stitch §5 Miniaturas) ─────────────────────────
 
 /// Painel lateral (navegação / assinaturas): fundo chrome, hairline `line`,
