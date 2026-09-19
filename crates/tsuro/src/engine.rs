@@ -59,9 +59,7 @@ enum Request {
         reply: mpsc::Sender<Result<(u64, u32), EngineError>>,
     },
     /// Esquece o documento (aba fechada). Sem resposta: é limpeza.
-    Close {
-        doc_id: u64,
-    },
+    Close { doc_id: u64 },
     PageData {
         doc_id: u64,
         page: PageNo,
@@ -128,8 +126,11 @@ static WORKER: LazyLock<Arc<Shared>> = LazyLock::new(|| {
 
 /// A biblioteca do processo. O erro do bind é cacheado junto: sem Pdfium
 /// nenhuma aba abre, e é isso que cada `open` responde.
-static LIBRARY: LazyLock<Result<Library, String>> =
-    LazyLock::new(|| PdfiumEngine::bind().map(Library).map_err(|err| err.to_string()));
+static LIBRARY: LazyLock<Result<Library, String>> = LazyLock::new(|| {
+    PdfiumEngine::bind()
+        .map(Library)
+        .map_err(|err| err.to_string())
+});
 
 fn worker() -> Arc<Shared> {
     WORKER.clone()
@@ -168,7 +169,11 @@ fn serve(incoming: mpsc::Receiver<Request>) {
             Request::Close { doc_id } => {
                 documents.remove(&doc_id);
             }
-            Request::PageData { doc_id, page, reply } => {
+            Request::PageData {
+                doc_id,
+                page,
+                reply,
+            } => {
                 let _ = reply.send(with_doc(&documents, doc_id, |doc| {
                     page_data_from_doc(doc, page)
                 }));
@@ -853,6 +858,48 @@ mod tests {
         assert_send_sync::<PdfiumEngine>();
     }
 
+    /// Fixture de `scripts/generate_samples.py` (`public/samples/` é read-only:
+    /// o PDF nunca é editado à mão).
+    fn sample_engine(name: &str) -> Option<PdfiumEngine> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../public/samples")
+            .join(name);
+        let bytes = std::fs::read(path).ok()?;
+        PdfiumEngine::open(Arc::from(bytes.as_slice())).ok()
+    }
+
+    #[test]
+    fn outline_reads_nested_bookmarks_with_pages() {
+        let Some(engine) = sample_engine("sumario-folio.pdf") else {
+            return; // sem Pdfium ao lado do binário de teste
+        };
+        let outline = engine
+            .outline()
+            .expect("leitura do outline")
+            .expect("o fixture declara bookmarks");
+        assert_eq!(outline.items.len(), 16);
+        assert_eq!(outline.items[0].title, "1. Identificação das partes");
+        assert_eq!(outline.items[0].page, PageNo::first());
+        assert!(outline.items[0].children.is_empty());
+        // Nó com filhos: título, página (0-based) e ordem dos filhos.
+        let precos = &outline.items[3];
+        assert_eq!(precos.title, "4. Preços e reajuste");
+        assert_eq!(precos.page, PageNo::from_index(3));
+        assert_eq!(precos.children.len(), 2);
+        assert_eq!(precos.children[0].title, "4.1 Reajuste anual");
+        assert_eq!(precos.children[1].title, "4.2 Revisão extraordinária");
+        assert_eq!(precos.children[1].page, PageNo::from_index(3));
+    }
+
+    #[test]
+    fn outline_is_none_for_pdf_without_bookmarks() {
+        let Some(engine) = sample_engine("guia-folio.pdf") else {
+            return;
+        };
+        // `None`, não árvore vazia: a aba Sumário só existe quando há outline.
+        assert!(engine.outline().expect("leitura do outline").is_none());
+    }
+
     #[test]
     fn frameworks_path_points_at_bundle_lib() {
         let exe = Path::new("/Applications/TsuroPDF.app/Contents/MacOS/TsuroPDF");
@@ -889,6 +936,21 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from(Vec::new());
         let result = PdfiumEngine::open(bytes);
         assert!(result.is_err(), "bytes vazios devem falhar");
+    }
+
+    #[test]
+    fn pdfium_binds_when_ci_requires_it() {
+        // Pela worker estática: um segundo `Pdfium::new` no processo travaria
+        // no mutex global do pdfium-render (`InitLibrary` retém o lock) — o
+        // gate abre um documento em vez de dar bind de novo.
+        let Some(bytes) = sample_pdf_bytes() else {
+            return;
+        };
+        match PdfiumEngine::open(bytes) {
+            Ok(_) => {}
+            Err(e) if std::env::var("CI").is_ok() => panic!("{e}"),
+            Err(_) => {}
+        }
     }
 
     fn sample_pdf_bytes() -> Option<Arc<[u8]>> {
@@ -995,7 +1057,10 @@ mod tests {
         };
         // Marcador arrastado para longe do trecho: o `/Text` da cópia nasce
         // onde o ícone está na tela, não no primeiro quad.
-        let marker = [first.x0.min(first.x1) + 120.0, first.y0.max(first.y1) - 200.0];
+        let marker = [
+            first.x0.min(first.x1) + 120.0,
+            first.y0.max(first.y1) - 200.0,
+        ];
         let annotations = vec![Annotation {
             id: 1,
             page,
@@ -1019,8 +1084,16 @@ mod tests {
         let note = &stored[0];
         assert!(matches!(note.kind, AnnotKind::Note));
         assert_eq!(note.text, "nota movida");
-        assert!((note.bounds.0 - marker[0]).abs() < 0.05, "{:?}", note.bounds);
-        assert!((note.bounds.3 - marker[1]).abs() < 0.05, "{:?}", note.bounds);
+        assert!(
+            (note.bounds.0 - marker[0]).abs() < 0.05,
+            "{:?}",
+            note.bounds
+        );
+        assert!(
+            (note.bounds.3 - marker[1]).abs() < 0.05,
+            "{:?}",
+            note.bounds
+        );
     }
 
     #[test]

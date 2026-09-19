@@ -18,6 +18,8 @@ Veja as issues abertas antes — duplicada é fechada. Um bom relato tem:
 - Um PDF de exemplo: anexe um, ou indique um arquivo em `public/samples/`
 - Para relatos de assinatura: o estado mostrado no painel de assinaturas
 
+Uma issue nova recebe a label `needs-triage` de `.github/workflows/issues.yml`. Um corpo muito curto também recebe `needs-info` e um comentário pedindo os campos acima.
+
 ## Pull requests
 
 1. Crie a branch a partir da `main` (`feat/<tema>`, `fix/<tema>`).
@@ -29,7 +31,8 @@ Veja as issues abertas antes — duplicada é fechada. Um bom relato tem:
    cargo test -p tsuro-sign   # só se mexeu em assinaturas
    ```
 
-   Não há gate de CI em PRs — verde local é o gate.
+   `.github/workflows/pr.yml` roda os mesmos comandos em macos-14 e windows-latest.
+   `.github/workflows/review.yml` roda rustfmt --check e clippy nesses mesmos pacotes.
 4. Código novo do visor → `crates/tsuro/...`; de assinaturas → `crates/tsuro-sign/...`.
 
 Commits seguem [Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/): `tipo(escopo): descrição (#issue) (#PR)`.

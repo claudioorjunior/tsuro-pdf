@@ -1,0 +1,88 @@
+name: Issues
+
+on:
+  issues:
+    types: [opened, reopened, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const TRIAGE = [
+              'needs-triage',
+              'needs-info',
+              'ready-for-agent',
+              'ready-for-human',
+              'wontfix',
+            ];
+            const MARKER = '<!-- tsuro-issue-ci -->';
+            const MIN = 80;
+
+            function collapsedLength(body) {
+              return String(body || '').replace(/\s+/g, ' ').trim().length;
+            }
+
+            const { issue, action } = context.payload;
+            const { owner, repo } = context.repo;
+            const issue_number = issue.number;
+            const present = new Set((issue.labels || []).map((label) => label.name));
+            const complete = collapsedLength(issue.body) >= MIN;
+            const toAdd = [];
+
+            if (
+              (action === 'opened' || action === 'reopened') &&
+              !TRIAGE.some((name) => present.has(name))
+            ) {
+              toAdd.push('needs-triage');
+            }
+
+            if (!complete && !present.has('needs-info')) {
+              toAdd.push('needs-info');
+            }
+
+            if (toAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number,
+                labels: toAdd,
+              });
+            }
+
+            if (!complete) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number, per_page: 100 },
+              );
+              if (!comments.some((comment) => (comment.body || '').includes(MARKER))) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number,
+                  body: [
+                    'This issue needs more detail before triage.',
+                    '',
+                    'Include TsuroPDF version, OS, steps to reproduce, expected vs actual behavior, and a sample PDF. See CONTRIBUTING.md.',
+                    '',
+                    'Esta issue precisa de mais detalhes antes da triagem.',
+                    '',
+                    'Inclua a versão do TsuroPDF, o sistema, os passos para reproduzir, o comportamento esperado vs o obtido, e um PDF de exemplo. Veja CONTRIBUTING.pt-BR.md.',
+                    '',
+                    MARKER,
+                  ].join('\n'),
+                });
+              }
+            } else if (action === 'edited' && present.has('needs-info')) {
+              await github.rest.issues.removeLabel({
+                owner,
+                repo,
+                issue_number,
+                name: 'needs-info',
+              });
+            }
