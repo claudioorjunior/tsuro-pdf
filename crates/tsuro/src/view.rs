@@ -39,6 +39,7 @@ const STICKY_LINE: Color = Color::from_rgb(0.80, 0.62, 0.10);
 const POSTIT_W: f32 = 320.0;
 const POSTIT_H: f32 = 210.0;
 const POSTIT_EDITOR_H: f32 = 112.0;
+
 pub fn pages_scroll_id() -> scrollable::Id {
     scrollable::Id::new("tsuro-pages")
 }
@@ -51,15 +52,10 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
     let t = Tokens::for_theme(theme);
     let body: Element<'_, Message> = match session {
         Session::Empty(empty) => empty_browser(empty, t),
-        Session::Loading { source, .. } => {
-            text(format!("Abrindo {}…", source.path().display())).into()
-        }
-        Session::Failed { message, .. } => column![
-            text("Não foi possível abrir o documento").size(20),
-            text(message),
-        ]
-        .spacing(8)
-        .into(),
+        Session::Loading { source, phase, .. } => opening(source, *phase, t),
+        Session::Failed {
+            source, message, ..
+        } => failed(source, message, t),
         Session::Ready(ready) => ready_body(ready, t),
     };
 
@@ -2230,9 +2226,107 @@ fn status_label(status: SignatureStatus) -> &'static str {
     }
 }
 
+/// Trilho da barra indeterminada de abertura (issue #41): 2px, como o
+/// progresso de página (`progress`), mas com um segmento que desliza.
+const LOADING_BAR_W: f32 = 220.0;
+const LOADING_SEG_W: f32 = 72.0;
+/// Passos do ciclo do segmento. `Session::Loading.phase` só conta tiques
+/// (não é porcentagem — o restante é fechado aqui no `%`).
+pub(crate) const LOADING_STEPS: u16 = 12;
+
+/// X do segmento dentro do trilho: 0 → direita, e volta ao início no ciclo
+/// seguinte. Sem porcentagem falsa: a fase dá a posição, nunca a fração
+/// carregada.
+fn sweep_x(phase: u16) -> f32 {
+    let step = f32::from(phase % LOADING_STEPS);
+    (LOADING_BAR_W - LOADING_SEG_W) * step / f32::from(LOADING_STEPS - 1)
+}
+
+/// Barra indeterminada: trilho `surface` 2px com segmento `accent` deslizando.
+fn loading_bar(phase: u16, t: Tokens) -> Element<'static, Message> {
+    let segment = container(Space::with_width(Length::Fill))
+        .width(Length::Fixed(LOADING_SEG_W))
+        .height(Length::Fixed(2.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.accent)),
+            ..container::Style::default()
+        });
+    container(row![Space::with_width(Length::Fixed(sweep_x(phase))), segment].spacing(0))
+        .width(Length::Fixed(LOADING_BAR_W))
+        .height(Length::Fixed(2.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.surface)),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Nome do arquivo no chrome de abertura/falha (o caminho completo não cabe).
+fn source_name(source: &OpenSource) -> String {
+    let path = source.path();
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Tela de abertura (issue #41): nome do arquivo + "Abrindo…" + barra
+/// indeterminada, no lugar do documento.
+fn opening(source: &OpenSource, phase: u16, t: Tokens) -> Element<'_, Message> {
+    container(
+        column![
+            text(source_name(source)).size(16),
+            text("Abrindo…").size(13).color(t.muted),
+            loading_bar(phase, t),
+        ]
+        .spacing(12)
+        .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center_x(Length::Fill)
+    .center_y(Length::Fill)
+    .into()
+}
+
+/// Falha ao abrir (issue #41): o erro toma o lugar da barra — nunca spinner
+/// preso; a saída é o topo (Início / abrir outro).
+fn failed<'a>(source: &'a OpenSource, message: &'a str, t: Tokens) -> Element<'a, Message> {
+    container(
+        column![
+            text("Não foi possível abrir o documento").size(16),
+            text(source_name(source)).size(13).color(t.muted),
+            text(message).size(13).color(t.danger),
+        ]
+        .spacing(12)
+        .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center_x(Length::Fill)
+    .center_y(Length::Fill)
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::outline_title;
+    use super::{outline_title, sweep_x, LOADING_BAR_W, LOADING_SEG_W, LOADING_STEPS};
+
+    #[test]
+    fn opening_sweep_stays_inside_the_track() {
+        let travel = LOADING_BAR_W - LOADING_SEG_W;
+        assert_eq!(sweep_x(0), 0.0);
+        assert_eq!(sweep_x(LOADING_STEPS - 1), travel);
+        let mut last = -1.0;
+        for phase in 0..LOADING_STEPS {
+            let x = sweep_x(phase);
+            assert!(x >= last, "phase {phase} went backwards");
+            assert!(x <= travel, "phase {phase} left the track");
+            last = x;
+        }
+        // Vários ciclos: a fase só conta, o `%` fecha o ciclo.
+        assert_eq!(sweep_x(LOADING_STEPS), sweep_x(0));
+        assert_eq!(sweep_x(u16::MAX), sweep_x(u16::MAX % LOADING_STEPS));
+    }
 
     #[test]
     fn outline_title_truncates_long_labels() {

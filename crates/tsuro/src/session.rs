@@ -57,6 +57,10 @@ pub(crate) const DOC_PAD_BOTTOM: f32 = 56.0;
 pub(crate) const DOC_PAD_X: f32 = 24.0;
 pub(crate) const DOC_GAP: f32 = 16.0;
 
+/// Intervalo do tique da tela de abertura (issue #41): 12 passos dos 90 ms
+/// fecham o ciclo de ~1,1 s da barra indeterminada (`view::LOADING_STEPS`).
+const LOADING_TICK: std::time::Duration = std::time::Duration::from_millis(90);
+
 #[derive(Debug, Clone)]
 pub enum OpenSource {
     Path(PathBuf),
@@ -688,6 +692,9 @@ pub enum Session {
         theme: Theme,
         /// DPR da janela (1.0 = sem Retina). Via `WindowScale`, como o tema.
         render_scale: f32,
+        /// Tique da barra indeterminada de abertura (issue #41): só conta,
+        /// não mede — o ciclo é fechado na view (`view::LOADING_STEPS`).
+        phase: u16,
     },
     Ready(Tabs),
     Failed {
@@ -1283,6 +1290,8 @@ pub enum Message {
         gen: u64,
         result: Result<Ready, OpenError>,
     },
+    /// Tique da tela de abertura (issue #41): avança a barra indeterminada.
+    LoadingTick,
     PageData {
         page: PageNo,
         doc_gen: u64,
@@ -1460,6 +1469,7 @@ impl Session {
             gen: 1,
             theme: read_theme(),
             render_scale: 1.0,
+            phase: 0,
         }
     }
 
@@ -1509,6 +1519,13 @@ impl Session {
                     _ => Task::none(),
                 };
                 Task::batch([self.schedule_work(), follow])
+            }
+            // Tela de abertura: só o contador da barra; nada mais reage a isto.
+            Message::LoadingTick => {
+                if let Session::Loading { phase, .. } = self {
+                    *phase = phase.wrapping_add(1);
+                }
+                Task::none()
             }
             Message::PageData {
                 page,
@@ -2435,7 +2452,7 @@ impl Session {
     }
 
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        event::listen_with(|event, status, id| match event {
+        let events = event::listen_with(|event, status, id| match event {
             Event::Window(window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
             Event::Window(window::Event::Unfocused) => Some(Message::DragCancelled),
             Event::Window(window::Event::Opened { size, .. })
@@ -2450,7 +2467,17 @@ impl Session {
                 keyboard_message(key, modifiers, status)
             }
             _ => None,
-        })
+        });
+        // Tique só enquanto a primeira aba carrega: a barra indeterminada
+        // (view.rs) precisa de repintura; parado o app não redesenha à toa.
+        if matches!(self, Session::Loading { .. }) {
+            iced::Subscription::batch([
+                events,
+                iced::time::every(LOADING_TICK).map(|_| Message::LoadingTick),
+            ])
+        } else {
+            events
+        }
     }
 
     pub fn begin_open(&mut self, source: OpenSource) -> Task<Message> {
@@ -2476,6 +2503,7 @@ impl Session {
                     gen,
                     theme,
                     render_scale,
+                    phase: 0,
                 };
             }
         }
@@ -6398,6 +6426,7 @@ mod tests {
             gen: 1,
             theme: Theme::Dark,
             render_scale: 1.0,
+            phase: 0,
         };
         apply(
             &mut session,
@@ -6409,6 +6438,28 @@ mod tests {
             }
             other => panic!("expected Loading, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn loading_tick_advances_and_wraps_the_bar_phase() {
+        isolated(|| {
+            let mut session = Session::open_path(PathBuf::from("/tmp/direct.pdf"));
+            apply(&mut session, Message::LoadingTick);
+            apply(&mut session, Message::LoadingTick);
+            match &session {
+                Session::Loading { phase, .. } => assert_eq!(*phase, 2),
+                other => panic!("expected Loading, got {other:?}"),
+            }
+            // Abertura longa (u16::MAX tiques ≈ 1,6 h): `wrapping_add` não estoura.
+            if let Session::Loading { phase, .. } = &mut session {
+                *phase = u16::MAX;
+            }
+            apply(&mut session, Message::LoadingTick);
+            match &session {
+                Session::Loading { phase, .. } => assert_eq!(*phase, 0),
+                other => panic!("expected Loading, got {other:?}"),
+            }
+        });
     }
 
     #[test]
