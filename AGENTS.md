@@ -12,7 +12,7 @@ Antes de propor ou implementar uma mudança, pergunte: isso deixa ler, anotar, m
 
 - `src/`, `src-tauri/` are legacy (Tauri/React). NEVER extend. Bugfix only with explicit permission.
 - NEVER hand-roll crypto. Signatures live in `crates/tsuro-sign` (CMS engine over `rsa`/`x509-parser`); use it, don't reimplement.
-- Fixtures in `public/samples/` (`guia-folio.pdf`, `contrato-assinado.pdf`) are read-only test inputs. NEVER overwrite — regenerate via `scripts/generate_samples.py`.
+- Fixtures in `public/samples/` (`guia-folio.pdf`, `sumario-folio.pdf`, `contrato-assinado.pdf`) are read-only test inputs. NEVER overwrite — regenerate via `scripts/generate_samples.py`.
 
 ## Stack
 
