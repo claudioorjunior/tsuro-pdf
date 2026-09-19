@@ -4009,8 +4009,10 @@ mod tests {
                 quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
             }],
         });
-        let file =
-            std::env::temp_dir().join(format!("tsuro-positions-unit-{}-search", std::process::id()));
+        let file = std::env::temp_dir().join(format!(
+            "tsuro-positions-unit-{}-search",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&file);
         crate::positions::with_positions_path(file.clone(), || {
             let mut session = Session::Ready(ready);
@@ -5158,7 +5160,9 @@ mod tests {
         ready.view_rotation = 1;
         assert_eq!(
             ready.zoom_step_factor(),
-            Zoom::Page.scale(ready.viewport, ready.rotated_media(page)).factor()
+            Zoom::Page
+                .scale(ready.viewport, ready.rotated_media(page))
+                .factor()
         );
         // Página não quadrada: girar muda o ajuste, então o passo de +/− tem
         // de partir do fator girado (antes partia do original e o + encolhia).
@@ -5190,10 +5194,7 @@ mod tests {
         let middle = layer.glyphs.len() / 2;
         let Some(k) = (middle..layer.glyphs.len()).chain(0..middle).find(|&i| {
             let (start, end) = glyph_byte_range(&layer, i);
-            !layer
-                .slice(TextRange { start, end })
-                .trim()
-                .is_empty()
+            !layer.slice(TextRange { start, end }).trim().is_empty()
         }) else {
             return;
         };
