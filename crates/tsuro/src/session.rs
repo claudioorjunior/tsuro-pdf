@@ -410,6 +410,10 @@ pub(crate) fn clamp_postit(pos: [f32; 2], size: [f32; 2], window: [f32; 2]) -> [
         axis(pos[1], size[1], window[1]),
     ]
 }
+/// Mini-toolbar da seleção (issue #51): respiro até o trecho e tamanho fixo
+/// (4 botões de ícone) para o clamp contra a janela.
+pub(crate) const SEL_BAR_GAP: f32 = 8.0;
+pub(crate) const SEL_BAR_SIZE: [f32; 2] = [148.0, 36.0];
 
 /// Lado mínimo/máximo do marcador compacto da nota (px CSS).
 pub(crate) const NOTE_MARKER_MIN_PX: f32 = 6.0;
@@ -3409,6 +3413,36 @@ impl Ready {
         ];
         clamp_postit(pos, size, [self.viewport.width, self.viewport.height])
     }
+    /// Canto da mini-toolbar da seleção na janela (`None` sem seleção com
+    /// texto): centrada no trecho, acima dele, abaixo se não couber, presa à
+    /// janela. Mesma matemática do canvas (`display_rect` + origem da folha
+    /// menos a rolagem desde o press).
+    pub(crate) fn selection_bar_pos(&self) -> Option<[f32; 2]> {
+        let (page, quads) = self.selection_quads()?;
+        let [cw, ch] = self.sheet_size(page);
+        let media = self.media(page);
+        let mut bb = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+        for q in &quads {
+            let [x, y, w, h] = display_rect(*q, media, self.view_rotation, cw, ch);
+            bb[0] = bb[0].min(x);
+            bb[1] = bb[1].min(y);
+            bb[2] = bb[2].max(x + w);
+            bb[3] = bb[3].max(y + h);
+        }
+        let scrolled = self.doc_scroll_y - self.sheet_scroll;
+        let cx = self.sheet_at[0] + (bb[0] + bb[2]) / 2.0;
+        let top = self.sheet_at[1] + bb[1] - scrolled;
+        let y = if top - SEL_BAR_GAP - SEL_BAR_SIZE[1] >= POSTIT_MARGIN {
+            top - SEL_BAR_GAP - SEL_BAR_SIZE[1]
+        } else {
+            self.sheet_at[1] + bb[3] - scrolled + SEL_BAR_GAP
+        };
+        Some(clamp_postit(
+            [cx - SEL_BAR_SIZE[0] / 2.0, y],
+            SEL_BAR_SIZE,
+            [self.viewport.width, self.viewport.height],
+        ))
+    }
 
     /// Abre a edição de uma nota existente (clique sobre o marcador): ancora
     /// o draft no trecho dela com o texto atual, sem tocar na seleção (o
@@ -5937,6 +5971,191 @@ mod tests {
             ready.postit_pos([2000.0, 2000.0]),
             [POSTIT_MARGIN, POSTIT_MARGIN]
         );
+    }
+    #[test]
+    fn selection_bar_hidden_without_selection() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        assert_eq!(ready.selection_bar_pos(), None);
+    }
+
+    #[test]
+    fn selection_bar_anchors_above_and_clamps_to_window() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        let Some([x, y]) = ready.selection_bar_pos() else {
+            panic!("barra visível com seleção viva");
+        };
+        assert!(x >= POSTIT_MARGIN && x + SEL_BAR_SIZE[0] <= 800.0 - POSTIT_MARGIN);
+        assert!(y >= POSTIT_MARGIN && y + SEL_BAR_SIZE[1] <= 600.0 - POSTIT_MARGIN);
+    }
+
+    #[test]
+    fn selection_bar_hides_after_annotate_clears_selection() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        assert!(ready.selection_bar_pos().is_some());
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::Annotate(AnnotKind::Highlight));
+        let Session::Ready(tabs) = &session else {
+            panic!("sessão segue pronta");
+        };
+        assert_eq!(tabs.active().selection_bar_pos(), None);
+    }
+    fn select_first_glyphs(ready: &mut Ready, start: usize, end: usize) {
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start, end },
+        });
+    }
+
+    /// Caixa da seleção em CSS (mesma matemática da vista, só para o teste
+    /// conferir o ramo acima/abaixo e a centralização).
+    fn selection_box(ready: &Ready) -> [f32; 4] {
+        let (page, quads) = ready.selection_quads().expect("seleção viva");
+        let [cw, ch] = ready.sheet_size(page);
+        let media = ready.media(page);
+        let mut bb = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+        for q in &quads {
+            let [x, y, w, h] = display_rect(*q, media, ready.view_rotation, cw, ch);
+            bb[0] = bb[0].min(x);
+            bb[1] = bb[1].min(y);
+            bb[2] = bb[2].max(x + w);
+            bb[3] = bb[3].max(y + h);
+        }
+        bb
+    }
+
+    #[test]
+    fn selection_bar_empty_range_hides() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        select_first_glyphs(&mut ready, 0, 0);
+        assert!(ready.selection_quads().is_none());
+        assert_eq!(ready.selection_bar_pos(), None);
+    }
+
+    #[test]
+    fn selection_bar_below_when_no_room_above() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        select_first_glyphs(&mut ready, 0, 2);
+        // Trecho no topo da folha (folha em 0,0): sem respiro acima.
+        let bb = selection_box(&ready);
+        let [x, y] = ready.selection_bar_pos().expect("barra visível");
+        assert!((y - (bb[3] + SEL_BAR_GAP)).abs() < 0.01);
+        assert!(((x + SEL_BAR_SIZE[0] / 2.0) - (bb[0] + bb[2]) / 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn selection_bar_above_with_sheet_offset() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.sheet_at = [50.0, 200.0];
+        select_first_glyphs(&mut ready, 0, 2);
+        let bb = selection_box(&ready);
+        let top = 200.0 + bb[1];
+        let [x, y] = ready.selection_bar_pos().expect("barra visível");
+        assert!((y + SEL_BAR_SIZE[1] + SEL_BAR_GAP - top).abs() < 0.01);
+        assert!(((x + SEL_BAR_SIZE[0] / 2.0) - (50.0 + (bb[0] + bb[2]) / 2.0)).abs() < 0.01);
+    }
+    #[test]
+    fn selection_bar_follows_document_scroll() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 2000.0,
+        };
+        ready.sheet_at = [0.0, 500.0];
+        select_first_glyphs(&mut ready, 0, 2);
+        let before = ready.selection_bar_pos().expect("barra visível");
+        ready.doc_scroll_y += 100.0;
+        let after = ready.selection_bar_pos().expect("barra visível");
+        assert!((after[0] - before[0]).abs() < 0.01);
+        assert!((before[1] - after[1] - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn selection_bar_rotated_stays_in_window() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.view_rotation = 1;
+        select_first_glyphs(&mut ready, 0, 2);
+        let Some([x, y]) = ready.selection_bar_pos() else {
+            panic!("barra visível com seleção viva");
+        };
+        assert!(x >= POSTIT_MARGIN && x + SEL_BAR_SIZE[0] <= 800.0 - POSTIT_MARGIN);
+        assert!(y >= POSTIT_MARGIN && y + SEL_BAR_SIZE[1] <= 600.0 - POSTIT_MARGIN);
+    }
+
+    #[test]
+    fn selection_bar_all_mark_kinds_clear_selection() {
+        for kind in [
+            AnnotKind::Highlight,
+            AnnotKind::Underline,
+            AnnotKind::Strikeout,
+        ] {
+            let Some(mut ready) = sample_ready() else {
+                return;
+            };
+            select_first_glyphs(&mut ready, 0, 2);
+            let mut session = Session::Ready(Tabs::single(ready));
+            apply(&mut session, Message::Annotate(kind));
+            let Session::Ready(tabs) = &session else {
+                panic!("sessão segue pronta");
+            };
+            assert_eq!(tabs.active().selection_bar_pos(), None, "{kind:?} limpa");
+        }
+    }
+
+    #[test]
+    fn selection_bar_note_keeps_selection_and_opens_draft() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        select_first_glyphs(&mut ready, 0, 2);
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::Annotate(AnnotKind::Note));
+        let Session::Ready(tabs) = &session else {
+            panic!("sessão segue pronta");
+        };
+        // A seleção ancora o draft — a precedência da camada de nota sobre a
+        // barra vive na ordem dos braços em `chrome`, não aqui.
+        assert!(tabs.active().note_draft.is_some());
+        assert!(tabs.active().selection_bar_pos().is_some());
     }
 
     #[test]
