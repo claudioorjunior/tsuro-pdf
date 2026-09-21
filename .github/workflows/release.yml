@@ -70,17 +70,16 @@ jobs:
           sha256sum * | tee SHA256SUMS
           NOTES="$(mktemp)"
           cat >"$NOTES" <<EOF
-          TsuroPDF ${GITHUB_REF_NAME} — navegação, impressão e modos de leitura
+          TsuroPDF ${GITHUB_REF_NAME} — redesign, abas e anotações
 
-          Novidades desde a v0.1.1:
+          Novidades desde a v0.2.0:
 
-          - **Ir para a página**: clique no número da página e digite o destino. Atalhos PgUp/PgDn/Home/End e setas; pré-render direcional das páginas vizinhas (cache ≤ 64 MiB).
-          - **Impressão própria**: diálogo com pré-visualização, impressora, intervalo de páginas, cópias e orientação. Monta um PDF de impressão (~200 DPI, página como imagem via XObject compartilhado) e envia direto para a fila (CUPS no Mac, winspool no Windows).
-          - **Girar vista (R)**: gira só a exibição em passos de 90° — o arquivo não é alterado e a impressão sai sem rotação.
-          - **Retomar leitura**: reabrir um documento volta à última página lida (posição salva por arquivo). Voltar/avançar percorre o histórico de páginas visitadas.
-          - **Rolagem contínua**: alterna entre página única e rolagem contínua do documento inteiro.
-          - **Sumário**: PDFs com sumário ganham a aba Sumário no painel lateral — árvore clicável com expandir/colapsar e salto para a seção.
-          - **Botão início + ícone novo**: volta para a tela inicial com ícone Ori em origami; ícone novo do app (tsuru sobre fundo Kiri).
+          - **Redesign Stitch**: chrome de 1 linha, tema escuro padrão, ícones Ori próprios, sem gradientes.
+          - **Abas**: vários documentos numa janela, cada um com página, zoom e histórico próprios.
+          - **Marcar texto**: destaque, sublinhado e riscado com undo/redo; **post-its** arrastáveis com editor; **mini-toolbar** grudada na seleção.
+          - **Barra de loading**: abertura de documento com progresso indeterminado e dicas de atalho.
+          - **Sumário navegável pelo teclado** (setas + Enter) e **retomar leitura** com modo e histórico por arquivo.
+          - **Zoom +/- a partir do ajuste girado** e teto de memória no cache de miniaturas (LRU 16 MiB).
           EOF
           # PRs mergeadas com @autores (visibilidade open-source; rodapé Full
           # Changelog próprio do template, então filtra o gerado). Falha aqui
@@ -96,7 +95,7 @@ jobs:
           } >>"$NOTES"
           cat >>"$NOTES" <<EOF
 
-          **Full Changelog**: https://github.com/claudioorjunior/tsuro-pdf/compare/v0.1.1...${GITHUB_REF_NAME}
+          **Full Changelog**: https://github.com/claudioorjunior/tsuro-pdf/compare/v0.2.0...${GITHUB_REF_NAME}
 
           Instalação:
 
