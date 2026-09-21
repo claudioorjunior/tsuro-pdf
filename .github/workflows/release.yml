@@ -15,6 +15,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: oven-sh/setup-bun@v2
+      # O gate pdfium_binds_when_ci_requires_it exige a lib sob CI (mesmo
+      # padrão do pr.yml: baixa o asset e planta ao lado do binário de teste).
+      - name: Pdfium
+        shell: bash
+        env:
+          PDFIUM_RELEASE: chromium/8044
+        run: |
+          curl -fsSL --max-time 180 -o pdfium.tgz \
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_RELEASE}/pdfium-mac-arm64.tgz"
+          mkdir -p pdfium-extract
+          tar xzf pdfium.tgz -C pdfium-extract
+          FOUND="$(find pdfium-extract -name 'libpdfium.dylib' -type f | head -n 1)"
+          test -n "$FOUND"
+          cargo test -p tsuro --lib --no-run -- --test-threads=1
+          for dest in target/debug/deps target/debug/Frameworks target/debug; do
+            mkdir -p "$dest"
+            cp "$FOUND" "$dest/libpdfium.dylib"
+          done
       - name: Testes Rust
         shell: bash
         run: |
@@ -35,6 +53,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Pdfium
+        shell: bash
+        env:
+          PDFIUM_RELEASE: chromium/8044
+        run: |
+          curl -fsSL --max-time 180 -o pdfium.tgz \
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_RELEASE}/pdfium-win-x64.tgz"
+          mkdir -p pdfium-extract
+          tar xzf pdfium.tgz -C pdfium-extract
+          FOUND="$(find pdfium-extract -name 'pdfium.dll' -type f | head -n 1)"
+          test -n "$FOUND"
+          cargo test -p tsuro --lib --no-run -- --test-threads=1
+          for dest in target/debug/deps target/debug; do
+            mkdir -p "$dest"
+            cp "$FOUND" "$dest/pdfium.dll"
+          done
       - name: Testes Rust
         shell: bash
         run: |
