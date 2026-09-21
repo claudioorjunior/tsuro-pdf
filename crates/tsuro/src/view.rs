@@ -108,6 +108,13 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
         Session::Ready(ready) if ready.overflow_open => {
             stack![main, overflow_layer(ready, t)].into()
         }
+        // Mini-toolbar da seleção (issue #51): sem dim nem captura — só os
+        // quatro botões recebem clique, o resto atravessa para a folha. Os
+        // diálogos acima têm precedência; `Annotate` limpa a seleção e a
+        // barra some sozinha.
+        Session::Ready(ready) if ready.selection_bar_pos().is_some() => {
+            stack![main, selection_bar_layer(ready, t)].into()
+        }
         _ => main.into(),
     }
 }
@@ -996,6 +1003,53 @@ fn note_layer(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             left: x,
         });
     stack![mouse_area(dim).on_press(Message::NoteCancel), card,].into()
+}
+/// Mini-toolbar da seleção (issue #51): os mesmos quatro `Annotate` da topbar
+/// num segmento flutuante ancorado no trecho. Sem dim: o cartão posicionado
+/// por padding não captura clique fora dos botões. Folha sempre branca, então
+/// o segmento usa o estilo da barra em qualquer tema.
+fn selection_bar_layer(ready: &Ready, t: Tokens) -> Element<'_, Message> {
+    let Some([x, y]) = ready.selection_bar_pos() else {
+        return Space::with_width(Length::Fill).into();
+    };
+    let seg = |icon: Element<'static, Message>, label: &'static str, kind| {
+        tip(
+            control_seg(t, button(icon).on_press(Message::Annotate(kind))),
+            label,
+        )
+    };
+    let bar = container(
+        row![
+            seg(
+                kiri::ori!("highlighter"),
+                "Destacar (H)",
+                AnnotKind::Highlight
+            ),
+            seg(
+                kiri::ori!("underline"),
+                "Sublinhar (U)",
+                AnnotKind::Underline
+            ),
+            seg(kiri::ori!("strike"), "Riscar (S)", AnnotKind::Strikeout),
+            seg(kiri::ori!("note"), "Nota (N)", AnnotKind::Note),
+        ]
+        .spacing(0)
+        .align_y(Alignment::Center),
+    )
+    .padding(2)
+    .style(kiri::bar_mark_style(t));
+    container(bar)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Start)
+        .align_y(Alignment::Start)
+        .padding(Padding {
+            top: y,
+            right: 0.0,
+            bottom: 0.0,
+            left: x,
+        })
+        .into()
 }
 
 /// Cartão do post-it: rótulo caps + editor multilinha + rodapé com o vermelho
