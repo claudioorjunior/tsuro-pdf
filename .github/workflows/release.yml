@@ -104,16 +104,11 @@ jobs:
           sha256sum * | tee SHA256SUMS
           NOTES="$(mktemp)"
           cat >"$NOTES" <<EOF
-          TsuroPDF ${GITHUB_REF_NAME} — redesign, abas e anotações
+          TsuroPDF ${GITHUB_REF_NAME} — correção do histórico na rolagem contínua
 
-          Novidades desde a v0.2.0:
+          Novidades desde a v0.3.0:
 
-          - **Redesign Stitch**: chrome de 1 linha, tema escuro padrão, ícones Ori próprios, sem gradientes.
-          - **Abas**: vários documentos numa janela, cada um com página, zoom e histórico próprios.
-          - **Marcar texto**: destaque, sublinhado e riscado com undo/redo; **post-its** arrastáveis com editor; **mini-toolbar** grudada na seleção.
-          - **Barra de loading**: abertura de documento com progresso indeterminado e dicas de atalho.
-          - **Sumário navegável pelo teclado** (setas + Enter) e **retomar leitura** com modo e histórico por arquivo.
-          - **Zoom +/- a partir do ajuste girado** e teto de memória no cache de miniaturas (LRU 16 MiB).
+          - **Histórico na rolagem contínua**: Voltar, Avançar e o salto do sumário agora movem a folha junto com a página, como setas, busca e "ir para página" já faziam.
           EOF
           # PRs mergeadas com @autores (visibilidade open-source; rodapé Full
           # Changelog próprio do template, então filtra o gerado). Falha aqui
@@ -129,7 +124,7 @@ jobs:
           } >>"$NOTES"
           cat >>"$NOTES" <<EOF
 
-          **Full Changelog**: https://github.com/claudioorjunior/tsuro-pdf/compare/v0.2.0...${GITHUB_REF_NAME}
+          **Full Changelog**: https://github.com/claudioorjunior/tsuro-pdf/compare/v0.3.0...${GITHUB_REF_NAME}
 
           Instalação:
 
