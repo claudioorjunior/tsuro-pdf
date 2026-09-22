@@ -2420,13 +2420,13 @@ impl Session {
                 if let Session::Ready(ready) = self {
                     ready.history_go(false);
                 }
-                self.schedule_work()
+                Task::batch([self.schedule_work(), self.nav_follow_active()])
             }
             Message::HistoryForward => {
                 if let Session::Ready(ready) = self {
                     ready.history_go(true);
                 }
-                self.schedule_work()
+                Task::batch([self.schedule_work(), self.nav_follow_active()])
             }
             Message::DocScrolled(y) => {
                 if let Session::Ready(ready) = self {
@@ -2829,7 +2829,7 @@ impl Session {
         if let Session::Ready(ready) = self {
             ready.navigate_to(page);
         }
-        self.schedule_work()
+        Task::batch([self.schedule_work(), self.nav_follow_active()])
     }
 
     fn schedule_work(&mut self) -> Task<Message> {
@@ -3870,6 +3870,9 @@ impl Ready {
         self.visible = target;
         self.bump_render_gen();
         self.sync_page_input();
+        if self.view_mode == ViewMode::Continuous {
+            self.doc_scroll_y = self.page_offset(self.visible);
+        }
         true
     }
 
@@ -4994,6 +4997,51 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Rolagem contínua: voltar/avançar deixa o offset na página visitada.
+    /// Sem isso `visible` muda e o próximo `DocScrolled` (offset antigo) desfaz a visita.
+    #[test]
+    fn history_in_continuous_aligns_scroll_with_the_page() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        if ready.page_count() < 2 {
+            return;
+        }
+        let last = PageNo::from_index(ready.page_count() - 1);
+        let file = std::env::temp_dir().join(format!(
+            "tsuro-positions-unit-{}-hist-scroll",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        crate::positions::with_positions_path(file.clone(), || {
+            let mut session = Session::Ready(Tabs::single(ready));
+            apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
+            apply(&mut session, Message::Nav(NavCmd::GoTo(last)));
+            let landed = match &session {
+                Session::Ready(r) => r.page_offset(r.visible),
+                _ => unreachable!(),
+            };
+            apply(&mut session, Message::DocScrolled(landed));
+            apply(&mut session, Message::HistoryBack);
+            match &session {
+                Session::Ready(r) => {
+                    assert_eq!(r.visible, PageNo::first());
+                    assert_eq!(r.doc_scroll_y, r.page_offset(r.visible));
+                }
+                _ => unreachable!(),
+            }
+            apply(&mut session, Message::HistoryForward);
+            match &session {
+                Session::Ready(r) => {
+                    assert_eq!(r.visible, last);
+                    assert_eq!(r.doc_scroll_y, r.page_offset(r.visible));
+                }
+                _ => unreachable!(),
+            }
+        });
+        let _ = std::fs::remove_file(&file);
     }
 
     /// Pilha pura (sem documento/fixture): 1→5→3, voltar/avançar, colapso,
