@@ -474,6 +474,52 @@ pub(crate) fn clamped_marker_pt(pt: [f32; 2], media: MediaBox) -> [f32; 2] {
     ]
 }
 
+/// Destaques como Markdown para a área de transferência (issue #50): um item
+/// por marcação, em ordem de leitura (`page.index`, `range.start`). `None`
+/// sem itens — lista vazia ou só trechos sem texto (defensivo: a criação
+/// exige slice não-vazio). N 1-based como a UI (`index() + 1`).
+fn annotations_markdown(
+    doc_name: &str,
+    annotations: &[Annotation],
+    text: &[Option<TextLayer>],
+) -> Option<String> {
+    // Uma linha só: quebras do trecho/nota não quebram o item.
+    fn one_line(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let mut sorted: Vec<&Annotation> = annotations.iter().collect();
+    sorted.sort_by_key(|a| (a.page.index(), a.range.start));
+    let mut lines = vec![format!("## Destaques — {doc_name}"), String::new()];
+    for annot in sorted {
+        let quote = text
+            .get(annot.page.index() as usize)
+            .and_then(|layer| layer.as_ref())
+            .map(|layer| one_line(&layer.slice(annot.range)))
+            .unwrap_or_default();
+        if quote.is_empty() {
+            continue;
+        }
+        let n = annot.page.index() + 1;
+        let line = match annot.kind {
+            AnnotKind::Note if !annot.text.trim().is_empty() => {
+                format!(
+                    "- p.{n} — \"{quote}\" — Nota: \"{}\"",
+                    one_line(&annot.text)
+                )
+            }
+            AnnotKind::Note => format!("- p.{n} — \"{quote}\" _(nota)_"),
+            AnnotKind::Highlight => format!("- p.{n} — \"{quote}\" _(destaque)_"),
+            AnnotKind::Underline => format!("- p.{n} — \"{quote}\" _(sublinhado)_"),
+            AnnotKind::Strikeout => format!("- p.{n} — \"{quote}\" _(riscado)_"),
+        };
+        lines.push(line);
+    }
+    if lines.len() <= 2 {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Hit {
     pub page: PageNo,
@@ -1370,6 +1416,8 @@ pub enum Message {
         page_pt: [f32; 2],
     },
     CopySelection,
+    /// ⋯/M: destaques como Markdown na área de transferência; ignora sem itens.
+    CopyAnnotations,
     /// Marca a seleção atual (H/U/S ou menu ⋯); ignora sem seleção.
     Annotate(AnnotKind),
     /// Janela perdeu o foco no meio do drag: o Up nunca chega, então a
@@ -1847,6 +1895,25 @@ impl Session {
                     ready.overflow_open = false;
                     if let Some(text) = ready.selection_plain_text() {
                         return clipboard::write(text);
+                    }
+                }
+                Task::none()
+            }
+            Message::CopyAnnotations => {
+                if let Session::Ready(ready) = self {
+                    ready.overflow_open = false;
+                    if !ready.annotations.is_empty() {
+                        let source = ready.source.path();
+                        let name = source
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| source.display().to_string());
+                        if let Some(md) =
+                            annotations_markdown(&name, &ready.annotations, &ready.pages.text)
+                        {
+                            ready.save_status = Some("Destaques copiados como Markdown.".into());
+                            return clipboard::write(md);
+                        }
                     }
                 }
                 Task::none()
@@ -3012,6 +3079,8 @@ pub(crate) fn keyboard_message(
         // N abre o rascunho de nota da seleção (handler ignora sem seleção
         // com texto; com draft já aberto é no-op para não apagar o digitado).
         Key::Character("n" | "N") => Some(Message::Annotate(AnnotKind::Note)),
+        // M copia os destaques como Markdown (o handler ignora sem anotações).
+        Key::Character("m" | "M") => Some(Message::CopyAnnotations),
         // Sem diálogo aberto o handler ignora; com foco em campo, o iced captura antes.
         Key::Named(Named::Escape) => Some(Message::ClosePrintDialog),
         // ↑/↓ e Enter andam/saltam na árvore do sumário; sem a aba aberta o
@@ -5205,6 +5274,164 @@ mod tests {
         ));
         // Com foco em campo o iced captura antes (guarda de foco).
         assert!(keyboard_message(Key::Character("h".into()), plain, Status::Captured).is_none());
+    }
+
+    /// Anotação fake direta (a função pura não precisa de fixture).
+    fn fake_annot(
+        id: u64,
+        page: u32,
+        start: usize,
+        end: usize,
+        kind: AnnotKind,
+        text: &str,
+    ) -> Annotation {
+        Annotation {
+            id,
+            page: PageNo::from_index(page),
+            range: TextRange { start, end },
+            quads: Vec::new(),
+            kind,
+            text: text.into(),
+            marker: None,
+        }
+    }
+
+    fn fake_layer(page: u32, plain: &str) -> Option<TextLayer> {
+        Some(TextLayer {
+            page: PageNo::from_index(page),
+            plain: plain.into(),
+            glyphs: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn copy_annotations_sorts_and_labels_by_kind() {
+        let text = vec![
+            fake_layer(0, "primeiro trecho segundo"),
+            fake_layer(1, "outra pagina aqui"),
+        ];
+        // Fora de ordem de propósito: pág 1 antes da 0, fim antes do começo.
+        let annots = vec![
+            fake_annot(1, 1, 0, 12, AnnotKind::Underline, ""),
+            fake_annot(2, 0, 16, 23, AnnotKind::Strikeout, ""),
+            fake_annot(3, 0, 0, 8, AnnotKind::Highlight, ""),
+        ];
+        let md = annotations_markdown("guia.pdf", &annots, &text).unwrap();
+        assert_eq!(
+            md,
+            "## Destaques — guia.pdf\n\
+             \n\
+             - p.1 — \"primeiro\" _(destaque)_\n\
+             - p.1 — \"segundo\" _(riscado)_\n\
+             - p.2 — \"outra pagina\" _(sublinhado)_"
+        );
+    }
+
+    #[test]
+    fn copy_annotations_collapses_whitespace_to_one_line() {
+        let text = vec![fake_layer(0, "primeiro\n   trecho")];
+        let annots = vec![fake_annot(1, 0, 0, 18, AnnotKind::Highlight, "")];
+        let md = annotations_markdown("doc.pdf", &annots, &text).unwrap();
+        assert!(md.ends_with("- p.1 — \"primeiro trecho\" _(destaque)_"));
+    }
+
+    #[test]
+    fn copy_annotations_notes_with_and_without_text() {
+        let text = vec![fake_layer(0, "trecho citado")];
+        let annots = vec![
+            fake_annot(1, 0, 0, 6, AnnotKind::Note, "ver isso"),
+            // Fallback defensivo: `save_note_draft` descarta texto vazio, mas
+            // a forma existe caso uma nota sem texto apareça.
+            fake_annot(2, 0, 7, 13, AnnotKind::Note, ""),
+        ];
+        let md = annotations_markdown("doc.pdf", &annots, &text).unwrap();
+        assert_eq!(
+            md,
+            "## Destaques — doc.pdf\n\
+             \n\
+             - p.1 — \"trecho\" — Nota: \"ver isso\"\n\
+             - p.1 — \"citado\" _(nota)_"
+        );
+    }
+
+    #[test]
+    fn copy_annotations_skips_quoteless() {
+        let text = vec![fake_layer(0, "trecho")];
+        // Lista vazia.
+        assert!(annotations_markdown("doc.pdf", &[], &text).is_none());
+        // H/U/S sem citação (range vazio) e nota sem citação nem texto: nada
+        // para renderizar — `None`, não cabeçalho solitário.
+        let annots = vec![
+            fake_annot(1, 0, 0, 0, AnnotKind::Highlight, ""),
+            fake_annot(2, 0, 0, 0, AnnotKind::Note, ""),
+            fake_annot(3, 0, 0, 0, AnnotKind::Note, "sem trecho"),
+        ];
+        assert!(annotations_markdown("doc.pdf", &annots, &text).is_none());
+        // Camada ausente também rende citação vazia (pula, não quebra).
+        let missing: Vec<Option<TextLayer>> = vec![None];
+        let annots = vec![fake_annot(1, 0, 0, 6, AnnotKind::Highlight, "")];
+        assert!(annotations_markdown("doc.pdf", &annots, &missing).is_none());
+    }
+
+    #[test]
+    fn copy_annotations_handler_closes_overflow_and_sets_status() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        if ready.pages.text.is_empty() {
+            return;
+        }
+        ready.pages.text[0] = Some(TextLayer {
+            page: PageNo::first(),
+            plain: "ola mundo".into(),
+            glyphs: Vec::new(),
+        });
+        ready
+            .annotations
+            .push(fake_annot(1, 0, 0, 3, AnnotKind::Highlight, ""));
+        ready.overflow_open = true;
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::CopyAnnotations);
+        match &session {
+            Session::Ready(ready) => {
+                assert!(!ready.overflow_open);
+                assert_eq!(
+                    ready.save_status.as_deref(),
+                    Some("Destaques copiados como Markdown.")
+                );
+            }
+            _ => unreachable!(),
+        }
+        // Sem anotações: no-op (fecha o menu, sem status, sem clipboard).
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.overflow_open = true;
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::CopyAnnotations);
+        match &session {
+            Session::Ready(ready) => {
+                assert!(!ready.overflow_open);
+                assert!(ready.save_status.is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn copy_annotations_shortcut_maps_m_and_respects_focus() {
+        use iced::event::Status;
+        use iced::keyboard::Modifiers;
+        let plain = Modifiers::empty();
+        assert!(matches!(
+            keyboard_message(Key::Character("m".into()), plain, Status::Ignored),
+            Some(Message::CopyAnnotations)
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("M".into()), plain, Status::Ignored),
+            Some(Message::CopyAnnotations)
+        ));
+        assert!(keyboard_message(Key::Character("m".into()), plain, Status::Captured).is_none());
     }
 
     #[test]

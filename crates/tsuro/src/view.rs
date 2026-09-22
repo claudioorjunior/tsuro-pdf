@@ -682,6 +682,15 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             false,
         ));
     }
+    if !ready.annotations.is_empty() {
+        items = items.push(menu_item(
+            t,
+            "copy",
+            "Copiar destaques como Markdown",
+            Message::CopyAnnotations,
+            false,
+        ));
+    }
     if ready.can_annot_undo() {
         items = items.push(menu_item(
             t,
