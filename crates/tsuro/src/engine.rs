@@ -1135,6 +1135,63 @@ mod tests {
         assert_eq!(err.0, ANNOT_PAGE_OUT_OF_RANGE);
     }
 
+    /// Segunda cópia na mesma sessão grava o mesmo conjunto. O documento vivo
+    /// da worker não recebe as marcações.
+    #[test]
+    fn save_copy_twice_keeps_one_mark_and_leaves_the_open_document() {
+        let Some(bytes) = sample_pdf_bytes() else {
+            return;
+        };
+        let Ok(engine) = PdfiumEngine::open(bytes) else {
+            return;
+        };
+        let page = PageNo::first();
+        let (_, text) = engine.page_data(page).expect("page data");
+        let quads: Vec<Quad> = text.glyphs.iter().take(3).map(|g| g.quad).collect();
+        if quads.is_empty() {
+            return;
+        }
+        let annotations = vec![Annotation {
+            id: 1,
+            page,
+            range: TextRange {
+                start: 0,
+                end: quads.len(),
+            },
+            quads,
+            kind: AnnotKind::Highlight,
+            text: String::new(),
+            marker: None,
+        }];
+        let live_before = engine.annotations(page).expect("anotações iniciais").len();
+
+        let first = engine.save_copy(&annotations).expect("primeira cópia");
+        assert_eq!(
+            engine.annotations(page).expect("vivo após a primeira").len(),
+            live_before,
+            "a primeira cópia não pode gravar no documento aberto"
+        );
+        let second = engine.save_copy(&annotations).expect("segunda cópia");
+        assert_eq!(
+            engine.annotations(page).expect("vivo após a segunda").len(),
+            live_before,
+            "a segunda cópia não pode gravar no documento aberto"
+        );
+        engine.close();
+
+        let count = |bytes: Vec<u8>| {
+            PdfiumEngine::open(Arc::from(bytes))
+                .expect("reabrir a cópia")
+                .annotations(page)
+                .expect("anotações da cópia")
+                .len()
+        };
+        let first_count = count(first);
+        let second_count = count(second);
+        assert_eq!(first_count, live_before + 1);
+        assert_eq!(second_count, first_count);
+    }
+
     fn assert_too_large(page_w: f32, page_h: f32, factor: f32) {
         let err = render_target_px(page_w, page_h, factor).unwrap_err();
         assert_eq!(err.0, RENDER_TOO_LARGE);
