@@ -28,6 +28,7 @@ use crate::print::{
     print_selection_pdf, write_and_open_print_pdf, PrintOrientation, PrintRange, PrintSelection,
     MAX_COPIES,
 };
+use crate::search::Search;
 use crate::spool::{list_printers, spool_pdf, PrinterInfo};
 
 pub(crate) const THUMB_WIDTH: f32 = 120.0;
@@ -139,159 +140,11 @@ pub enum ViewMode {
     Continuous,
 }
 
-#[derive(Debug, Clone)]
-pub struct Search {
-    query: String,
-    hits: Vec<Hit>,
-}
-
-impl Search {
-    pub fn query(&self) -> &str {
-        &self.query
-    }
-
-    pub fn hits(&self) -> &[Hit] {
-        &self.hits
-    }
-
-    fn derive(query: &str, pages: &[Option<TextLayer>]) -> Self {
-        if query.is_empty() {
-            return Search {
-                query: query.to_string(),
-                hits: Vec::new(),
-            };
-        }
-        let mut hits = Vec::new();
-        for layer in pages.iter().flatten() {
-            hits.extend(find_hits(query, layer));
-        }
-        hits.sort_by_key(|hit| (hit.page.index(), hit.range.start));
-        Search {
-            query: query.to_string(),
-            hits,
-        }
-    }
-
-    fn extend_page(&mut self, layer: &TextLayer) {
-        if self.query.is_empty() {
-            return;
-        }
-        let page_idx = layer.page.index();
-        self.hits.retain(|hit| hit.page != layer.page);
-        let mut page_hits = find_hits(&self.query, layer);
-        page_hits.sort_by_key(|hit| hit.range.start);
-        let pos = self
-            .hits
-            .partition_point(|hit| (hit.page.index(), hit.range.start) < (page_idx, 0));
-        self.hits.splice(pos..pos, page_hits);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LowerChar {
-    lower: char,
-    byte_start: usize,
-    byte_end: usize,
-}
-
-fn lower_plain_map(plain: &str) -> Vec<LowerChar> {
-    let mut mapped = Vec::new();
-    for (byte_start, ch) in plain.char_indices() {
-        let byte_end = byte_start + ch.len_utf8();
-        for lower in ch.to_lowercase() {
-            mapped.push(LowerChar {
-                lower,
-                byte_start,
-                byte_end,
-            });
-        }
-    }
-    mapped
-}
-
-fn case_insensitive_byte_ranges(plain: &str, needle: &str) -> Vec<(usize, usize)> {
-    let needle_chars: Vec<char> = needle.chars().flat_map(|ch| ch.to_lowercase()).collect();
-    if needle_chars.is_empty() {
-        return Vec::new();
-    }
-    let mapped = lower_plain_map(plain);
-    if mapped.len() < needle_chars.len() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + needle_chars.len() <= mapped.len() {
-        if mapped[i..i + needle_chars.len()]
-            .iter()
-            .zip(&needle_chars)
-            .all(|(entry, &nc)| entry.lower == nc)
-        {
-            let start = mapped[i].byte_start;
-            let end = mapped[i + needle_chars.len() - 1].byte_end;
-            out.push((start, end));
-            i += 1;
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-fn find_hits(query: &str, layer: &TextLayer) -> Vec<Hit> {
-    let ranges = case_insensitive_byte_ranges(&layer.plain, query);
-    let mut hits = Vec::with_capacity(ranges.len());
-    let mut glyph_idx = 0usize;
-    let mut byte_cursor = 0usize;
-    for (start, end) in ranges {
-        let quad =
-            quads_for_range_monotonic(&layer.glyphs, start, end, &mut glyph_idx, &mut byte_cursor);
-        hits.push(Hit {
-            page: layer.page,
-            range: TextRange { start, end },
-            quad,
-        });
-    }
-    hits
-}
-
-fn quads_for_range_monotonic(
-    glyphs: &[Glyph],
-    start: usize,
-    end: usize,
-    glyph_idx: &mut usize,
-    byte_cursor: &mut usize,
-) -> Quad {
-    while *glyph_idx < glyphs.len() {
-        let next = *byte_cursor + glyphs[*glyph_idx].cluster.len();
-        if next > start {
-            break;
-        }
-        *byte_cursor = next;
-        *glyph_idx += 1;
-    }
-    let mut acc: Option<Quad> = None;
-    let mut cursor = *byte_cursor;
-    for glyph in &glyphs[*glyph_idx..] {
-        let next = cursor + glyph.cluster.len();
-        if cursor < end && next > start {
-            acc = Some(match acc {
-                None => glyph.quad,
-                Some(q) => q.union(glyph.quad),
-            });
-        }
-        cursor = next;
-        if cursor >= end {
-            break;
-        }
-    }
-    acc.unwrap_or(Quad::from_rect(0.0, 0.0, 0.0, 0.0))
-}
-
 /// Quad de um range arbitrário (mesma origem dos hits de busca).
 pub(crate) fn quad_for_range(glyphs: &[Glyph], start: usize, end: usize) -> Quad {
     let mut glyph_idx = 0usize;
     let mut byte_cursor = 0usize;
-    quads_for_range_monotonic(glyphs, start, end, &mut glyph_idx, &mut byte_cursor)
+    crate::search::quads_for_range_monotonic(glyphs, start, end, &mut glyph_idx, &mut byte_cursor)
 }
 
 /// Um retângulo por linha do range (padrão dos leitores: nunca pintar o vão
@@ -521,13 +374,6 @@ fn annotations_markdown(
         return None;
     }
     Some(lines.join("\n"))
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Hit {
-    pub page: PageNo,
-    pub range: TextRange,
-    pub quad: Quad,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -780,6 +626,19 @@ pub struct Tabs {
     /// Falha ao abrir a aba pendente; a janela segue com as abas que tinha e
     /// a mensagem aparece na faixa de abas.
     open_error: Option<String>,
+    /// Fechar com marcações não salvas espera Cancelar, Descartar ou Salvar.
+    close_ask: Option<CloseTarget>,
+}
+
+/// Fechamento que ainda precisa de confirmação.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseTarget {
+    /// Home ou a última aba: volta para a tela vazia.
+    Document,
+    /// Uma aba; a janela fica.
+    Tab(usize),
+    /// O SO pediu para sair.
+    Quit(window::Id),
 }
 
 /// Altura reservada pela faixa de abas: zero com um documento só (a janela de
@@ -800,7 +659,12 @@ impl Tabs {
             active: 0,
             pending: None,
             open_error: None,
+            close_ask: None,
         }
+    }
+
+    pub(crate) fn close_prompt(&self) -> bool {
+        self.close_ask.is_some()
     }
 
     pub fn len(&self) -> usize {
@@ -965,6 +829,8 @@ pub struct Ready {
     next_annot_id: u64,
     /// Âncora do press (click-vs-drag no PointerUp); zera ao trocar de documento.
     press_anchor: Option<PressAnchor>,
+    /// Marcação escolhida pelo clique. Delete/Backspace remove. Clique não apaga.
+    selected_annot: Option<u64>,
     annot_undo: Vec<AnnotAction>,
     annot_redo: Vec<AnnotAction>,
     /// Rascunho de nota aberto (issue #30); zera ao abrir. Sem persistência na v1.
@@ -1009,6 +875,9 @@ pub struct Ready {
     open_gen: u64,
     /// Identidade (tamanho+mtime) na última leitura; o poll compara com o disco.
     disk_identity: Option<(u64, u64)>,
+    /// O arquivo no disco divergiu e a sessão tem (ou teve) trabalho não salvo.
+    /// O aviso fica fora de `save_status`. Recarregar é explícito.
+    disk_stale: bool,
     /// Reload do disco em voo (um por aba; a resposta chega em `Reloaded`).
     reload_inflight: bool,
     /// Invalidates in-flight renders on nav/zoom/DPI changes.
@@ -1501,6 +1370,8 @@ pub enum Message {
     LoadingTick,
     /// Poll de auto-reload (issue #46): compara cada aba com o disco.
     FileTick,
+    /// Recarrega a aba ativa do disco e descarta o trabalho da sessão.
+    ReloadDisk,
     /// Documento relido do disco; `identity` é a do tique que disparou.
     Reloaded {
         doc_gen: u64,
@@ -1517,6 +1388,14 @@ pub enum Message {
     CloseTabActive,
     /// Fecha a aba `usize` (o × da faixa de abas).
     CloseTab(usize),
+    /// Descarta as marcações e conclui o fechamento pedido.
+    CloseDiscard,
+    /// Volta ao documento.
+    CloseCancel,
+    /// Grava a cópia. Se não sobrar marcação suja, conclui o fechamento.
+    CloseSave,
+    /// O SO pediu para fechar a janela.
+    CloseWindow(window::Id),
     /// Troca a aba ativa (clique na faixa de abas).
     SelectTab(usize),
     /// Aba seguinte (`+1`) ou anterior (`-1`) — Ctrl+Tab / Ctrl+Shift+Tab.
@@ -1554,6 +1433,8 @@ pub enum Message {
     DragCancelled,
     AnnotUndo,
     AnnotRedo,
+    /// Remove a marcação selecionada (Delete/Backspace). Sem seleção, no-op.
+    DeleteSelectedAnnot,
     /// Edição no post-it aberto (o editor do iced manda a ação; o rascunho
     /// aplica e o texto vive em `NoteDraft.content`).
     NoteEdit(text_editor::Action),
@@ -1746,6 +1627,8 @@ impl Session {
                 Task::none()
             }
             // Auto-reload (issue #46): cada aba que mudou no disco relê o arquivo.
+            // Com trabalho não salvo, ou depois que o aviso já apareceu, espera
+            // o botão Recarregar — a linha de status fica livre para "Cópia salva".
             Message::FileTick => {
                 let Session::Ready(tabs) = self else {
                     return Task::none();
@@ -1756,25 +1639,33 @@ impl Session {
                         continue;
                     }
                     let current = file_identity(doc.source.path());
-                    let has_unsaved = !doc.annotations.is_empty() || doc.note_draft.is_some();
-                    if should_reload(doc.disk_identity, current, has_unsaved) {
-                        doc.reload_inflight = true;
-                        let doc_gen = doc.open_gen;
-                        let source = doc.source.clone();
-                        tasks.push(Task::perform(open_ready(source), move |result| {
-                            Message::Reloaded {
-                                doc_gen,
-                                result,
-                                identity: current,
-                            }
-                        }));
-                    } else if doc.disk_identity != current && has_unsaved {
-                        // Marcações/rascunho: recarregar destruiria trabalho não
-                        // salvo; avisa e espera (re-set idempotente, não pisca).
-                        doc.save_status = Some("O arquivo mudou no disco.".into());
+                    if doc.disk_identity == current {
+                        doc.disk_stale = false;
+                        continue;
+                    }
+                    if doc.unsaved() {
+                        doc.disk_stale = true;
+                        continue;
+                    }
+                    if doc.disk_stale {
+                        continue;
+                    }
+                    if should_reload(doc.disk_identity, current, false) {
+                        tasks.push(schedule_reload(doc, current));
                     }
                 }
                 Task::batch(tasks)
+            }
+            Message::ReloadDisk => {
+                let Session::Ready(tabs) = self else {
+                    return Task::none();
+                };
+                let doc = tabs.active_mut();
+                if doc.reload_inflight {
+                    return Task::none();
+                }
+                let current = file_identity(doc.source.path());
+                Task::batch([schedule_reload(doc, current)])
             }
             Message::Reloaded {
                 doc_gen,
@@ -1810,6 +1701,7 @@ impl Session {
                         // Adota a identidade atual: sem retry infinito na mesma
                         // versão; qualquer escrita futura muda de novo e re-tenta.
                         doc.disk_identity = identity;
+                        doc.disk_stale = false;
                         doc.save_status = Some("Falha ao recarregar.".into());
                     }
                 }
@@ -1853,6 +1745,24 @@ impl Session {
                 self.close_tab(index)
             }
             Message::CloseTab(index) => self.close_tab(index),
+            Message::CloseDiscard => {
+                let target = match self {
+                    Session::Ready(tabs) => tabs.close_ask.take(),
+                    _ => None,
+                };
+                match target {
+                    Some(target) => self.complete_close(target),
+                    None => Task::none(),
+                }
+            }
+            Message::CloseCancel => {
+                if let Session::Ready(tabs) = self {
+                    tabs.close_ask = None;
+                }
+                Task::none()
+            }
+            Message::CloseSave => self.close_save(),
+            Message::CloseWindow(id) => self.request_quit(id),
             Message::SelectTab(index) => self.select_tab(index),
             Message::CycleTab(step) => self.cycle_tab(step),
             Message::Nav(cmd) => {
@@ -1965,7 +1875,7 @@ impl Session {
                     let ready = tabs.active_mut();
                     ready.set_query(query);
                     // Primeiro hit, sem segurar o empréstimo da busca.
-                    if let Some(page) = ready.search.hits.first().map(|hit| hit.page) {
+                    if let Some(page) = ready.search.hits().first().map(|hit| hit.page) {
                         ready.navigate_to(page);
                     }
                     nav_follow(ready)
@@ -2062,20 +1972,24 @@ impl Session {
                         return crate::view::focus_postit();
                     }
                     // Clique (press+release sem arrasto): sobre marcação
-                    // remove; no vazio desseleciona; em glifo mantém a palavra.
+                    // seleciona; no vazio desseleciona; em glifo mantém a palavra.
                     // Arrasto só estende (já feito no PointerMove).
                     if let Some(anchor) = ready.press_anchor.clone() {
                         if Some(anchor.sel.clone()) == ready.selection {
                             if let Some(id) = ready.annotation_at(page, page_pt) {
-                                // Clique sobre nota abre a edição dela; as
-                                // demais marcações o clique remove.
+                                // Clique sobre nota abre a edição dela. As
+                                // demais marcações ficam selecionadas. Delete
+                                // é que remove.
                                 if ready.open_note_draft_for_id(id) {
+                                    ready.selected_annot = None;
                                     return crate::view::focus_postit();
-                                } else {
-                                    ready.remove_annotation(id);
                                 }
-                            } else if !anchor.exact {
-                                ready.selection = None;
+                                ready.selected_annot = Some(id);
+                            } else {
+                                ready.selected_annot = None;
+                                if !anchor.exact {
+                                    ready.selection = None;
+                                }
                             }
                         }
                     }
@@ -2134,6 +2048,16 @@ impl Session {
                     // A folha perdeu o mouse (solta fora dela, janela sem
                     // foco): soltar fora da página cancela o arrasto.
                     ready.note_drag = None;
+                }
+                Task::none()
+            }
+            Message::DeleteSelectedAnnot => {
+                if let Session::Ready(ready) = self {
+                    if ready.note_draft.is_none() {
+                        if let Some(id) = ready.selected_annot {
+                            ready.remove_annotation(id);
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -2358,6 +2282,10 @@ impl Session {
             }
             Message::ClosePrintDialog => {
                 if let Session::Ready(ready) = self {
+                    if ready.close_ask.is_some() {
+                        ready.close_ask = None;
+                        return Task::none();
+                    }
                     // Esc com rascunho de nota aberto também o fecha: o
                     // popover de nota não tem subscription própria e a
                     // função pura de teclas não vê estado (Esc → este
@@ -2643,6 +2571,7 @@ impl Session {
                 saved,
                 result,
             } => {
+                let saved_ok = result.is_ok();
                 if let Session::Ready(tabs) = self {
                     if let Some(ready) = tabs.by_gen(doc_gen) {
                         match result {
@@ -2666,7 +2595,11 @@ impl Session {
                         }
                     }
                 }
-                Task::none()
+                if saved_ok {
+                    self.finish_pending_close()
+                } else {
+                    Task::none()
+                }
             }
             Message::SetTheme(theme) => {
                 self.set_theme(theme);
@@ -2765,6 +2698,7 @@ impl Session {
     pub fn subscription(&self) -> iced::Subscription<Message> {
         let events = event::listen_with(|event, status, id| match event {
             Event::Window(window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
+            Event::Window(window::Event::CloseRequested) => Some(Message::CloseWindow(id)),
             Event::Window(window::Event::Unfocused) => Some(Message::DragCancelled),
             Event::Window(window::Event::Opened { size, .. })
             | Event::Window(window::Event::Resized(size)) => Some(Message::WindowMetrics {
@@ -2924,6 +2858,19 @@ impl Session {
     }
 
     fn close_document(&mut self) -> Task<Message> {
+        if self.blocks_close() {
+            return Task::none();
+        }
+        if self.any_unsaved() {
+            if let Session::Ready(tabs) = self {
+                tabs.close_ask = Some(CloseTarget::Document);
+            }
+            return Task::none();
+        }
+        self.finish_close_document()
+    }
+
+    fn finish_close_document(&mut self) -> Task<Message> {
         let recents = self.recents();
         let theme = self.theme();
         let open_gen = self.open_gen();
@@ -2948,12 +2895,22 @@ impl Session {
     /// Fecha a aba `index` (⌘W ou o × da faixa). A última aba fecha a janela,
     /// como sempre: `Empty` com os recentes preservados.
     fn close_tab(&mut self, index: usize) -> Task<Message> {
-        if self.modal_open() {
+        if self.blocks_close() {
             return Task::none();
         }
         if matches!(self, Session::Ready(tabs) if tabs.len() == 1) {
             return self.close_document();
         }
+        if self.tab_unsaved(index) {
+            if let Session::Ready(tabs) = self {
+                tabs.close_ask = Some(CloseTarget::Tab(index));
+            }
+            return Task::none();
+        }
+        self.finish_close_tab(index)
+    }
+
+    fn finish_close_tab(&mut self, index: usize) -> Task<Message> {
         let Some(tabs) = self.tabs_mut() else {
             return Task::none();
         };
@@ -2962,6 +2919,103 @@ impl Session {
         }
         tabs.remove(index).close_engine();
         Task::batch([self.schedule_work(), self.nav_follow_active()])
+    }
+
+    fn complete_close(&mut self, target: CloseTarget) -> Task<Message> {
+        match target {
+            CloseTarget::Document => self.finish_close_document(),
+            CloseTarget::Tab(index) => self.finish_close_tab(index),
+            CloseTarget::Quit(id) => window::close(id),
+        }
+    }
+
+    /// Cópia gravada no meio de um fechamento: segue se o alvo ficou limpo.
+    fn finish_pending_close(&mut self) -> Task<Message> {
+        let target = match self {
+            Session::Ready(tabs) => {
+                let Some(target) = tabs.close_ask else {
+                    return Task::none();
+                };
+                let clean = match target {
+                    CloseTarget::Tab(index) => {
+                        tabs.docs.get(index).is_some_and(|doc| !doc.unsaved())
+                    }
+                    CloseTarget::Document | CloseTarget::Quit(_) => {
+                        tabs.docs.iter().all(|doc| !doc.unsaved())
+                    }
+                };
+                if !clean {
+                    return Task::none();
+                }
+                tabs.close_ask = None;
+                target
+            }
+            _ => return Task::none(),
+        };
+        self.complete_close(target)
+    }
+
+    fn close_save(&mut self) -> Task<Message> {
+        let Session::Ready(tabs) = self else {
+            return Task::none();
+        };
+        let Some(target) = tabs.close_ask else {
+            return Task::none();
+        };
+        let index = match target {
+            CloseTarget::Tab(index) => index,
+            CloseTarget::Document | CloseTarget::Quit(_) => tabs
+                .docs
+                .iter()
+                .position(|doc| doc.unsaved())
+                .unwrap_or(tabs.active),
+        };
+        tabs.select(index);
+        let ready = tabs.active_mut();
+        ready.overflow_open = false;
+        if ready.annotations.is_empty() {
+            ready.save_status = Some("Nada para salvar — marque o texto primeiro.".into());
+            return Task::none();
+        }
+        if needs_sign_warning(&ready.signatures) {
+            ready.save_warning = true;
+            return Task::none();
+        }
+        start_save_dialog(ready)
+    }
+
+    fn request_quit(&mut self, id: window::Id) -> Task<Message> {
+        if self.any_unsaved() {
+            if let Session::Ready(tabs) = self {
+                tabs.close_ask = Some(CloseTarget::Quit(id));
+            }
+            return Task::none();
+        }
+        window::close(id)
+    }
+
+    fn any_unsaved(&self) -> bool {
+        match self {
+            Session::Ready(tabs) => tabs.docs().iter().any(|doc| doc.unsaved()),
+            _ => false,
+        }
+    }
+
+    fn tab_unsaved(&self, index: usize) -> bool {
+        match self {
+            Session::Ready(tabs) => tabs.docs().get(index).is_some_and(|doc| doc.unsaved()),
+            _ => false,
+        }
+    }
+
+    /// Impressão, aviso de assinatura ou o próprio pedido de fechar capturam
+    /// o fechamento. O rascunho de nota não: ele é trabalho não salvo.
+    fn blocks_close(&self) -> bool {
+        matches!(
+            self,
+            Session::Ready(tabs)
+                if tabs.print_dialog.is_some() || tabs.save_warning || tabs.close_ask.is_some()
+        )
     }
 
     /// Troca a aba ativa (clique na faixa).
@@ -3003,8 +3057,8 @@ impl Session {
     /// assinado): trocar ou fechar aba por baixo prenderia o estado na aba de
     /// origem — a resposta assíncrona voltaria para uma aba que saiu da tela.
     fn modal_open(&self) -> bool {
-        matches!(self, Session::Ready(tabs)
-            if tabs.print_dialog.is_some() || tabs.note_draft.is_some() || tabs.save_warning)
+        self.blocks_close()
+            || matches!(self, Session::Ready(tabs) if tabs.note_draft.is_some() || tabs.close_prompt())
     }
 
     /// `nav_follow` do documento ativo (sem aba aberta é `Task::none`).
@@ -3285,6 +3339,7 @@ pub(crate) fn keyboard_message(
         Key::Character("n" | "N") => Some(Message::Annotate(AnnotKind::Note)),
         // M copia os destaques como Markdown (o handler ignora sem anotações).
         Key::Character("m" | "M") => Some(Message::CopyAnnotations),
+        Key::Named(Named::Delete | Named::Backspace) => Some(Message::DeleteSelectedAnnot),
         // Sem diálogo aberto o handler ignora; com foco em campo, o iced captura antes.
         Key::Named(Named::Escape) => Some(Message::ClosePrintDialog),
         // ↑/↓ e Enter andam/saltam na árvore do sumário; sem a aba aberta o
@@ -3312,6 +3367,18 @@ impl Ready {
 
     pub(crate) fn marks_dirty(&self) -> bool {
         self.annotations != self.saved_marks
+    }
+
+    fn unsaved(&self) -> bool {
+        self.marks_dirty() || self.note_draft.is_some()
+    }
+
+    pub(crate) fn selected_annot(&self) -> Option<u64> {
+        self.selected_annot
+    }
+
+    pub(crate) fn disk_stale(&self) -> bool {
+        self.disk_stale
     }
 
     /// Solta o documento na worker do motor (aba fechada, issue #40). Os
@@ -3805,7 +3872,7 @@ impl Ready {
         true
     }
 
-    /// Remove por id (clique sobre nota abre edição, não remove); `false` se não existe.
+    /// Remove por id; `false` se não existe. Clique seleciona. Delete chama isto.
     pub(crate) fn remove_annotation(&mut self, id: u64) -> bool {
         let Some(annot) = self.annotations.iter().find(|a| a.id == id).cloned() else {
             return false;
@@ -3813,6 +3880,9 @@ impl Ready {
         self.apply_annot_action(AnnotAction::Remove(annot.clone()));
         self.annot_undo.push(AnnotAction::Remove(annot));
         self.annot_redo.clear();
+        if self.selected_annot == Some(id) {
+            self.selected_annot = None;
+        }
         true
     }
 
@@ -3929,6 +3999,7 @@ impl Ready {
         };
         self.apply_annot_action(inverse);
         self.annot_redo.push(action);
+        self.drop_stale_selection();
         true
     }
 
@@ -3938,7 +4009,17 @@ impl Ready {
         };
         self.apply_annot_action(action.clone());
         self.annot_undo.push(action);
+        self.drop_stale_selection();
         true
+    }
+
+    fn drop_stale_selection(&mut self) {
+        if self
+            .selected_annot
+            .is_some_and(|id| !self.annotations.iter().any(|annot| annot.id == id))
+        {
+            self.selected_annot = None;
+        }
     }
 
     pub(crate) fn can_annot_undo(&self) -> bool {
@@ -4523,6 +4604,7 @@ impl Document {
             annotations: Vec::new(),
             next_annot_id: 0,
             press_anchor: None,
+            selected_annot: None,
             annot_undo: Vec::new(),
             annot_redo: Vec::new(),
             note_draft: None,
@@ -4549,6 +4631,7 @@ impl Document {
             saved_marks: Vec::new(),
             open_gen: 0,
             disk_identity: None,
+            disk_stale: false,
             reload_inflight: false,
             render_gen: 1,
             surfaces: SurfaceCache::default(),
@@ -4578,6 +4661,17 @@ fn should_reload(
     has_unsaved: bool,
 ) -> bool {
     !has_unsaved && stored != current
+}
+
+fn schedule_reload(doc: &mut Ready, current: Option<(u64, u64)>) -> Task<Message> {
+    doc.reload_inflight = true;
+    let doc_gen = doc.open_gen;
+    let source = doc.source.clone();
+    Task::perform(open_ready(source), move |result| Message::Reloaded {
+        doc_gen,
+        result,
+        identity: current,
+    })
 }
 
 async fn open_ready(source: OpenSource) -> Result<Ready, OpenError> {
@@ -4790,39 +4884,6 @@ mod tests {
                 .open_error()
                 .is_some_and(|msg| msg.contains("motor quebrou")));
         });
-    }
-
-    #[test]
-    fn search_keeps_portuguese_accents() {
-        let layer = TextLayer {
-            page: PageNo::first(),
-            plain: "texto ação extra".into(),
-            glyphs: vec![Glyph {
-                cluster: "texto ação extra".into(),
-                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
-            }],
-        };
-        let hits = Search::derive("ação", &[Some(layer.clone())]);
-        assert_eq!(hits.hits().len(), 1);
-        let none = Search::derive("acao", &[Some(layer)]);
-        assert!(none.hits().is_empty());
-    }
-
-    #[test]
-    fn lazy_search_skips_unloaded_pages() {
-        let layer = TextLayer {
-            page: PageNo::first(),
-            plain: "texto ação extra".into(),
-            glyphs: vec![Glyph {
-                cluster: "texto ação extra".into(),
-                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
-            }],
-        };
-        let mut pages: Vec<Option<TextLayer>> = vec![None; 200];
-        pages[0] = Some(layer);
-        let hits = Search::derive("ação", &pages);
-        assert_eq!(hits.hits().len(), 1);
-        assert_eq!(pages.len(), 200);
     }
 
     #[test]
@@ -5837,7 +5898,7 @@ mod tests {
         ];
         assert_eq!(ready.annotation_at(annot.page, center), Some(annot.id));
         assert_eq!(ready.annotation_at(annot.page, [-1000.0, -1000.0]), None);
-        // PointerUp sem arrasto remove via mensagens.
+        // PointerUp sem arrasto seleciona. Delete apaga.
         ready.press_anchor = Some(PressAnchor { sel, exact: true });
         let mut session = Session::Ready(Tabs::single(ready));
         apply(
@@ -5848,8 +5909,200 @@ mod tests {
             },
         );
         match &session {
-            Session::Ready(ready) => assert!(ready.annotations.is_empty()),
+            Session::Ready(ready) => {
+                assert_eq!(ready.annotations.len(), 1);
+                assert_eq!(ready.selected_annot, Some(annot.id));
+            }
             _ => unreachable!(),
+        }
+        apply(&mut session, Message::DeleteSelectedAnnot);
+        match &session {
+            Session::Ready(ready) => {
+                assert!(ready.annotations.is_empty());
+                assert_eq!(ready.selected_annot, None);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn delete_without_selection_keeps_the_mark() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.annotations.push(unsaved_mark());
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::DeleteSelectedAnnot);
+        assert_eq!(active_ready(&session).annotations.len(), 1);
+    }
+
+    #[test]
+    fn close_with_dirty_marks_asks_until_discard() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.annotations.push(unsaved_mark());
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::Close);
+        match &session {
+            Session::Ready(tabs) => {
+                assert_eq!(tabs.close_ask, Some(CloseTarget::Document));
+                assert_eq!(tabs.annotations.len(), 1);
+            }
+            other => panic!("fechar sujo fica no documento, veio {other:?}"),
+        }
+        apply(&mut session, Message::CloseCancel);
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(tabs.close_ask.is_none());
+                assert_eq!(tabs.annotations.len(), 1);
+            }
+            other => panic!("cancelar fica no documento, veio {other:?}"),
+        }
+        apply(&mut session, Message::Close);
+        apply(&mut session, Message::ClosePrintDialog);
+        match &session {
+            Session::Ready(tabs) => assert!(tabs.close_ask.is_none()),
+            other => panic!("esc cancela o aviso, veio {other:?}"),
+        }
+        apply(&mut session, Message::Close);
+        apply(&mut session, Message::CloseDiscard);
+        assert!(matches!(session, Session::Empty(_)));
+    }
+
+    #[test]
+    fn close_with_saved_marks_does_not_ask() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.annotations.push(unsaved_mark());
+        ready.saved_marks = ready.annotations.clone();
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::Close);
+        assert!(matches!(session, Session::Empty(_)));
+    }
+
+    #[test]
+    fn close_with_note_draft_asks() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.note_draft = Some(dummy_draft());
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::CloseTabActive);
+        match &session {
+            Session::Ready(tabs) => {
+                assert_eq!(tabs.close_ask, Some(CloseTarget::Document));
+                assert!(tabs.note_draft.is_some());
+            }
+            other => panic!("rascunho sujo pede confirmação, veio {other:?}"),
+        }
+        apply(&mut session, Message::CloseCancel);
+        assert!(active_ready(&session).note_draft.is_some());
+    }
+
+    #[test]
+    fn save_done_finishes_a_pending_close() {
+        isolated(|| {
+            let Some(mut ready) = sample_ready() else {
+                return;
+            };
+            ready.annotations.push(unsaved_mark());
+            let saved = ready.annotations.clone();
+            let doc_gen = ready.open_gen;
+            let mut session = Session::Ready(Tabs::single(ready));
+            apply(&mut session, Message::Close);
+            apply(
+                &mut session,
+                Message::SaveCopyDone {
+                    doc_gen,
+                    path: std::env::temp_dir().join("guia (marcado).pdf"),
+                    saved: vec![unsaved_mark()],
+                    result: Err("disco cheio".into()),
+                },
+            );
+            match &session {
+                Session::Ready(tabs) => {
+                    assert_eq!(tabs.close_ask, Some(CloseTarget::Document));
+                    assert!(tabs.marks_dirty());
+                }
+                other => panic!("falha ao salvar não fecha, veio {other:?}"),
+            }
+            apply(
+                &mut session,
+                Message::SaveCopyDone {
+                    doc_gen,
+                    path: std::env::temp_dir().join("guia (marcado).pdf"),
+                    saved,
+                    result: Ok(()),
+                },
+            );
+            assert!(matches!(session, Session::Empty(_)));
+        });
+    }
+
+    #[test]
+    fn close_dirty_tab_discard_keeps_the_other() {
+        isolated(|| {
+            let Some(first) = sample_ready() else {
+                return;
+            };
+            let Some(mut second) = sample_ready() else {
+                return;
+            };
+            second.annotations.push(unsaved_mark());
+            let mut session = Session::Ready(Tabs::single(first));
+            let _ = session.begin_open(second.source.clone());
+            session.finish_open(Ok(second));
+            apply(&mut session, Message::CloseTabActive);
+            match &session {
+                Session::Ready(tabs) => {
+                    assert_eq!(tabs.len(), 2);
+                    assert_eq!(tabs.close_ask, Some(CloseTarget::Tab(1)));
+                }
+                other => panic!("aba suja pede confirmação, veio {other:?}"),
+            }
+            apply(&mut session, Message::CloseDiscard);
+            match &session {
+                Session::Ready(tabs) => {
+                    assert_eq!(tabs.len(), 1);
+                    assert!(tabs.close_ask.is_none());
+                    assert!(tabs.annotations.is_empty());
+                }
+                other => panic!("descartar uma aba deixa a outra, veio {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn window_close_asks_only_when_dirty() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let id = window::Id::unique();
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::CloseWindow(id));
+        match &session {
+            Session::Ready(tabs) => assert!(tabs.close_ask.is_none()),
+            other => panic!("janela limpa não pergunta, veio {other:?}"),
+        }
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.annotations.push(unsaved_mark());
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::CloseWindow(id));
+        match &session {
+            Session::Ready(tabs) => assert_eq!(tabs.close_ask, Some(CloseTarget::Quit(id))),
+            other => panic!("janela suja pergunta, veio {other:?}"),
+        }
+        apply(&mut session, Message::CloseCancel);
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(tabs.close_ask.is_none());
+                assert_eq!(tabs.annotations.len(), 1);
+            }
+            other => panic!("cancelar o SO fica no documento, veio {other:?}"),
         }
     }
 
@@ -7465,6 +7718,20 @@ mod tests {
         assert!(
             keyboard_message(Key::Named(Named::End), Modifiers::SHIFT, Status::Ignored).is_none()
         );
+        assert!(matches!(
+            keyboard_message(
+                Key::Named(Named::Delete),
+                Modifiers::default(),
+                Status::Ignored
+            ),
+            Some(Message::DeleteSelectedAnnot)
+        ));
+        assert!(keyboard_message(
+            Key::Named(Named::Backspace),
+            Modifiers::default(),
+            Status::Captured
+        )
+        .is_none());
     }
 
     #[test]
@@ -7755,26 +8022,6 @@ mod tests {
     }
 
     #[test]
-    fn search_many_unicode_matches_share_glyph_walk() {
-        let mut glyphs = Vec::new();
-        let mut plain = String::new();
-        for _ in 0..50 {
-            plain.push_str("ação ");
-            glyphs.push(Glyph {
-                cluster: "ação ".into(),
-                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
-            });
-        }
-        let layer = TextLayer {
-            page: PageNo::first(),
-            plain,
-            glyphs,
-        };
-        let hits = find_hits("ação", &layer);
-        assert_eq!(hits.len(), 50);
-    }
-
-    #[test]
     fn stale_doc_gen_render_is_ignored() {
         let Some(ready) = sample_ready() else {
             return;
@@ -7827,27 +8074,6 @@ mod tests {
         assert!(
             ready.next_page_data_target().is_none() || ready.next_page_data_target() != Some(page)
         );
-    }
-
-    #[test]
-    fn search_overlapping_ranges_keep_glyph_quads() {
-        let layer = TextLayer {
-            page: PageNo::first(),
-            plain: "aa".into(),
-            glyphs: vec![
-                Glyph {
-                    cluster: "a".into(),
-                    quad: Quad::from_rect(0.0, 0.0, 1.0, 1.0),
-                },
-                Glyph {
-                    cluster: "a".into(),
-                    quad: Quad::from_rect(1.0, 0.0, 2.0, 1.0),
-                },
-            ],
-        };
-        let hits = find_hits("aa", &layer);
-        assert_eq!(hits.len(), 1);
-        assert!(hits[0].quad.x1 > 1.0);
     }
 
     #[test]
@@ -9114,19 +9340,80 @@ mod tests {
         apply(&mut session, Message::FileTick);
         let marked = active_ready(&session);
         assert!(!marked.reload_inflight);
-        assert_eq!(
-            marked.save_status.as_deref(),
-            Some("O arquivo mudou no disco.")
+        assert!(
+            marked.save_status.is_none(),
+            "aviso de disco não pode ocupar a linha de status"
         );
-        // Re-tique: idempotente, segue sem inflight.
+        assert!(marked.disk_stale());
+        // Re-tique: idempotente, segue sem inflight e sem status.
         apply(&mut session, Message::FileTick);
         let marked = active_ready(&session);
         assert!(!marked.reload_inflight);
-        assert_eq!(
-            marked.save_status.as_deref(),
-            Some("O arquivo mudou no disco.")
-        );
+        assert!(marked.save_status.is_none());
+        assert!(marked.disk_stale());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_tick_reloads_when_marks_match_the_last_save() {
+        let Some((mut doc, dir)) = temp_copy_ready() else {
+            return;
+        };
+        doc.annotations.push(unsaved_mark());
+        doc.saved_marks = doc.annotations.clone();
+        let mut session = Session::Ready(Tabs::single(doc));
+        let path = active_ready(&session).source.path().to_path_buf();
+        std::fs::write(&path, b"novo").expect("reescreve a cópia");
+        apply(&mut session, Message::FileTick);
+        let ready = active_ready(&session);
+        assert!(ready.reload_inflight);
+        assert!(!ready.disk_stale());
+        assert!(ready.save_status.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_tick_after_save_keeps_confirmation_until_reload() {
+        isolated(|| {
+            let Some((mut doc, dir)) = temp_copy_ready() else {
+                return;
+            };
+            doc.annotations.push(unsaved_mark());
+            let saved = doc.annotations.clone();
+            let doc_gen = doc.open_gen;
+            let mut session = Session::Ready(Tabs::single(doc));
+            let path = active_ready(&session).source.path().to_path_buf();
+            std::fs::write(&path, b"novo").expect("reescreve a cópia");
+            apply(&mut session, Message::FileTick);
+            assert!(active_ready(&session).disk_stale());
+            apply(
+                &mut session,
+                Message::SaveCopyDone {
+                    doc_gen,
+                    path: std::env::temp_dir().join("guia (marcado).pdf"),
+                    saved,
+                    result: Ok(()),
+                },
+            );
+            let ready = active_ready(&session);
+            assert!(!ready.marks_dirty());
+            assert!(ready.disk_stale());
+            assert_eq!(
+                ready.save_status.as_deref(),
+                Some("Cópia salva em guia (marcado).pdf")
+            );
+            apply(&mut session, Message::FileTick);
+            let ready = active_ready(&session);
+            assert!(!ready.reload_inflight);
+            assert!(ready.disk_stale());
+            assert_eq!(
+                ready.save_status.as_deref(),
+                Some("Cópia salva em guia (marcado).pdf")
+            );
+            apply(&mut session, Message::ReloadDisk);
+            assert!(active_ready(&session).reload_inflight);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
