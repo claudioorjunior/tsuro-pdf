@@ -1417,6 +1417,11 @@ pub enum Message {
     PageInput(String),
     PageSubmit,
     SetZoom(Zoom),
+    /// +/- do teclado (#72): passo de 1.1× a partir do zoom em tela.
+    ZoomIn,
+    ZoomOut,
+    /// Ctrl+F (#72): foca o campo de busca da toolbar.
+    FocusSearch,
     /// Gira a vista 90° no sentido horário (ciclo 0→1→2→3→0).
     RotateView,
     SetViewport(Viewport),
@@ -1863,6 +1868,15 @@ impl Session {
                     Task::none()
                 };
                 Task::batch([self.schedule_work(), follow])
+            }
+            Message::ZoomIn => self.zoom_step(1.1),
+            Message::ZoomOut => self.zoom_step(1.0 / 1.1),
+            Message::FocusSearch => {
+                if matches!(self, Session::Ready(_)) {
+                    iced::widget::text_input::focus(crate::view::search_input_id())
+                } else {
+                    Task::none()
+                }
             }
             Message::RotateView => {
                 let follow = if let Session::Ready(ready) = self {
@@ -3233,6 +3247,22 @@ impl Session {
         Task::batch([self.schedule_work(), self.nav_follow_active()])
     }
 
+    /// Passo de zoom do teclado (#72): mesmo 1.1× dos botões, partindo do
+    /// fator em tela (`zoom_step_factor`, que segue o ajuste girado).
+    fn zoom_step(&mut self, factor: f32) -> Task<Message> {
+        let follow = if let Session::Ready(ready) = self {
+            let current = ready.zoom_step_factor();
+            ready.zoom = Zoom::Manual(ZoomFactor::new(current * factor));
+            ready.overflow_open = false;
+            ready.bump_render_gen();
+            ready.save_position();
+            nav_follow(ready)
+        } else {
+            Task::none()
+        };
+        Task::batch([self.schedule_work(), follow])
+    }
+
     fn schedule_work(&mut self) -> Task<Message> {
         let Session::Ready(ready) = self else {
             return Task::none();
@@ -3399,6 +3429,12 @@ pub(crate) fn keyboard_message(
             // Abrir entra em aba nova quando já há documento (issue #40).
             Key::Character("t" | "T") => return Some(Message::PickFile),
             Key::Character("w" | "W") => return Some(Message::CloseTabActive),
+            // Aceleradores padrão (#72); guarda de foco cobre os campos.
+            Key::Character("c" | "C") => return Some(Message::CopySelection),
+            Key::Character("f" | "F") => return Some(Message::FocusSearch),
+            Key::Character("o" | "O") => return Some(Message::PickFile),
+            Key::Character("p" | "P") => return Some(Message::OpenPrintDialog),
+            Key::Character("s" | "S") => return Some(Message::SaveCopyRequested),
             _ => {}
         }
     }
@@ -3422,6 +3458,19 @@ pub(crate) fn keyboard_message(
             Key::Named(Named::ArrowRight) => Some(Message::HistoryForward),
             _ => None,
         };
+    }
+    // +/- zoomam (#72, README): respeitam o foco (só Ignored), mas o "+"
+    // chega com Shift — por isso valem antes da guarda de modificadores.
+    if status == event::Status::Ignored
+        && !modifiers.control()
+        && !modifiers.logo()
+        && !modifiers.alt()
+    {
+        match key.as_ref() {
+            Key::Character("+") | Key::Character("=") => return Some(Message::ZoomIn),
+            Key::Character("-") => return Some(Message::ZoomOut),
+            _ => {}
+        }
     }
     if modifiers.shift() || modifiers.control() || modifiers.alt() || modifiers.logo() {
         return None;
@@ -3455,14 +3504,33 @@ pub(crate) fn keyboard_message(
 }
 
 /// Rótulo do atalho no menu ⋯ (#42): `None` = sem tecla ou com a dica na
-/// toolbar (H/U/S/N, setas de página). Cobertura travada em
+/// toolbar (H/U/S/N, F3, Ctrl+F, +/-, setas de página). Cobertura travada em
 /// `every_keyboard_shortcut_has_a_menu_hint_or_exemption` — atalho novo no
 /// `keyboard_message` sem rótulo aqui (ou isenção) quebra o teste.
 pub(crate) fn shortcut_hint(msg: &Message) -> Option<&'static str> {
     match msg {
-        Message::PickFile => Some("T"),
+        Message::PickFile => Some(if cfg!(target_os = "macos") {
+            "⌘O"
+        } else {
+            "Ctrl+O"
+        }),
         Message::RotateView => Some("R"),
         Message::CopyAnnotations => Some("M"),
+        Message::CopySelection => Some(if cfg!(target_os = "macos") {
+            "⌘C"
+        } else {
+            "Ctrl+C"
+        }),
+        Message::OpenPrintDialog => Some(if cfg!(target_os = "macos") {
+            "⌘P"
+        } else {
+            "Ctrl+P"
+        }),
+        Message::SaveCopyRequested => Some(if cfg!(target_os = "macos") {
+            "⌘S"
+        } else {
+            "Ctrl+S"
+        }),
         Message::DeleteSelectedAnnot => Some("Del"),
         Message::AnnotUndo => Some(if cfg!(target_os = "macos") {
             "⌘Z"
@@ -6021,6 +6089,9 @@ mod tests {
                     | Message::ClosePrintDialog
                     | Message::SearchNext
                     | Message::SearchPrev
+                    | Message::FocusSearch
+                    | Message::ZoomIn
+                    | Message::ZoomOut
             )
         }
         #[cfg(target_os = "macos")]
@@ -6089,6 +6160,88 @@ mod tests {
             probe(Key::Named(named), hist);
         }
         assert!(checked >= 7, "esperava T/R/M/Del/Z/⌘←/⌘→, viu {checked}");
+    }
+
+    #[test]
+    fn standard_accelerators_map_to_actions() {
+        use iced::event::Status;
+        use iced::keyboard::Modifiers;
+        #[cfg(target_os = "macos")]
+        let cmd = Modifiers::LOGO;
+        #[cfg(not(target_os = "macos"))]
+        let cmd = Modifiers::CTRL;
+        assert!(matches!(
+            keyboard_message(Key::Character("c".into()), cmd, Status::Ignored),
+            Some(Message::CopySelection)
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("F".into()), cmd, Status::Ignored),
+            Some(Message::FocusSearch)
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("o".into()), cmd, Status::Ignored),
+            Some(Message::PickFile)
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("p".into()), cmd, Status::Ignored),
+            Some(Message::OpenPrintDialog)
+        ));
+        assert!(matches!(
+            keyboard_message(Key::Character("S".into()), cmd, Status::Ignored),
+            Some(Message::SaveCopyRequested)
+        ));
+        // +/-/= com foco livre; com campo focado o iced captura antes.
+        assert!(matches!(
+            keyboard_message(
+                Key::Character("+".into()),
+                Modifiers::SHIFT,
+                Status::Ignored
+            ),
+            Some(Message::ZoomIn)
+        ));
+        assert!(matches!(
+            keyboard_message(
+                Key::Character("=".into()),
+                Modifiers::empty(),
+                Status::Ignored
+            ),
+            Some(Message::ZoomIn)
+        ));
+        assert!(matches!(
+            keyboard_message(
+                Key::Character("-".into()),
+                Modifiers::empty(),
+                Status::Ignored
+            ),
+            Some(Message::ZoomOut)
+        ));
+        assert!(keyboard_message(
+            Key::Character("+".into()),
+            Modifiers::SHIFT,
+            Status::Captured
+        )
+        .is_none());
+        assert!(keyboard_message(Key::Character("c".into()), cmd, Status::Captured).is_none());
+    }
+
+    #[test]
+    fn zoom_step_moves_from_current_factor() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(Tabs::single(ready));
+        let factor = |s: &Session| match s {
+            Session::Ready(r) => r.zoom_step_factor(),
+            _ => unreachable!(),
+        };
+        let before = factor(&session);
+        apply(&mut session, Message::ZoomIn);
+        let after = factor(&session);
+        assert!((after - before * 1.1).abs() < 0.01, "{before} -> {after}");
+        apply(&mut session, Message::ZoomOut);
+        apply(&mut session, Message::ZoomOut);
+        let down = factor(&session);
+        assert!(down < before, "{before} -> {after} -> {down}");
     }
 
     #[test]

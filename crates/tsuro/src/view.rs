@@ -49,6 +49,11 @@ pub fn doc_scroll_id() -> scrollable::Id {
     scrollable::Id::new("tsuro-doc")
 }
 
+/// Campo de busca da toolbar (Ctrl+F foca aqui).
+pub fn search_input_id() -> text_input::Id {
+    text_input::Id::new("tsuro-search")
+}
+
 pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
     let t = Tokens::for_theme(theme);
     let body: Element<'_, Message> = match session {
@@ -169,9 +174,9 @@ fn hud(ready: &Ready, t: Tokens) -> Element<'_, Message> {
             t,
             Message::SetZoom(Zoom::Width)
         ),
-        hud_icon("minus", "Diminuir zoom", t, Message::SetZoom(out)),
+        hud_icon("minus", "Diminuir zoom (-)", t, Message::SetZoom(out)),
         mono(format!("{}%", (current * 100.0).round() as i32), t.ink),
-        hud_icon("plus", "Aumentar zoom", t, Message::SetZoom(into)),
+        hud_icon("plus", "Aumentar zoom (+)", t, Message::SetZoom(into)),
     ]
     .spacing(2)
     .align_y(Alignment::Center);
@@ -388,8 +393,16 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
         );
         let pill = container(
             row![
-                kiri::ori_small!("search"),
+                tip(
+                    kiri::ori_small!("search"),
+                    if cfg!(target_os = "macos") {
+                        "Buscar no documento (⌘F)"
+                    } else {
+                        "Buscar no documento (Ctrl+F)"
+                    },
+                ),
                 text_input("Buscar no documento...", ready.search.query())
+                    .id(search_input_id())
                     .on_input(Message::SearchChanged)
                     .on_submit(Message::SearchSubmit)
                     .style(kiri::bar_input_style(t))
@@ -464,7 +477,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                         t,
                         button(kiri::ori!("minus")).on_press(Message::SetZoom(out))
                     ),
-                    "Diminuir zoom"
+                    "Diminuir zoom (-)"
                 ),
                 tip(
                     container(
@@ -481,7 +494,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                         t,
                         button(kiri::ori!("plus")).on_press(Message::SetZoom(into))
                     ),
-                    "Aumentar zoom"
+                    "Aumentar zoom (+)"
                 ),
                 tip(
                     control_seg(
