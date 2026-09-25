@@ -61,6 +61,9 @@ pub(crate) const DOC_GAP: f32 = 16.0;
 /// fecham o ciclo de ~1,1 s da barra indeterminada (`view::LOADING_STEPS`).
 const LOADING_TICK: std::time::Duration = std::time::Duration::from_millis(90);
 
+/// Poll do auto-reload (issue #46): barato (`stat` por aba), sem watcher.
+const RELOAD_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone)]
 pub enum OpenSource {
     Path(PathBuf),
@@ -813,6 +816,11 @@ impl Tabs {
         &self.docs
     }
 
+    /// Abas para o poll de auto-reload (lê identidade, marca inflight).
+    fn docs_mut(&mut self) -> &mut [Ready] {
+        &mut self.docs
+    }
+
     pub fn open_error(&self) -> Option<&str> {
         self.open_error.as_deref()
     }
@@ -996,6 +1004,10 @@ pub struct Ready {
     /// DPR da janela: bitmap sai em px físicos (zoom CSS × isto).
     pub render_scale: f32,
     open_gen: u64,
+    /// Identidade (tamanho+mtime) na última leitura; o poll compara com o disco.
+    disk_identity: Option<(u64, u64)>,
+    /// Reload do disco em voo (um por aba; a resposta chega em `Reloaded`).
+    reload_inflight: bool,
     /// Invalidates in-flight renders on nav/zoom/DPI changes.
     render_gen: u64,
     surfaces: SurfaceCache,
@@ -1378,6 +1390,14 @@ pub enum Message {
     },
     /// Tique da tela de abertura (issue #41): avança a barra indeterminada.
     LoadingTick,
+    /// Poll de auto-reload (issue #46): compara cada aba com o disco.
+    FileTick,
+    /// Documento relido do disco; `identity` é a do tique que disparou.
+    Reloaded {
+        doc_gen: u64,
+        result: Result<Ready, OpenError>,
+        identity: Option<(u64, u64)>,
+    },
     PageData {
         page: PageNo,
         doc_gen: u64,
@@ -1615,12 +1635,75 @@ impl Session {
                 }
                 Task::none()
             }
-            // Tela de abertura: só o contador da barra; nada mais reage a isto.
-            Message::LoadingTick => {
-                if let Session::Loading { phase, .. } = self {
-                    *phase = phase.wrapping_add(1);
+            // Auto-reload (issue #46): cada aba que mudou no disco relê o arquivo.
+            Message::FileTick => {
+                let Session::Ready(tabs) = self else {
+                    return Task::none();
+                };
+                let mut tasks = Vec::new();
+                for doc in tabs.docs_mut() {
+                    if doc.reload_inflight {
+                        continue;
+                    }
+                    let current = file_identity(doc.source.path());
+                    let has_unsaved = !doc.annotations.is_empty() || doc.note_draft.is_some();
+                    if should_reload(doc.disk_identity, current, has_unsaved) {
+                        doc.reload_inflight = true;
+                        let doc_gen = doc.open_gen;
+                        let source = doc.source.clone();
+                        tasks.push(Task::perform(open_ready(source), move |result| {
+                            Message::Reloaded {
+                                doc_gen,
+                                result,
+                                identity: current,
+                            }
+                        }));
+                    } else if doc.disk_identity != current && has_unsaved {
+                        // Marcações/rascunho: recarregar destruiria trabalho não
+                        // salvo; avisa e espera (re-set idempotente, não pisca).
+                        doc.save_status = Some("O arquivo mudou no disco.".into());
+                    }
                 }
-                Task::none()
+                Task::batch(tasks)
+            }
+            Message::Reloaded {
+                doc_gen,
+                result,
+                identity,
+            } => {
+                let Session::Ready(tabs) = self else {
+                    // Janela fechada no meio do voo: solta o parse antes de largar.
+                    if let Ok(fresh) = &result {
+                        fresh.close_engine();
+                    }
+                    return Task::none();
+                };
+                // Geração nova a cada reload: respostas do motor antigo (página,
+                // outline, renders) não acham dono em `by_gen` e caem fora.
+                let next_gen = tabs.max_gen().wrapping_add(1);
+                let next_gen = if next_gen == 0 { 1 } else { next_gen };
+                let Some(doc) = tabs.by_gen(doc_gen) else {
+                    // Aba fechada no meio do voo: mesma disciplina do ramo stale.
+                    if let Ok(fresh) = &result {
+                        fresh.close_engine();
+                    }
+                    return Task::none();
+                };
+                doc.reload_inflight = false;
+                match result {
+                    Ok(fresh) => {
+                        doc.apply_reload(fresh);
+                        doc.open_gen = next_gen;
+                        doc.disk_identity = identity;
+                    }
+                    Err(_) => {
+                        // Adota a identidade atual: sem retry infinito na mesma
+                        // versão; qualquer escrita futura muda de novo e re-tenta.
+                        doc.disk_identity = identity;
+                        doc.save_status = Some("Falha ao recarregar.".into());
+                    }
+                }
+                Task::batch([self.schedule_work(), self.nav_follow_active()])
             }
             Message::PageData {
                 page,
@@ -2589,6 +2672,12 @@ impl Session {
                 events,
                 iced::time::every(LOADING_TICK).map(|_| Message::LoadingTick),
             ])
+        } else if matches!(self, Session::Ready(_)) {
+            // Poll de auto-reload (issue #46): `Ready` sempre tem aba aberta.
+            iced::Subscription::batch([
+                events,
+                iced::time::every(RELOAD_POLL).map(|_| Message::FileTick),
+            ])
         } else {
             events
         }
@@ -2660,6 +2749,7 @@ impl Session {
                 ready.theme = theme;
                 ready.render_scale = render_scale;
                 ready.open_gen = gen;
+                ready.disk_identity = file_identity(ready.source.path());
                 ready.signatures_open = false;
                 ready.pages_open = false;
                 ready.outline_open = false;
@@ -3999,6 +4089,47 @@ impl Ready {
         self.history.reset(self.visible);
     }
 
+    /// Troca o documento pelo recém-lido do disco, mantendo a posição de
+    /// leitura (página clampada ao novo total, zoom, modo). O resto zera como
+    /// numa abertura: seleção, busca, histórico, painéis, marcações. A rotação
+    /// é da vista, não do arquivo, e sobrevive. A geração nova vem do handler
+    /// (`max_gen + 1`), que enxerga as abas — aqui ela chega zerada do `fresh`.
+    fn apply_reload(&mut self, fresh: Ready) {
+        // O motor antigo sai da worker antes do Ready cair (Drop não fecha).
+        self.close_engine();
+        let (visible, zoom, view_mode) = (self.visible, self.zoom, self.view_mode);
+        let (rotation, viewport, theme, scale) = (
+            self.view_rotation,
+            self.viewport,
+            self.theme,
+            self.render_scale,
+        );
+        let recents = std::mem::take(&mut self.recents);
+        let render_gen = self.render_gen;
+        *self = fresh;
+        self.zoom = zoom;
+        self.view_mode = view_mode;
+        self.view_rotation = rotation;
+        self.viewport = viewport;
+        self.theme = theme;
+        self.render_scale = scale;
+        self.recents = recents;
+        // Renders do motor antigo em voo voltam com a geração antiga: o guarda
+        // em `Rendered` os ignora (mesma disciplina de `go_to`).
+        self.render_gen = render_gen;
+        self.bump_render_gen();
+        let idx = visible.index().min(self.pages.total.saturating_sub(1));
+        self.visible = PageNo::from_index(idx);
+        if self.view_mode == ViewMode::Continuous {
+            // Topo da página, como na abertura: a posição intra-página se perde.
+            self.doc_scroll_y = self.page_offset(self.visible);
+        }
+        self.history.reset(self.visible);
+        self.sync_page_input();
+        self.save_status = Some("Documento atualizado.".into());
+        self.save_position();
+    }
+
     fn apply_nav(&mut self, cmd: NavCmd) {
         match cmd {
             NavCmd::Previous => {
@@ -4298,6 +4429,8 @@ impl Document {
             save_status: None,
             save_warning: false,
             open_gen: 0,
+            disk_identity: None,
+            reload_inflight: false,
             render_gen: 1,
             surfaces: SurfaceCache::default(),
             thumbs: ThumbCache::default(),
@@ -4315,6 +4448,17 @@ impl Document {
         ready.sync_page_input();
         Ok(ready)
     }
+}
+
+/// Gate do auto-reload (issue #46): identidade trocou e nada não salvo em
+/// jogo. `None` (apagado/ilegível) conta como transição — e reaparecer
+/// recarrega de novo.
+fn should_reload(
+    stored: Option<(u64, u64)>,
+    current: Option<(u64, u64)>,
+    has_unsaved: bool,
+) -> bool {
+    !has_unsaved && stored != current
 }
 
 async fn open_ready(source: OpenSource) -> Result<Ready, OpenError> {
@@ -8626,5 +8770,255 @@ mod tests {
         let _ = session.view();
         apply(&mut session, Message::SetViewMode(ViewMode::Continuous));
         let _ = session.view();
+    }
+
+    #[test]
+    fn should_reload_fires_only_on_change_without_unsaved() {
+        let a = Some((10u64, 20u64));
+        let b = Some((10u64, 21u64));
+        assert!(should_reload(a, b, false), "mudou no disco: recarrega");
+        assert!(!should_reload(a, a, false), "igual: parado");
+        assert!(!should_reload(a, b, true), "não salvo: espera o usuário");
+        assert!(!should_reload(None, None, false), "segue apagado: parado");
+        assert!(should_reload(a, None, false), "apagado: recarrega");
+        assert!(should_reload(None, a, false), "reapareceu: recarrega");
+    }
+
+    /// Cópia da fixture em temp: o tique vê a mudança sem tocar na fixture.
+    /// Devolve o documento aberto + o diretório (o teste remove no fim).
+    fn temp_copy_ready() -> Option<(Ready, PathBuf)> {
+        // Contador, não relógio: dois testes paralelos podem ler o mesmo nano
+        // e dividir o arquivo (flake: um vê a escrita do outro no tique).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("tsuro-reload-unit-{}-{n}", std::process::id()));
+        let path = dir.join("guia-copia.pdf");
+        let bytes = std::fs::read(sample_pdf()).ok()?;
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::write(&path, &bytes).ok()?;
+        let mut doc =
+            Document::from_bytes(OpenSource::Path(path), Arc::<[u8]>::from(bytes)).ok()?;
+        doc.open_gen = 7;
+        doc.disk_identity = crate::positions::file_identity(doc.source.path());
+        Some((doc, dir))
+    }
+
+    fn unsaved_mark() -> Annotation {
+        Annotation {
+            id: 0,
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+            quads: Vec::new(),
+            kind: AnnotKind::Highlight,
+            text: String::new(),
+            marker: None,
+        }
+    }
+
+    #[test]
+    fn file_tick_reloads_only_changed_tabs() {
+        let Some((doc, dir)) = temp_copy_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(Tabs::single(doc));
+        // Sem mudança: parado, sem status.
+        apply(&mut session, Message::FileTick);
+        assert!(!active_ready(&session).reload_inflight);
+        assert!(active_ready(&session).save_status.is_none());
+        // Mudou no disco (só o tamanho basta): dispara o reload.
+        let path = active_ready(&session).source.path().to_path_buf();
+        std::fs::write(&path, b"novo").expect("reescreve a cópia");
+        apply(&mut session, Message::FileTick);
+        assert!(active_ready(&session).reload_inflight);
+        assert!(active_ready(&session).save_status.is_none());
+        // Em voo: o tique seguinte não dispara de novo.
+        apply(&mut session, Message::FileTick);
+        assert!(active_ready(&session).reload_inflight);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_tick_warns_instead_of_reloading_with_unsaved_marks() {
+        let Some((mut doc, dir)) = temp_copy_ready() else {
+            return;
+        };
+        doc.annotations.push(unsaved_mark());
+        let mut session = Session::Ready(Tabs::single(doc));
+        let path = active_ready(&session).source.path().to_path_buf();
+        std::fs::write(&path, b"novo").expect("reescreve a cópia");
+        apply(&mut session, Message::FileTick);
+        let marked = active_ready(&session);
+        assert!(!marked.reload_inflight);
+        assert_eq!(
+            marked.save_status.as_deref(),
+            Some("O arquivo mudou no disco.")
+        );
+        // Re-tique: idempotente, segue sem inflight.
+        apply(&mut session, Message::FileTick);
+        let marked = active_ready(&session);
+        assert!(!marked.reload_inflight);
+        assert_eq!(
+            marked.save_status.as_deref(),
+            Some("O arquivo mudou no disco.")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_failure_keeps_document_and_adopts_identity() {
+        isolated(|| {
+            let Some(ready) = sample_ready() else {
+                return;
+            };
+            let mut session = Session::Empty(EmptyState {
+                theme: Theme::Dark,
+                ..EmptyState::default()
+            });
+            let _ = session.begin_open(ready.source.clone());
+            let gen = match &session {
+                Session::Loading { gen, .. } => *gen,
+                other => panic!("esperava Loading, veio {other:?}"),
+            };
+            let _ = session.update(Message::Opened {
+                gen,
+                result: Ok(ready),
+            });
+            assert_eq!(
+                active_ready(&session).disk_identity,
+                crate::positions::file_identity(&sample_pdf()),
+                "abertura captura a identidade"
+            );
+            let doc_gen = active_ready(&session).open_gen;
+            // O tique viu outra versão, mas a leitura falhou (meio de escrita).
+            let current = Some((1u64, 2u64));
+            apply(
+                &mut session,
+                Message::Reloaded {
+                    doc_gen,
+                    result: Err(OpenError::Io("travado".into())),
+                    identity: current,
+                },
+            );
+            let doc = active_ready(&session);
+            assert_eq!(doc.disk_identity, current, "adota: sem retry infinito");
+            assert!(!doc.reload_inflight);
+            assert_eq!(doc.save_status.as_deref(), Some("Falha ao recarregar."));
+            assert_eq!(doc.visible, PageNo::first(), "o doc antigo segue na tela");
+        });
+    }
+
+    #[test]
+    fn reload_transplants_position_and_resets_session_state() {
+        let Some(mut old) = sample_ready() else {
+            return;
+        };
+        let Some(mut fresh) = sample_ready() else {
+            return;
+        };
+        if old.page_count() < 2 {
+            return;
+        }
+        let file = std::env::temp_dir().join(format!(
+            "tsuro-positions-unit-{}-reload",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        crate::positions::with_positions_path(file.clone(), || {
+            // "Novo" arquivo com menos páginas: a posição clampada.
+            fresh.pages.total = 1;
+            fresh.pages.media.truncate(1);
+            fresh.pages.text.truncate(1);
+            let last = PageNo::from_index(old.page_count() - 1);
+            old.navigate_to(last);
+            old.zoom = Zoom::Manual(ZoomFactor::new(2.0));
+            old.view_mode = ViewMode::Continuous;
+            old.view_rotation = 1;
+            old.selection = Some(Selection {
+                page: last,
+                range: TextRange { start: 0, end: 2 },
+            });
+            old.search = Search::derive("cláusula", &[]);
+            old.annotations.push(unsaved_mark());
+            old.signatures_open = true;
+            old.pages_open = true;
+            let old_render_gen = old.render_gen;
+            old.apply_reload(fresh);
+            assert_eq!(old.visible.index(), 0, "clamp ao novo total");
+            assert_eq!(zoom_factor(&old), 2.0);
+            assert_eq!(old.view_mode, ViewMode::Continuous);
+            assert_eq!(old.doc_scroll_y, old.page_offset(old.visible));
+            assert_eq!(old.view_rotation, 1, "rotação é da vista");
+            assert!(old.selection.is_none());
+            assert!(old.search.query().is_empty());
+            assert!(old.annotations.is_empty());
+            assert!(!old.signatures_open && !old.pages_open);
+            assert!(!old.can_history_back() && !old.can_history_forward());
+            assert_ne!(old.render_gen, old_render_gen, "invalida renders antigos");
+            assert_eq!(old.page_input(), "1");
+            assert_eq!(old.save_status.as_deref(), Some("Documento atualizado."));
+        });
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn reload_rotates_gen_and_drops_stale_responses() {
+        let Some((doc, dir)) = temp_copy_ready() else {
+            return;
+        };
+        let Some(mut fresh) = sample_ready() else {
+            return;
+        };
+        if fresh.page_count() < 2 {
+            return;
+        }
+        fresh.source = doc.source.clone();
+        let old_gen = doc.open_gen;
+        let mut session = Session::Ready(Tabs::single(doc));
+        // O reload salva a posição: isola o arquivo como no teste vizinho.
+        let pos_file = std::env::temp_dir().join(format!(
+            "tsuro-positions-unit-{}-reload-gen",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pos_file);
+        crate::positions::with_positions_path(pos_file.clone(), || {
+            apply(
+                &mut session,
+                Message::Reloaded {
+                    doc_gen: old_gen,
+                    result: Ok(fresh),
+                    identity: Some((9u64, 9u64)),
+                },
+            );
+        });
+        let _ = std::fs::remove_file(&pos_file);
+        let doc = active_ready(&session);
+        assert_ne!(doc.open_gen, old_gen, "reload gira a geração");
+        // Resposta do motor antigo (geração antiga): cai no `by_gen`, não
+        // instala texto velho na página nova.
+        let stale_page = PageNo::from_index(1);
+        assert!(active_ready(&session).pages.text[1].is_none());
+        apply(
+            &mut session,
+            Message::PageData {
+                page: stale_page,
+                doc_gen: old_gen,
+                result: Ok((
+                    MediaBox {
+                        width: 1.0,
+                        height: 1.0,
+                    },
+                    TextLayer {
+                        page: stale_page,
+                        plain: "velho".into(),
+                        glyphs: Vec::new(),
+                    },
+                )),
+            },
+        );
+        let doc = active_ready(&session);
+        assert!(doc.pages.text[1].is_none(), "stale não instala");
+        assert!(!doc.page_data_failed.contains(&1), "stale não suja falha");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
