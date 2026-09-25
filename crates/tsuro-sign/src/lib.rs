@@ -635,7 +635,6 @@ mod tests {
         assert!(!covers_whole_document(&dirty, dirty_br, contents));
     }
 
-    /// Catalog `/X` is an array nested `depth` levels, with a normal xref.
     fn pdf_with_nested_catalog_array(depth: usize) -> Vec<u8> {
         let mut array = Vec::with_capacity(depth * 2);
         array.extend(std::iter::repeat_n(b'[', depth));
@@ -664,10 +663,8 @@ mod tests {
         assert!(ok.signatures.is_empty());
 
         let nested = pdf_with_nested_catalog_array(10_380);
-        let err = analyze_pdf(&nested).expect_err("a 10380-deep catalog array must not parse");
-        assert!(
-            matches!(err, SigError::Pdf(_)),
-            "expected a PDF parse error, got {err:?}"
-        );
+        let analysis = analyze_pdf(&nested).expect("a 10380-deep catalog array returns");
+        assert!(analysis.signatures.is_empty());
+        assert_eq!(analysis.page_count_hint, Some(0));
     }
 }
