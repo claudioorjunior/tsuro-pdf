@@ -14,6 +14,7 @@ use crate::browse::{EmptyState, FsEntry};
 use crate::kiri::{self, Theme, Tokens};
 use crate::page::{MediaBox, PageNo};
 use crate::print::{PrintOrientation, MAX_COPIES};
+use crate::search::Search;
 use crate::session::{
     display_pt, display_rect, marker_side, page_pt_at, AnnotKind, Message, NavCmd, NoteDraft,
     OpenSource, PrintDialog, RangeMode, Ready, Session, Tabs, ViewMode, Zoom, ZoomFactor, DOC_GAP,
@@ -295,6 +296,49 @@ fn middle_truncate(name: &str, max: usize) -> String {
     format!("{}…{}", &name[..head_end], &name[tail_start..])
 }
 
+/// Contador da busca (#43): `None` sem consulta, `"0"` sem hits, total puro
+/// digitando (`"12"`) e `"3 de 12"` navegando.
+fn search_count_text(search: &Search) -> Option<String> {
+    if search.query().is_empty() {
+        return None;
+    }
+    let total = search.hits().len();
+    match search.current() {
+        Some(i) if total > 0 => Some(format!("{} de {}", i + 1, total)),
+        _ if total == 0 => Some("0".to_string()),
+        _ => Some(total.to_string()),
+    }
+}
+
+/// Navegação da busca na pílula: contador + ‹ › (só com consulta; botões só
+/// com hits). Vazio encolhe para não empurrar a página.
+fn search_nav<'a>(ready: &'a Ready, t: Tokens) -> Element<'a, Message> {
+    if ready.search.query().is_empty() {
+        return Space::with_width(Length::Shrink).into();
+    }
+    let mut nav = row![].spacing(2).align_y(Alignment::Center);
+    if let Some(count) = search_count_text(&ready.search) {
+        nav = nav.push(text(count).size(11).color(t.muted));
+    }
+    if !ready.search.hits().is_empty() {
+        nav = nav.push(tip(
+            control_seg(
+                t,
+                button(kiri::ori!("chevron-left")).on_press(Message::SearchPrev),
+            ),
+            "Anterior (Shift+Enter)",
+        ));
+        nav = nav.push(tip(
+            control_seg(
+                t,
+                button(kiri::ori!("chevron-right")).on_press(Message::SearchNext),
+            ),
+            "Próximo (Enter)",
+        ));
+    }
+    nav.into()
+}
+
 /// Barra única Kiri (`Session::Ready`): abrir │ pílula do documento │ busca e
 /// página │ marcar │ zoom │ painéis │ ⋯. Uma linha só (`CHROME_HEIGHT`).
 fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
@@ -333,10 +377,12 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                 kiri::ori_small!("search"),
                 text_input("Buscar no documento...", ready.search.query())
                     .on_input(Message::SearchChanged)
+                    .on_submit(Message::SearchSubmit)
                     .style(kiri::bar_input_style(t))
                     .padding([2, 4])
                     .size(12)
-                    .width(Length::Fixed(180.0)),
+                    .width(Length::Fixed(120.0)),
+                search_nav(ready, t),
                 kiri::vsep(t),
                 row![
                     tip(
@@ -1940,6 +1986,7 @@ fn single_pane(ready: &Ready, t: Tokens) -> Element<'_, Message> {
                 .width(Length::Fixed(sw))
                 .height(Length::Fixed(sh))
                 .into(),
+            t,
         ),
         // Sem bitmap: caixa do tamanho da folha (mesma geometria do
         // placeholder do contínuo) — sem salto de layout quando chega.
@@ -2039,6 +2086,7 @@ fn doc_cell(ready: &Ready, page: PageNo, t: Tokens) -> Element<'_, Message> {
                 .width(Length::Fixed(sw))
                 .height(Length::Fixed(sh))
                 .into(),
+            t,
         ),
         None => {
             let h = (ready.doc_cell_height(page, sw) - DOC_PAD_TOP - DOC_PAD_BOTTOM).max(1.0);
@@ -2076,6 +2124,7 @@ fn doc_cell(ready: &Ready, page: PageNo, t: Tokens) -> Element<'_, Message> {
 
 /// Retângulo desenhável (px CSS, espaço exibido); `kind: None` = seleção ativa.
 /// `marker: true` = quadrado compacto de nota (não segue o traço do kind).
+/// `search: true` = hit da busca (amarelo; `current` = âmbar do hit atual).
 struct DrawMark {
     x: f32,
     y: f32,
@@ -2087,6 +2136,8 @@ struct DrawMark {
     /// segue sólido até o soltar).
     ghost: bool,
     selected: bool,
+    search: bool,
+    current: bool,
 }
 
 /// Camada transparente sobre a folha (issue #30): desenha marcações/seleção
@@ -2097,6 +2148,8 @@ struct MarkLayer {
     rotation: u8,
     size: Size,
     marks: Vec<DrawMark>,
+    mark: Color,
+    mark_current: Color,
 }
 
 #[derive(Default)]
@@ -2231,6 +2284,18 @@ impl Program<Message> for MarkLayer {
                 }
                 continue;
             }
+            // Busca: amarelo claro nos hits, âmbar no atual (#43).
+            if m.search {
+                frame.fill(
+                    &rect,
+                    if m.current {
+                        self.mark_current
+                    } else {
+                        self.mark
+                    },
+                );
+                continue;
+            }
             match m.kind {
                 None => frame.fill(&rect, Color::from_rgba(0.25, 0.45, 1.0, 0.30)),
                 Some(AnnotKind::Highlight) => {
@@ -2324,12 +2389,33 @@ fn with_marks<'a>(
     page: PageNo,
     cw: f32,
     sheet: Element<'a, Message>,
+    t: Tokens,
 ) -> Element<'a, Message> {
     let media = ready.media(page);
     let rotated = ready.rotated_media(page);
     let ch = cw * rotated.height.max(1.0) / rotated.width.max(1.0);
     let size = Size::new(cw, ch);
     let mut marks = Vec::new();
+    // Busca (#43): hits amarelos + atual âmbar, sob seleção e marcas.
+    let current = ready.search.current();
+    for (i, hit) in ready.search.hits().iter().enumerate() {
+        if hit.page != page {
+            continue;
+        }
+        let [x, y, w, h] = display_rect(hit.quad, media, ready.view_rotation, cw, ch);
+        marks.push(DrawMark {
+            x,
+            y,
+            w,
+            h,
+            kind: None,
+            marker: false,
+            ghost: false,
+            selected: false,
+            search: true,
+            current: Some(i) == current,
+        });
+    }
     if let Some((sel_page, quads)) = ready.selection_quads() {
         if sel_page == page {
             for quad in &quads {
@@ -2343,6 +2429,8 @@ fn with_marks<'a>(
                     marker: false,
                     ghost: false,
                     selected: false,
+                    search: false,
+                    current: false,
                 });
             }
         }
@@ -2360,6 +2448,8 @@ fn with_marks<'a>(
                 marker: false,
                 ghost: false,
                 selected,
+                search: false,
+                current: false,
             });
             // Nota: marcador compacto — na origem do primeiro quad ou onde o
             // arrasto o deixou (`Annotation::marker`); o trecho não se move.
@@ -2375,6 +2465,8 @@ fn with_marks<'a>(
                     marker: true,
                     ghost: false,
                     selected,
+                    search: false,
+                    current: false,
                 });
             }
         }
@@ -2394,6 +2486,8 @@ fn with_marks<'a>(
                 marker: true,
                 ghost: true,
                 selected: false,
+                search: false,
+                current: false,
             });
         }
     }
@@ -2403,6 +2497,8 @@ fn with_marks<'a>(
         rotation: ready.view_rotation,
         size,
         marks,
+        mark: t.mark,
+        mark_current: t.mark_current,
     };
     stack![
         sheet,
@@ -2631,5 +2727,30 @@ mod tests {
         assert!(short.chars().count() <= 30);
         assert!(short.contains('…'));
         assert!(short.ends_with(".pdf"), "elipse no meio, fim intacto");
+    }
+
+    #[test]
+    fn search_count_shows_total_then_position() {
+        use super::search_count_text;
+        use crate::page::{Glyph, PageNo, Quad, TextLayer};
+        use crate::search::Search;
+        let layer = || TextLayer {
+            page: PageNo::first(),
+            plain: "a a".into(),
+            glyphs: vec![Glyph {
+                cluster: "a a".into(),
+                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+            }],
+        };
+        let empty = Search::derive("", &[]);
+        assert_eq!(search_count_text(&empty), None);
+        let none = Search::derive("zzz", &[Some(layer())]);
+        assert_eq!(search_count_text(&none).as_deref(), Some("0"));
+        let mut two = Search::derive("a", &[Some(layer())]);
+        assert_eq!(search_count_text(&two).as_deref(), Some("2"));
+        two.step(1);
+        assert_eq!(search_count_text(&two).as_deref(), Some("1 de 2"));
+        two.step(1);
+        assert_eq!(search_count_text(&two).as_deref(), Some("2 de 2"));
     }
 }

@@ -628,6 +628,8 @@ pub struct Tabs {
     open_error: Option<String>,
     /// Fechar com marcações não salvas espera Cancelar, Descartar ou Salvar.
     close_ask: Option<CloseTarget>,
+    /// Shift segurado agora (janela, não aba): decide Enter vs Shift+Enter.
+    shift_held: bool,
 }
 
 /// Fechamento que ainda precisa de confirmação.
@@ -660,6 +662,7 @@ impl Tabs {
             pending: None,
             open_error: None,
             close_ask: None,
+            shift_held: false,
         }
     }
 
@@ -852,6 +855,9 @@ pub struct Ready {
     outline_cursor: Option<Vec<usize>>,
     /// Evita disparar mais de um task de carregamento de outline por documento.
     outline_load_issued: bool,
+    /// Catálogo de caixas já pedido (uma vez). O contínuo não espera `PageData`
+    /// para saber a altura de cada página.
+    media_boxes_issued: bool,
     /// Tema Kiri — sobrevive a `begin_open`/`finish_open`/`close_document`.
     pub theme: Theme,
     /// Menu ⋯ aberto. Só existe em `Ready`; zera ao trocar de documento.
@@ -875,7 +881,7 @@ pub struct Ready {
     /// DPR da janela: bitmap sai em px físicos (zoom CSS × isto).
     pub render_scale: f32,
     open_gen: u64,
-    /// Identidade (tamanho+mtime) na última leitura; o poll compara com o disco.
+    /// Identidade (tamanho + mtime em nanos) na última leitura; o poll compara com o disco.
     disk_identity: Option<(u64, u64)>,
     /// O arquivo no disco divergiu e a sessão tem (ou teve) trabalho não salvo.
     /// O aviso fica fora de `save_status`. Recarregar é explícito.
@@ -994,17 +1000,102 @@ fn needs_sign_warning(signatures: &PdfAnalysis) -> bool {
     !signatures.signatures.is_empty()
 }
 
-/// Puro: o destino é o próprio original? O original nunca é sobrescrito —
-/// canonicaliza quando dá (caminhos relativos, symlinks) e cai para a
-/// comparação direta quando não (arquivo ainda inexistente).
+/// Puro: o destino é o próprio original? O original nunca é sobrescrito.
+/// Hard links compartilham o inode e `canonicalize` não os une, então a
+/// identidade é o par (dispositivo, inode). O caminho canônico cobre
+/// symlinks e relativos; destino inexistente cai na comparação direta.
 fn is_same_file(dest: &std::path::Path, src: &std::path::Path) -> bool {
     if dest == src {
+        return true;
+    }
+    if same_inode(dest, src) {
         return true;
     }
     match (dest.canonicalize(), src.canonicalize()) {
         (Ok(dest), Ok(src)) => dest == src,
         _ => false,
     }
+}
+
+/// Mesmo arquivo no disco, inclusive hard links. `metadata` segue symlinks.
+fn same_inode(dest: &std::path::Path, src: &std::path::Path) -> bool {
+    match (inode_key(dest), inode_key(src)) {
+        (Some(dest_id), Some(src_id)) => dest_id == src_id,
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn inode_key(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// `MetadataExt::file_index` é nightly (`windows_by_handle`). O índice
+/// estável sai de `GetFileInformationByHandle`: volume + nFileIndex.
+#[cfg(windows)]
+fn inode_key(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    let file = std::fs::File::open(path).ok()?;
+    windows_file_id(file.as_raw_handle())
+}
+
+#[cfg(windows)]
+fn windows_file_id(handle: std::os::windows::io::RawHandle) -> Option<(u64, u64)> {
+    #[repr(C)]
+    struct Filetime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: Filetime,
+        last_access_time: Filetime,
+        last_write_time: Filetime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: std::os::windows::io::RawHandle,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut info = ByHandleFileInformation {
+        file_attributes: 0,
+        creation_time: Filetime { low: 0, high: 0 },
+        last_access_time: Filetime { low: 0, high: 0 },
+        last_write_time: Filetime { low: 0, high: 0 },
+        volume_serial_number: 0,
+        file_size_high: 0,
+        file_size_low: 0,
+        number_of_links: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    };
+    // Safety: `handle` é um arquivo aberto e `info` tem o layout Win32 de
+    // `BY_HANDLE_FILE_INFORMATION`.
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    if ok == 0 {
+        return None;
+    }
+    let index = (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low);
+    Some((u64::from(info.volume_serial_number), index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inode_key(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// Monta o PDF de impressão. Com marcações, rasteriza uma cópia marcada
@@ -1300,6 +1391,11 @@ pub enum Message {
         doc_gen: u64,
         result: Result<(MediaBox, TextLayer), String>,
     },
+    /// Caixas de todas as páginas (sem texto). `doc_gen` casa a aba.
+    MediaBoxes {
+        doc_gen: u64,
+        result: Result<Vec<MediaBox>, String>,
+    },
     Close,
     /// Fecha a aba ativa (⌘W); se for a última, fecha a janela (→ `Empty`).
     CloseTabActive,
@@ -1325,6 +1421,13 @@ pub enum Message {
     RotateView,
     SetViewport(Viewport),
     SearchChanged(String),
+    /// Enter no campo de busca: próximo hit (Shift+Enter volta um).
+    SearchSubmit,
+    /// Botões/F3: anda um hit para frente ou para trás, com wrap.
+    SearchNext,
+    SearchPrev,
+    /// Shift segurado (para o Shift+Enter saber a direção no submit).
+    ModifiersChanged(keyboard::Modifiers),
     PointerDown {
         page: PageNo,
         page_pt: [f32; 2],
@@ -1659,6 +1762,22 @@ impl Session {
                 }
                 self.schedule_work()
             }
+            Message::MediaBoxes { doc_gen, result } => {
+                if let Session::Ready(tabs) = self {
+                    let Some(ready) = tabs.by_gen(doc_gen) else {
+                        return Task::none();
+                    };
+                    if let Ok(boxes) = result {
+                        let n = ready.pages.media.len().min(boxes.len());
+                        for i in 0..n {
+                            if ready.pages.media[i].is_none() {
+                                ready.pages.media[i] = Some(boxes[i]);
+                            }
+                        }
+                    }
+                }
+                self.schedule_work()
+            }
             Message::Close => self.close_document(),
             Message::CloseTabActive => {
                 let index = match self {
@@ -1794,18 +1913,23 @@ impl Session {
                 self.schedule_work()
             }
             Message::SearchChanged(query) => {
-                let follow = if let Session::Ready(tabs) = self {
-                    let ready = tabs.active_mut();
-                    ready.set_query(query);
-                    // Primeiro hit, sem segurar o empréstimo da busca.
-                    if let Some(page) = ready.search.hits().first().map(|hit| hit.page) {
-                        ready.navigate_to(page);
-                    }
-                    nav_follow(ready)
-                } else {
-                    Task::none()
-                };
-                Task::batch([self.schedule_work(), follow])
+                // #74: digitar só recalcula os highlights — o salto é no Enter.
+                if let Session::Ready(tabs) = self {
+                    tabs.active_mut().set_query(query);
+                }
+                self.schedule_work()
+            }
+            Message::SearchSubmit => {
+                let back = matches!(self, Session::Ready(tabs) if tabs.shift_held);
+                self.search_step(if back { -1 } else { 1 })
+            }
+            Message::SearchNext => self.search_step(1),
+            Message::SearchPrev => self.search_step(-1),
+            Message::ModifiersChanged(modifiers) => {
+                if let Session::Ready(tabs) = self {
+                    tabs.shift_held = modifiers.shift();
+                }
+                Task::none()
             }
             Message::PointerDown {
                 page,
@@ -2646,6 +2770,10 @@ impl Session {
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 keyboard_message(key, modifiers, status)
             }
+            // Shift para o Shift+Enter: vale com foco ou sem (o submit lê).
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                Some(Message::ModifiersChanged(modifiers))
+            }
             _ => None,
         });
         // Tique só enquanto a primeira aba carrega: a barra indeterminada
@@ -3092,6 +3220,19 @@ impl Session {
         Task::batch([self.schedule_work(), self.nav_follow_active()])
     }
 
+    /// Passo da busca (#43): anda o índice, salta para a página do hit atual
+    /// e alinha a rolagem no contínuo. Sem hits é no-op.
+    fn search_step(&mut self, delta: i32) -> Task<Message> {
+        if let Session::Ready(tabs) = self {
+            let ready = tabs.active_mut();
+            ready.search.step(delta);
+            if let Some(page) = ready.search.current_hit().map(|hit| hit.page) {
+                ready.navigate_to(page);
+            }
+        }
+        Task::batch([self.schedule_work(), self.nav_follow_active()])
+    }
+
     fn schedule_work(&mut self) -> Task<Message> {
         let Session::Ready(ready) = self else {
             return Task::none();
@@ -3108,6 +3249,11 @@ impl Session {
         ready.evict_unused();
         if let Some(task) = ready.request_visible_render() {
             return task;
+        }
+        if ready.needs_media_boxes() {
+            ready.media_boxes_issued = true;
+            let doc_gen = ready.open_gen;
+            return media_boxes_task(ready.engine.clone(), doc_gen);
         }
         if let Some(page) = ready.next_page_data_target() {
             let doc_gen = ready.open_gen;
@@ -3143,6 +3289,17 @@ fn page_data_task(engine: PdfiumEngine, page: PageNo, doc_gen: u64) -> Task<Mess
             doc_gen,
             result,
         },
+    )
+}
+
+fn media_boxes_task(engine: PdfiumEngine, doc_gen: u64) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || engine.media_boxes().map_err(|e| e.to_string()))
+                .await
+                .map_err(|e| e.to_string())?
+        },
+        move |result| Message::MediaBoxes { doc_gen, result },
     )
 }
 
@@ -3213,6 +3370,17 @@ pub(crate) fn keyboard_message(
     if (modifiers.logo() || modifiers.control()) && !modifiers.alt() {
         if let Key::Named(Named::Enter) = key.as_ref() {
             return Some(Message::NoteSave);
+        }
+    }
+    // F3/Shift+F3 andam na busca com o campo focado ou não: o text_input
+    // não consome F3, então o atalho vale antes da guarda de foco.
+    if let Key::Named(Named::F3) = key.as_ref() {
+        if !modifiers.control() && !modifiers.logo() && !modifiers.alt() {
+            return Some(if modifiers.shift() {
+                Message::SearchPrev
+            } else {
+                Message::SearchNext
+            });
         }
     }
     if status != event::Status::Ignored {
@@ -3358,10 +3526,18 @@ impl Ready {
     }
 
     pub fn media(&self, page: PageNo) -> MediaBox {
-        self.loaded_media(page).unwrap_or(MediaBox {
-            width: 1.0,
-            height: 1.0,
-        })
+        self.loaded_media(page)
+            .or_else(|| self.stand_in_media())
+            .unwrap_or(MediaBox {
+                width: 1.0,
+                height: 1.0,
+            })
+    }
+
+    /// Primeira caixa já lida. Página sem `PageData` herda isto no layout:
+    /// 1×1 pt, no ajuste à largura, vira um quadrado da largura do painel.
+    fn stand_in_media(&self) -> Option<MediaBox> {
+        self.pages.media.iter().find_map(|slot| *slot)
     }
 
     /// Escala de render em px físicos: zoom CSS × DPR da janela.
@@ -4360,19 +4536,33 @@ impl Ready {
     }
 
     fn page_data_priority(&self) -> Vec<PageNo> {
-        let mut pages = vec![self.visible];
+        let mut pages: Vec<PageNo> = Vec::new();
+        let mut push = |page: PageNo| {
+            if !pages.iter().any(|p: &PageNo| p.index() == page.index()) {
+                pages.push(page);
+            }
+        };
+        push(self.visible);
         let v = self.visible.index();
         if v + 1 < self.pages.total {
-            pages.push(PageNo::from_index(v + 1));
+            push(PageNo::from_index(v + 1));
+        }
+        if self.view_mode == ViewMode::Continuous {
+            let (start, end) = self.doc_window();
+            for index in start..end {
+                push(PageNo::from_index(index));
+            }
         }
         if self.pages_open {
             for page in self.thumb_page_window() {
-                if !pages.iter().any(|p| p.index() == page.index()) {
-                    pages.push(page);
-                }
+                push(page);
             }
         }
         pages
+    }
+
+    fn needs_media_boxes(&self) -> bool {
+        !self.media_boxes_issued && self.pages.media.iter().any(Option::is_none)
     }
 
     fn prefetch_target(&self) -> Option<(PageNo, Scale, u8)> {
@@ -4587,6 +4777,7 @@ impl Document {
             outline_collapsed: HashSet::new(),
             outline_cursor: None,
             outline_load_issued: false,
+            media_boxes_issued: false,
             pages_scroll_y: 0.0,
             doc_scroll_y: 0.0,
             recents: Vec::new(),
@@ -5190,6 +5381,134 @@ mod tests {
         assert_eq!(ready.doc_total_height(), ready.page_offset(last) + cell);
     }
 
+    /// Página sem `PageData` não pode medir 1×1 pt: no ajuste à largura isso
+    /// vira um quadrado da largura do painel e a coluna contínua (offset,
+    /// scrollbar, `page_at_offset`) persegue a geometria errada.
+    #[test]
+    fn continuous_unloaded_page_uses_known_media_not_unit_box() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let known = ready.loaded_media(PageNo::first()).expect("page 0");
+        assert!(known.width > 2.0 && known.height > 2.0);
+        let total = 4.max(ready.page_count());
+        ready.pages.total = total;
+        let text0 = ready.pages.text.first().cloned().flatten();
+        ready.pages.media = vec![None; total as usize];
+        ready.pages.text = vec![None; total as usize];
+        ready.pages.media[0] = Some(known);
+        ready.pages.text[0] = text0;
+        ready.view_mode = ViewMode::Continuous;
+        ready.zoom = Zoom::Width;
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.pages_open = false;
+        ready.signatures_open = false;
+
+        let tail = PageNo::from_index(total - 1);
+        assert!(ready.loaded_media(tail).is_none());
+        let got = ready.media(tail);
+        assert!((got.width - known.width).abs() < 0.01);
+        assert!((got.height - known.height).abs() < 0.01);
+
+        let h0 = ready.doc_cell_height(PageNo::first(), ready.sheet_width(PageNo::first()));
+        let ht = ready.doc_cell_height(tail, ready.sheet_width(tail));
+        assert!((h0 - ht).abs() < 0.01);
+
+        let square = DOC_PAD_TOP + ready.doc_content_width() + DOC_PAD_BOTTOM;
+        let aspect = known.height / known.width;
+        if (aspect - 1.0).abs() > 0.05 {
+            assert!(
+                (ht - square).abs() > 1.0,
+                "unloaded cell {ht} collapsed to the 1×1 square {square}"
+            );
+        }
+
+        let step = h0 + DOC_GAP;
+        assert_eq!(ready.page_offset(tail), (total - 1) as f32 * step);
+        assert_eq!(ready.page_at_offset(2.0 * step + 1.0).index(), 2);
+    }
+
+    /// A janela montada pede `PageData` além de visível+1. Sem isso o bitmap
+    /// da célula nunca chega e o prefetch persegue a página errada.
+    #[test]
+    fn continuous_page_data_includes_pages_past_the_next() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let known = ready.loaded_media(PageNo::first()).expect("page 0");
+        let text0 = ready.pages.text.first().cloned().flatten();
+        assert!(text0.is_some());
+        let total = 8.max(ready.page_count());
+        ready.pages.total = total;
+        ready.pages.media = vec![Some(known); total as usize];
+        ready.pages.text = vec![None; total as usize];
+        ready.pages.text[0] = text0.clone();
+        ready.pages.text[1] = text0;
+        ready.view_mode = ViewMode::Continuous;
+        ready.zoom = Zoom::Width;
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.pages_open = false;
+        ready.signatures_open = false;
+        ready.visible = PageNo::first();
+        ready.doc_scroll_y = 0.0;
+        let (start, end) = ready.doc_window();
+        assert!(end > 2, "window {start}..{end} should pass the next page");
+        let target = ready.next_page_data_target().expect("page in the window");
+        assert!(target.index() >= 2);
+        assert!(target.index() >= start && target.index() < end);
+    }
+
+    #[test]
+    fn media_boxes_fill_unloaded_slots_without_clobbering() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        if ready.page_count() < 2 {
+            return;
+        }
+        let known = ready.loaded_media(PageNo::first()).expect("page 0");
+        let gen = ready.open_gen;
+        let mut session = Session::Ready(Tabs::single(ready));
+        {
+            let Session::Ready(ready) = &mut session else {
+                unreachable!();
+            };
+            ready.pages.media[1] = None;
+        }
+        let distinct = MediaBox {
+            width: known.width + 10.0,
+            height: known.height + 20.0,
+        };
+        apply(
+            &mut session,
+            Message::MediaBoxes {
+                doc_gen: gen,
+                result: Ok(vec![
+                    MediaBox {
+                        width: 9.0,
+                        height: 9.0,
+                    },
+                    distinct,
+                ]),
+            },
+        );
+        let Session::Ready(ready) = &session else {
+            unreachable!();
+        };
+        let kept = ready.loaded_media(PageNo::first()).expect("page 0");
+        assert!((kept.width - known.width).abs() < 0.01);
+        assert!((kept.height - known.height).abs() < 0.01);
+        let filled = ready.loaded_media(PageNo::from_index(1)).expect("page 1");
+        assert!((filled.width - distinct.width).abs() < 0.01);
+        assert!((filled.height - distinct.height).abs() < 0.01);
+    }
+
     #[test]
     fn page_at_offset_resolves_borders_and_clamps() {
         let Some(ready) = uniform_ready() else {
@@ -5484,6 +5803,12 @@ mod tests {
                 _ => unreachable!(),
             };
             apply(&mut session, Message::SearchChanged("cláusula".into()));
+            assert_eq!(
+                visible(&session),
+                PageNo::first(),
+                "digitar não salta (#74)"
+            );
+            apply(&mut session, Message::SearchSubmit);
             assert_eq!(visible(&session), hit_page);
             apply(&mut session, Message::HistoryBack);
             assert_eq!(visible(&session), PageNo::first());
@@ -5491,6 +5816,115 @@ mod tests {
             assert_eq!(visible(&session), hit_page);
         });
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn search_submit_steps_through_hits_with_wrap() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let last = ready.page_count().saturating_sub(1);
+        if last < 1 {
+            return;
+        }
+        for idx in [0, last] {
+            let page = PageNo::from_index(idx);
+            ready.pages.text[idx as usize] = Some(TextLayer {
+                page,
+                plain: "alvo".into(),
+                glyphs: vec![Glyph {
+                    cluster: "alvo".into(),
+                    quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+                }],
+            });
+        }
+        let mut session = Session::Ready(Tabs::single(ready));
+        let state = |s: &Session| match s {
+            Session::Ready(r) => (r.visible, r.search.current()),
+            _ => unreachable!(),
+        };
+        apply(&mut session, Message::SearchChanged("alvo".into()));
+        assert_eq!(state(&session), (PageNo::first(), None));
+        apply(&mut session, Message::SearchSubmit);
+        assert_eq!(state(&session), (PageNo::first(), Some(0)));
+        apply(&mut session, Message::SearchNext);
+        assert_eq!(state(&session), (PageNo::from_index(last), Some(1)));
+        apply(&mut session, Message::SearchNext);
+        assert_eq!(state(&session), (PageNo::first(), Some(0)), "wrap");
+        apply(&mut session, Message::SearchPrev);
+        assert_eq!(
+            state(&session),
+            (PageNo::from_index(last), Some(1)),
+            "wrap reverso"
+        );
+    }
+
+    #[test]
+    fn shift_submit_opens_on_last_hit() {
+        use iced::keyboard::Modifiers;
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let last = ready.page_count().saturating_sub(1);
+        if last < 1 {
+            return;
+        }
+        for idx in [0, last] {
+            let page = PageNo::from_index(idx);
+            ready.pages.text[idx as usize] = Some(TextLayer {
+                page,
+                plain: "alvo".into(),
+                glyphs: vec![Glyph {
+                    cluster: "alvo".into(),
+                    quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+                }],
+            });
+        }
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::SearchChanged("alvo".into()));
+        apply(&mut session, Message::ModifiersChanged(Modifiers::SHIFT));
+        apply(&mut session, Message::SearchSubmit);
+        match &session {
+            Session::Ready(r) => {
+                assert_eq!(r.search.current(), Some(1));
+                assert_eq!(r.visible, PageNo::from_index(last));
+            }
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::ModifiersChanged(Modifiers::empty()));
+        apply(&mut session, Message::SearchSubmit);
+        match &session {
+            Session::Ready(r) => assert_eq!(r.search.current(), Some(0)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn f3_maps_to_search_nav_before_focus_guard() {
+        use iced::event::Status;
+        use iced::keyboard::Modifiers;
+        let f3 = Key::Named(Named::F3);
+        assert!(matches!(
+            keyboard_message(f3.clone(), Modifiers::empty(), Status::Ignored),
+            Some(Message::SearchNext)
+        ));
+        assert!(matches!(
+            keyboard_message(f3.clone(), Modifiers::SHIFT, Status::Ignored),
+            Some(Message::SearchPrev)
+        ));
+        // Com o campo focado o atalho continua valendo (pré-guarda).
+        assert!(matches!(
+            keyboard_message(f3.clone(), Modifiers::empty(), Status::Captured),
+            Some(Message::SearchNext)
+        ));
+        assert!(matches!(
+            keyboard_message(f3.clone(), Modifiers::SHIFT, Status::Captured),
+            Some(Message::SearchPrev)
+        ));
+        assert!(matches!(
+            keyboard_message(f3, Modifiers::CTRL, Status::Ignored),
+            None
+        ));
     }
 
     #[test]
@@ -5585,6 +6019,8 @@ mod tests {
                     | Message::CloseTabActive
                     | Message::NoteSave
                     | Message::ClosePrintDialog
+                    | Message::SearchNext
+                    | Message::SearchPrev
             )
         }
         #[cfg(target_os = "macos")]
@@ -8959,6 +9395,43 @@ mod tests {
     }
 
     #[test]
+    fn same_file_detects_hard_link_of_the_original() {
+        let dir = std::env::temp_dir().join(format!(
+            "tsuro-save-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("doc.pdf");
+        let link = dir.join("doc-link.pdf");
+        std::fs::write(&src, b"%PDF-1.4 original").unwrap();
+        std::fs::hard_link(&src, &link).unwrap();
+
+        // `canonicalize` deixa os dois caminhos distintos; o inode não.
+        assert_ne!(src.canonicalize().unwrap(), link.canonicalize().unwrap());
+        assert!(is_same_file(&link, &src));
+
+        std::fs::write(&link, b"%PDF-1.4 copy").unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"%PDF-1.4 copy");
+
+        let other = dir.join("outro.pdf");
+        std::fs::write(&other, b"%PDF-1.4 other").unwrap();
+        assert!(!is_same_file(&other, &src));
+
+        #[cfg(unix)]
+        {
+            let symlink = dir.join("doc-symlink.pdf");
+            std::os::unix::fs::symlink(&src, &symlink).unwrap();
+            assert!(is_same_file(&symlink, &src));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn save_without_annotations_sets_status_and_opens_nothing() {
         let Some(ready) = sample_ready() else {
             return;
@@ -9365,6 +9838,47 @@ mod tests {
         // Em voo: o tique seguinte não dispara de novo.
         apply(&mut session, Message::FileTick);
         assert!(active_ready(&session).reload_inflight);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pin_mtime(path: &std::path::Path, secs: u64, subsec_nanos: u32) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("abre para mtime");
+        let when = std::time::UNIX_EPOCH + std::time::Duration::new(secs, subsec_nanos);
+        file.set_modified(when).expect("define mtime");
+    }
+
+    /// O poll (2s) pode cair no mesmo segundo da escrita. Mesmo tamanho e
+    /// mtime truncado escondem a troca; o tique precisa recarregar.
+    #[test]
+    fn file_tick_reloads_same_size_edit_within_one_second() {
+        let Some((mut doc, dir)) = temp_copy_ready() else {
+            return;
+        };
+        let path = doc.source.path().to_path_buf();
+        let mut bytes = std::fs::read(&path).expect("lê a cópia");
+        let secs = 1_790_305_504u64;
+        pin_mtime(&path, secs, 157_899_200);
+        doc.disk_identity = crate::positions::file_identity(&path);
+        let stored = doc.disk_identity;
+        let mut session = Session::Ready(Tabs::single(doc));
+        bytes[0] ^= 0xff;
+        std::fs::write(&path, &bytes).expect("reescreve o mesmo tamanho");
+        pin_mtime(&path, secs, 161_899_200);
+        let current = crate::positions::file_identity(&path);
+        assert_eq!(
+            stored.map(|id| id.0),
+            current.map(|id| id.0),
+            "mesmo tamanho"
+        );
+        assert_ne!(stored, current, "o mesmo segundo ainda é outra versão");
+        apply(&mut session, Message::FileTick);
+        assert!(
+            active_ready(&session).reload_inflight,
+            "poll dentro do segundo recarrega"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
