@@ -519,6 +519,141 @@ pub enum OutlineKey {
     Next,
     Activate,
 }
+
+/// Ação da paleta (#45). Ids congelados; o despacho chega nas fatias 2+.
+#[allow(dead_code)] // fatia 1: domínio congelado, produtores/despacho nas fatias 2+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaletteAction {
+    GoToPage,
+    ZoomIn,
+    ZoomOut,
+    RotateView,
+    OpenPrintDialog,
+    SaveCopyRequested,
+    TogglePages,
+    FocusSearch,
+}
+
+/// Item da paleta. Fatia 1 não preenche a lista; as variantes já são o domínio.
+#[allow(dead_code)] // fatia 1: domínio congelado, produtores/despacho nas fatias 2+
+#[derive(Debug, Clone)]
+pub(crate) enum PaletteItem {
+    Action {
+        id: PaletteAction,
+        title: &'static str,
+        hint: Option<&'static str>,
+    },
+    DocHit {
+        page: PageNo,
+        excerpt: String,
+    },
+    OutlineRow {
+        path: Vec<usize>,
+        title: String,
+        page: PageNo,
+    },
+    Recent {
+        path: PathBuf,
+    },
+    GlobalHit {
+        path: PathBuf,
+        page: PageNo,
+        excerpt: String,
+    },
+}
+
+impl PaletteItem {
+    pub(crate) fn title(&self) -> &str {
+        match self {
+            Self::Action { title, .. } => title,
+            Self::DocHit { excerpt, .. } | Self::GlobalHit { excerpt, .. } => excerpt,
+            Self::OutlineRow { title, .. } => title,
+            Self::Recent { path } => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .or_else(|| path.as_os_str().to_str())
+                .unwrap_or(""),
+        }
+    }
+
+    pub(crate) fn subtitle(&self) -> Option<&str> {
+        match self {
+            Self::Action { hint, .. } => *hint,
+            Self::GlobalHit { path, .. } => path.file_name().and_then(|name| name.to_str()),
+            Self::DocHit { .. } | Self::OutlineRow { .. } | Self::Recent { .. } => None,
+        }
+    }
+
+    pub(crate) fn icon(&self) -> &'static str {
+        match self {
+            Self::Action { .. } => "more",
+            Self::DocHit { .. } => "search",
+            Self::OutlineRow { .. } => "file-text",
+            Self::Recent { .. } => "folder",
+            Self::GlobalHit { .. } => "pages",
+        }
+    }
+}
+
+/// Estado da paleta. `selected` é `Some` só com lista não vazia.
+#[derive(Debug, Clone)]
+pub(crate) struct PaletteState {
+    query: String,
+    items: Vec<PaletteItem>,
+    selected: Option<usize>,
+}
+
+impl PaletteState {
+    pub(crate) fn fresh() -> Self {
+        Self {
+            query: String::new(),
+            items: Vec::new(),
+            selected: None,
+        }
+    }
+
+    pub(crate) fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub(crate) fn items(&self) -> &[PaletteItem] {
+        &self.items
+    }
+
+    pub(crate) fn selected(&self) -> Option<usize> {
+        self.selected
+    }
+
+    #[allow(dead_code)] // fatia 1: funil único de confirm das fatias 2+
+    pub(crate) fn selected_item(&self) -> Option<&PaletteItem> {
+        self.selected.and_then(|index| self.items.get(index))
+    }
+
+    pub(crate) fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.retarget();
+    }
+
+    pub(crate) fn move_by(&mut self, step: i32) {
+        let len = self.items.len() as i32;
+        if len == 0 {
+            return;
+        }
+        let cur = self.selected.unwrap_or(0) as i32;
+        self.selected = Some((cur + step).rem_euclid(len) as usize);
+    }
+
+    /// Seam das fatias 2–5: as fontes preenchem `items`. Fatia 1 só esvazia.
+    pub(crate) fn refresh(&mut self) {
+        self.items.clear();
+    }
+
+    fn retarget(&mut self) {
+        self.refresh();
+        self.selected = (!self.items.is_empty()).then_some(0);
+    }
+}
+
 /// Pilha de páginas visitadas, como um navegador: `current()` é onde o leitor
 /// está. Separada do `Ready` para poder ser testada sem documento.
 #[derive(Debug, Clone)]
@@ -628,6 +763,9 @@ pub struct Tabs {
     open_error: Option<String>,
     /// Fechar com marcações não salvas espera Cancelar, Descartar ou Salvar.
     close_ask: Option<CloseTarget>,
+    /// Paleta de comandos (#45); `None` = fechada. Da janela, como `close_ask`:
+    /// as fontes atravessam abas, então não vive no `Ready`.
+    palette: Option<PaletteState>,
     /// Shift segurado agora (janela, não aba): decide Enter vs Shift+Enter.
     shift_held: bool,
 }
@@ -662,12 +800,26 @@ impl Tabs {
             pending: None,
             open_error: None,
             close_ask: None,
+            palette: None,
             shift_held: false,
         }
     }
 
     pub(crate) fn close_prompt(&self) -> bool {
         self.close_ask.is_some()
+    }
+
+    pub(crate) fn palette_open(&self) -> bool {
+        self.palette.is_some()
+    }
+
+    pub(crate) fn palette(&self) -> Option<&PaletteState> {
+        self.palette.as_ref()
+    }
+
+    fn request_close(&mut self, target: CloseTarget) {
+        self.palette = None;
+        self.close_ask = Some(target);
     }
 
     pub fn len(&self) -> usize {
@@ -1499,6 +1651,12 @@ pub enum Message {
     OutlineJump(PageNo),
     /// ↑/↓/Enter na árvore do sumário (ignorado sem a aba aberta).
     OutlineKey(OutlineKey),
+    OpenPalette,
+    PaletteQuery(String),
+    PaletteMove(i32),
+    PaletteConfirm,
+    PaletteClose,
+    PaletteSelect(usize),
     /// ⋯ → Imprimir: abre o diálogo próprio e lista impressoras em background.
     OpenPrintDialog,
     /// Lista do SO pronta; pré-seleciona a default (ou a primeira).
@@ -2294,6 +2452,14 @@ impl Session {
                 let Session::Ready(ready) = self else {
                     return Task::none();
                 };
+                // Paleta aberta come ↑/↓/Enter; fechada, o sumário segue como hoje.
+                if ready.palette_open() {
+                    return match cmd {
+                        OutlineKey::Prev => self.palette_move(-1),
+                        OutlineKey::Next => self.palette_move(1),
+                        OutlineKey::Activate => self.palette_confirm(),
+                    };
+                }
                 if !ready.outline_open || ready.outline.is_none() {
                     return Task::none();
                 }
@@ -2320,6 +2486,12 @@ impl Session {
                     },
                 }
             }
+            Message::OpenPalette => self.open_palette(),
+            Message::PaletteQuery(query) => self.palette_query(query),
+            Message::PaletteMove(step) => self.palette_move(step),
+            Message::PaletteConfirm => self.palette_confirm(),
+            Message::PaletteClose => self.palette_close(),
+            Message::PaletteSelect(index) => self.palette_select(index),
             Message::OpenPrintDialog => {
                 let Session::Ready(ready) = self else {
                     return Task::none();
@@ -2354,6 +2526,11 @@ impl Session {
             }
             Message::ClosePrintDialog => {
                 if let Session::Ready(ready) = self {
+                    // Paleta desfaz sozinha; o segundo Esc segue o cascade.
+                    if ready.palette_open() {
+                        ready.palette = None;
+                        return Task::none();
+                    }
                     if ready.close_ask.is_some() {
                         ready.close_ask = None;
                         return Task::none();
@@ -2940,7 +3117,7 @@ impl Session {
         }
         if self.any_unsaved() {
             if let Session::Ready(tabs) = self {
-                tabs.close_ask = Some(CloseTarget::Document);
+                tabs.request_close(CloseTarget::Document);
             }
             return Task::none();
         }
@@ -2980,7 +3157,7 @@ impl Session {
         }
         if self.tab_unsaved(index) {
             if let Session::Ready(tabs) = self {
-                tabs.close_ask = Some(CloseTarget::Tab(index));
+                tabs.request_close(CloseTarget::Tab(index));
             }
             return Task::none();
         }
@@ -3064,7 +3241,7 @@ impl Session {
     fn request_quit(&mut self, id: window::Id) -> Task<Message> {
         if self.any_unsaved() {
             if let Session::Ready(tabs) = self {
-                tabs.close_ask = Some(CloseTarget::Quit(id));
+                tabs.request_close(CloseTarget::Quit(id));
             }
             return Task::none();
         }
@@ -3182,6 +3359,57 @@ impl Session {
             ready.overflow_open = false;
         }
     }
+
+    fn open_palette(&mut self) -> Task<Message> {
+        let Session::Ready(tabs) = self else {
+            return Task::none();
+        };
+        tabs.overflow_open = false;
+        tabs.palette = Some(PaletteState::fresh());
+        iced::widget::text_input::focus(crate::view::palette_input_id())
+    }
+
+    fn palette_query(&mut self, query: String) -> Task<Message> {
+        if let Session::Ready(tabs) = self {
+            if let Some(palette) = tabs.palette.as_mut() {
+                palette.set_query(query);
+            }
+        }
+        Task::none()
+    }
+
+    fn palette_move(&mut self, step: i32) -> Task<Message> {
+        if let Session::Ready(tabs) = self {
+            if let Some(palette) = tabs.palette.as_mut() {
+                palette.move_by(step);
+            }
+        }
+        Task::none()
+    }
+
+    fn palette_confirm(&mut self) -> Task<Message> {
+        // Fatia 1: só fecha; o despacho chega nas fatias 2+.
+        self.palette_close()
+    }
+
+    fn palette_close(&mut self) -> Task<Message> {
+        if let Session::Ready(tabs) = self {
+            tabs.palette = None;
+        }
+        Task::none()
+    }
+
+    fn palette_select(&mut self, index: usize) -> Task<Message> {
+        if let Session::Ready(tabs) = self {
+            if let Some(palette) = tabs.palette.as_mut() {
+                if index < palette.items.len() {
+                    palette.selected = Some(index);
+                }
+            }
+        }
+        self.palette_confirm()
+    }
+
     fn render_scale(&self) -> f32 {
         match self {
             Session::Empty(empty) => empty.render_scale,
@@ -3413,6 +3641,12 @@ pub(crate) fn keyboard_message(
             });
         }
     }
+    // ⌘/Ctrl+K abre a paleta mesmo com campo focado (não é tecla de texto).
+    if (modifiers.logo() || modifiers.control()) && !modifiers.alt() {
+        if let Key::Character("k" | "K") = key.as_ref() {
+            return Some(Message::OpenPalette);
+        }
+    }
     if status != event::Status::Ignored {
         return None;
     }
@@ -3513,6 +3747,11 @@ pub(crate) fn shortcut_hint(msg: &Message) -> Option<&'static str> {
             "⌘O"
         } else {
             "Ctrl+O"
+        }),
+        Message::OpenPalette => Some(if cfg!(target_os = "macos") {
+            "⌘K"
+        } else {
+            "Ctrl+K"
         }),
         Message::RotateView => Some("R"),
         Message::CopyAnnotations => Some("M"),
@@ -10305,5 +10544,303 @@ mod tests {
         assert!(doc.pages.text[1].is_none(), "stale não instala");
         assert!(!doc.page_data_failed.contains(&1), "stale não suja falha");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn palette_hit(page: u32, excerpt: &str) -> PaletteItem {
+        PaletteItem::DocHit {
+            page: PageNo::from_index(page),
+            excerpt: excerpt.into(),
+        }
+    }
+
+    fn fill_palette(session: &mut Session, items: Vec<PaletteItem>) {
+        let Session::Ready(tabs) = session else {
+            panic!("esperava Ready");
+        };
+        let palette = tabs.palette.as_mut().expect("paleta aberta");
+        palette.selected = if items.is_empty() { None } else { Some(0) };
+        palette.items = items;
+    }
+
+    #[test]
+    fn palette_query_resets_selection_via_retarget() {
+        let mut palette = PaletteState::fresh();
+        palette.items = vec![
+            palette_hit(0, "a"),
+            palette_hit(1, "b"),
+            palette_hit(2, "c"),
+        ];
+        palette.selected = Some(2);
+        palette.set_query("foo".into());
+        assert_eq!(palette.query(), "foo");
+        assert!(palette.items().is_empty());
+        assert_eq!(palette.selected(), None);
+        assert!(palette.selected_item().is_none());
+    }
+
+    #[test]
+    fn palette_move_wraps_and_noops_when_empty() {
+        let mut palette = PaletteState::fresh();
+        palette.move_by(1);
+        palette.move_by(-1);
+        assert_eq!(palette.selected(), None);
+        palette.items = vec![
+            palette_hit(0, "a"),
+            palette_hit(1, "b"),
+            palette_hit(2, "c"),
+        ];
+        palette.selected = Some(0);
+        palette.move_by(-1);
+        assert_eq!(palette.selected(), Some(2));
+        palette.move_by(1);
+        assert_eq!(palette.selected(), Some(0));
+        palette.move_by(2);
+        assert_eq!(palette.selected(), Some(2));
+        assert_eq!(palette.selected_item().unwrap().title(), "c");
+    }
+
+    #[test]
+    fn palette_item_display_uses_existing_ori_icons() {
+        let action = PaletteItem::Action {
+            id: PaletteAction::ZoomIn,
+            title: "Aumentar zoom",
+            hint: Some("Ctrl++"),
+        };
+        assert_eq!(action.title(), "Aumentar zoom");
+        assert_eq!(action.subtitle(), Some("Ctrl++"));
+        assert_eq!(action.icon(), "more");
+        let hit = palette_hit(0, "trecho");
+        assert_eq!(hit.title(), "trecho");
+        assert_eq!(hit.subtitle(), None);
+        assert_eq!(hit.icon(), "search");
+        let outline = PaletteItem::OutlineRow {
+            path: vec![0],
+            title: "Capítulo".into(),
+            page: PageNo::first(),
+        };
+        assert_eq!(outline.title(), "Capítulo");
+        assert_eq!(outline.icon(), "file-text");
+        let recent = PaletteItem::Recent {
+            path: PathBuf::from("/tmp/guia-folio.pdf"),
+        };
+        assert_eq!(recent.title(), "guia-folio.pdf");
+        assert_eq!(recent.icon(), "folder");
+        let global = PaletteItem::GlobalHit {
+            path: PathBuf::from("/tmp/guia-folio.pdf"),
+            page: PageNo::from_index(1),
+            excerpt: "achado".into(),
+        };
+        assert_eq!(global.title(), "achado");
+        assert_eq!(global.subtitle(), Some("guia-folio.pdf"));
+        assert_eq!(global.icon(), "pages");
+    }
+
+    #[test]
+    fn ctrl_k_opens_palette_before_focus_guard() {
+        use iced::event::Status;
+        use iced::keyboard::Modifiers;
+        let key = Key::Character("k".into());
+        let upper = Key::Character("K".into());
+        #[cfg(target_os = "macos")]
+        let cmd = Modifiers::LOGO;
+        #[cfg(not(target_os = "macos"))]
+        let cmd = Modifiers::CTRL;
+        assert!(matches!(
+            keyboard_message(key.clone(), cmd, Status::Ignored),
+            Some(Message::OpenPalette)
+        ));
+        assert!(matches!(
+            keyboard_message(key.clone(), cmd, Status::Captured),
+            Some(Message::OpenPalette)
+        ));
+        assert!(matches!(
+            keyboard_message(upper, Modifiers::CTRL, Status::Captured),
+            Some(Message::OpenPalette)
+        ));
+        assert!(keyboard_message(key, cmd | Modifiers::ALT, Status::Ignored).is_none());
+    }
+
+    #[test]
+    fn open_palette_sets_empty_state_and_closes_on_confirm_select() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.overflow_open = true;
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::OpenPalette);
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(tabs.palette_open());
+                let palette = tabs.palette().expect("aberta");
+                assert!(palette.query().is_empty());
+                assert!(palette.items().is_empty());
+                assert_eq!(palette.selected(), None);
+                assert!(!tabs.overflow_open);
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+        apply(&mut session, Message::PaletteConfirm);
+        match &session {
+            Session::Ready(tabs) => assert!(!tabs.palette_open()),
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+        apply(&mut session, Message::OpenPalette);
+        fill_palette(&mut session, vec![palette_hit(0, "a"), palette_hit(1, "b")]);
+        apply(&mut session, Message::PaletteSelect(1));
+        match &session {
+            Session::Ready(tabs) => assert!(!tabs.palette_open()),
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+        apply(&mut session, Message::OpenPalette);
+        apply(&mut session, Message::PaletteClose);
+        match &session {
+            Session::Ready(tabs) => assert!(!tabs.palette_open()),
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+        let mut empty = Session::empty();
+        apply(&mut empty, Message::OpenPalette);
+        assert!(matches!(empty, Session::Empty(_)));
+    }
+
+    #[test]
+    fn palette_query_message_resets_selection() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::OpenPalette);
+        fill_palette(
+            &mut session,
+            vec![
+                palette_hit(0, "a"),
+                palette_hit(1, "b"),
+                palette_hit(2, "c"),
+            ],
+        );
+        if let Session::Ready(tabs) = &mut session {
+            tabs.palette.as_mut().unwrap().selected = Some(2);
+        }
+        apply(&mut session, Message::PaletteQuery("x".into()));
+        match &session {
+            Session::Ready(tabs) => {
+                let palette = tabs.palette().expect("aberta");
+                assert_eq!(palette.query(), "x");
+                assert!(palette.items().is_empty());
+                assert_eq!(palette.selected(), None);
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn palette_move_message_wraps_like_cycle() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::OpenPalette);
+        apply(&mut session, Message::PaletteMove(1));
+        match &session {
+            Session::Ready(tabs) => assert_eq!(tabs.palette().unwrap().selected(), None),
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+        fill_palette(
+            &mut session,
+            vec![
+                palette_hit(0, "a"),
+                palette_hit(1, "b"),
+                palette_hit(2, "c"),
+            ],
+        );
+        apply(&mut session, Message::PaletteMove(-1));
+        match &session {
+            Session::Ready(tabs) => assert_eq!(tabs.palette().unwrap().selected(), Some(2)),
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+        apply(&mut session, Message::PaletteMove(1));
+        match &session {
+            Session::Ready(tabs) => assert_eq!(tabs.palette().unwrap().selected(), Some(0)),
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escape_unwinds_palette_only() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.note_draft = Some(dummy_draft());
+        ready.selection = Some(Selection {
+            page: PageNo::first(),
+            range: TextRange { start: 0, end: 2 },
+        });
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::OpenPalette);
+        apply(&mut session, Message::ClosePrintDialog);
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(!tabs.palette_open());
+                assert!(tabs.note_draft.is_some());
+                assert!(tabs.selection.is_some());
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outline_key_steals_when_palette_open_and_navigates_when_closed() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(Tabs::single(ready));
+        let doc_gen = active_ready(&session).open_gen;
+        apply(
+            &mut session,
+            Message::OutlineLoaded {
+                doc_gen,
+                outline: Some(outline_tree()),
+            },
+        );
+        apply(&mut session, Message::OutlineTab(true));
+        match &session {
+            Session::Ready(r) => assert_eq!(r.outline_focus(), Some(vec![0])),
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::OpenPalette);
+        apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(tabs.palette_open());
+                assert_eq!(tabs.outline_focus(), Some(vec![0]));
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+        apply(&mut session, Message::PaletteClose);
+        apply(&mut session, Message::OutlineKey(OutlineKey::Next));
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(!tabs.palette_open());
+                assert_eq!(tabs.outline_focus(), Some(vec![0, 0]));
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_close_clears_open_palette() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.annotations.push(unsaved_mark());
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::OpenPalette);
+        apply(&mut session, Message::Close);
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(!tabs.palette_open());
+                assert_eq!(tabs.close_ask, Some(CloseTarget::Document));
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
     }
 }

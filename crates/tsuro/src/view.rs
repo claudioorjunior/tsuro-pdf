@@ -17,8 +17,9 @@ use crate::print::{PrintOrientation, MAX_COPIES};
 use crate::search::Search;
 use crate::session::{
     display_pt, display_rect, marker_side, page_pt_at, AnnotKind, Message, NavCmd, NoteDraft,
-    OpenSource, PrintDialog, RangeMode, Ready, Session, Tabs, ViewMode, Zoom, ZoomFactor, DOC_GAP,
-    DOC_PAD_BOTTOM, DOC_PAD_TOP, DOC_PAD_X, PAGES_PANEL_W, SIG_PANEL_W, THUMB_ROW,
+    OpenSource, PaletteState, PrintDialog, RangeMode, Ready, Session, Tabs, ViewMode, Zoom,
+    ZoomFactor, DOC_GAP, DOC_PAD_BOTTOM, DOC_PAD_TOP, DOC_PAD_X, PAGES_PANEL_W, SIG_PANEL_W,
+    THUMB_ROW,
 };
 
 /// Altura do chrome Kiri: toolbar 36px + progresso 2px + respiro.
@@ -52,6 +53,10 @@ pub fn doc_scroll_id() -> scrollable::Id {
 /// Campo de busca da toolbar (Ctrl+F foca aqui).
 pub fn search_input_id() -> text_input::Id {
     text_input::Id::new("tsuro-search")
+}
+
+pub fn palette_input_id() -> text_input::Id {
+    text_input::Id::new("tsuro-palette")
 }
 
 pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
@@ -99,6 +104,11 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
     match session {
         // Fechar com marcações sujas fica por cima dos outros modais.
         Session::Ready(ready) if ready.close_prompt() => stack![main, close_prompt_layer(t)].into(),
+        Session::Ready(tabs) if tabs.palette_open() => stack![
+            main,
+            palette_layer(tabs.palette().as_ref().expect("checked above"), t)
+        ]
+        .into(),
         // Modal de impressão captura tudo; menu ⋯ nunca abre junto (fecha ao abrir).
         Session::Ready(ready) if ready.print_dialog.is_some() => {
             let dialog = ready.print_dialog.as_ref().expect("checked above");
@@ -1425,6 +1435,73 @@ fn close_prompt_card(t: Tokens) -> Element<'static, Message> {
     .padding(16)
     .style(kiri::menu_style(t))
     .into()
+}
+
+/// Só o estado da paleta — o overlay não pede Tabs/Ready.
+fn palette_layer(palette: &PaletteState, t: Tokens) -> Element<'_, Message> {
+    let dim = container(Space::with_width(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.25))),
+            ..container::Style::default()
+        });
+    // Âncora no topo (Spotlight/VSCode), não no centro como os outros modais.
+    let card = container(mouse_area(palette_card(palette, t)).on_press(Message::PrintNop))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Start)
+        .padding(Padding {
+            top: 64.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+    stack![mouse_area(dim).on_press(Message::PaletteClose), card].into()
+}
+
+fn palette_card(palette: &PaletteState, t: Tokens) -> Element<'_, Message> {
+    let query = text_input("Digite um comando…", palette.query())
+        .id(palette_input_id())
+        .on_input(Message::PaletteQuery)
+        .on_submit(Message::PaletteConfirm)
+        .style(kiri::bar_input_style(t))
+        .padding([8, 10])
+        .size(14)
+        .width(Length::Fill);
+    let mut rows = column![].spacing(2);
+    if palette.items().is_empty() {
+        rows = rows.push(text("Nenhum resultado").size(13).color(t.muted));
+    } else {
+        for (i, item) in palette.items().iter().enumerate() {
+            let selected = Some(i) == palette.selected();
+            rows = rows.push(
+                button(
+                    row![
+                        kiri::ori_icon(item.icon(), 16.0),
+                        column![
+                            text(item.title()).size(13),
+                            text(item.subtitle().unwrap_or("")).size(11).color(t.muted),
+                        ]
+                        .spacing(1),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill),
+                )
+                .width(Length::Fill)
+                .padding(Padding::from([8, 10]))
+                .style(kiri::panel_seg_style(t, selected))
+                .on_press(Message::PaletteSelect(i)),
+            );
+        }
+    }
+    container(column![query, rows].spacing(8))
+        .width(Length::Fixed(560.0))
+        .padding(12)
+        .style(kiri::menu_style(t))
+        .into()
 }
 
 /// Pergunta sim/não do aviso de assinatura; "Salvar mesmo assim" segue para o
