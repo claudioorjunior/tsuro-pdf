@@ -1136,13 +1136,23 @@ fn is_same_file(dest: &std::path::Path, src: &std::path::Path) -> bool {
     }
 }
 
-/// Monta o PDF de impressão. Sem marcações, rasteriza o documento aberto.
+/// Monta o PDF de impressão. Com marcações, rasteriza uma cópia marcada
+/// para o destaque entrar na página. Sem marcações, usa o documento aberto.
 fn print_job_pdf(
     engine: &PdfiumEngine,
-    _annotations: &[Annotation],
+    annotations: &[Annotation],
     selection: PrintSelection,
 ) -> Result<Vec<u8>, String> {
-    print_selection_pdf(engine, selection).map_err(|err| err.to_string())
+    if annotations.is_empty() {
+        return print_selection_pdf(engine, selection).map_err(|err| err.to_string());
+    }
+    let bytes = engine
+        .save_copy(annotations)
+        .map_err(|err| err.to_string())?;
+    let marked = PdfiumEngine::open(Arc::from(bytes)).map_err(|err| err.to_string())?;
+    let pdf = print_selection_pdf(&marked, selection).map_err(|err| err.to_string());
+    marked.close();
+    pdf
 }
 
 /// Grava a cópia marcada em `dest`. O documento aberto não muda.
@@ -2393,6 +2403,7 @@ impl Session {
                 let doc_gen = ready.open_gen;
                 let title = print_job_title(ready);
                 let engine = ready.engine.clone();
+                let annotations = ready.annotations.clone();
                 let Some(dialog) = ready.print_dialog.as_mut() else {
                     return Task::none();
                 };
@@ -2413,7 +2424,7 @@ impl Session {
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            match print_selection_pdf(&engine, selection) {
+                            match print_job_pdf(&engine, &annotations, selection) {
                                 Ok(pdf) => {
                                     spool_pdf(&printer, &pdf, &title).map_err(|err| err.to_string())
                                 }
@@ -2467,6 +2478,7 @@ impl Session {
                 let doc_gen = ready.open_gen;
                 let source = ready.source.path().to_path_buf();
                 let engine = ready.engine.clone();
+                let annotations = ready.annotations.clone();
                 let Some(dialog) = ready.print_dialog.as_mut() else {
                     return Task::none();
                 };
@@ -2482,7 +2494,7 @@ impl Session {
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            match print_selection_pdf(&engine, selection) {
+                            match print_job_pdf(&engine, &annotations, selection) {
                                 Ok(pdf) => write_and_open_print_pdf(&pdf, &source)
                                     .map(|path| path.display().to_string())
                                     .map_err(|err| err.to_string()),
@@ -8615,7 +8627,12 @@ mod tests {
         let Some(Some(text)) = ready.pages.text.get(page.index() as usize) else {
             return;
         };
-        let quads: Vec<Quad> = text.glyphs.iter().take(8).map(|glyph| glyph.quad).collect();
+        let quads: Vec<Quad> = text
+            .glyphs
+            .iter()
+            .take(40)
+            .map(|glyph| glyph.quad)
+            .collect();
         if quads.is_empty() {
             return;
         }
@@ -8636,8 +8653,22 @@ mod tests {
             copies: 1,
             orientation: PrintOrientation::Auto,
         };
+        let live_before = ready
+            .engine
+            .annotations(page)
+            .expect("anotações do aberto")
+            .len();
         let clean = print_job_pdf(&ready.engine, &[], selection).expect("print limpo");
         let marked = print_job_pdf(&ready.engine, &[mark], selection).expect("print marcado");
+        assert_eq!(
+            ready
+                .engine
+                .annotations(page)
+                .expect("aberto após imprimir")
+                .len(),
+            live_before,
+            "imprimir não grava no documento aberto"
+        );
         let clean_px = first_page_rgba(&clean);
         let marked_px = first_page_rgba(&marked);
         assert_eq!(clean_px.len(), marked_px.len());
