@@ -1476,15 +1476,20 @@ fn palette_card(palette: &PaletteState, t: Tokens) -> Element<'_, Message> {
     } else {
         for (i, item) in palette.items().iter().enumerate() {
             let selected = Some(i) == palette.selected();
+            let mut titlecol = column![text(item.title()).size(13)].spacing(1);
+            // Segunda linha só com hint; sem isso a linha fica compacta.
+            if let Some(sub) = item.subtitle() {
+                if !sub.is_empty() {
+                    titlecol = titlecol.push(text(sub).size(11).color(t.muted));
+                }
+            }
             rows = rows.push(
                 button(
                     row![
                         kiri::ori_icon(item.icon(), 16.0),
-                        column![
-                            text(item.title()).size(13),
-                            text(item.subtitle().unwrap_or("")).size(11).color(t.muted),
-                        ]
-                        .spacing(1),
+                        titlecol,
+                        Space::with_width(Length::Fill),
+                        text((i + 1).to_string()).size(11).color(t.muted),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center)

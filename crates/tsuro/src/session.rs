@@ -520,8 +520,7 @@ pub enum OutlineKey {
     Activate,
 }
 
-/// Ação da paleta (#45). Ids congelados; o despacho chega nas fatias 2+.
-#[allow(dead_code)] // fatia 1: domínio congelado, produtores/despacho nas fatias 2+
+/// Ação da paleta (#45). Ids congelados; a fatia 2 despacha o catálogo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaletteAction {
     GoToPage,
@@ -534,8 +533,21 @@ pub(crate) enum PaletteAction {
     FocusSearch,
 }
 
-/// Item da paleta. Fatia 1 não preenche a lista; as variantes já são o domínio.
-#[allow(dead_code)] // fatia 1: domínio congelado, produtores/despacho nas fatias 2+
+impl PaletteAction {
+    pub(crate) const ALL: [PaletteAction; 8] = [
+        PaletteAction::GoToPage,
+        PaletteAction::ZoomIn,
+        PaletteAction::ZoomOut,
+        PaletteAction::RotateView,
+        PaletteAction::OpenPrintDialog,
+        PaletteAction::SaveCopyRequested,
+        PaletteAction::TogglePages,
+        PaletteAction::FocusSearch,
+    ];
+}
+
+/// Item da paleta. A fatia 2 preenche as ações; as demais variantes são o domínio.
+#[allow(dead_code)] // fatia 2: variantes das fatias 3-5 ainda sem produtores
 #[derive(Debug, Clone)]
 pub(crate) enum PaletteItem {
     Action {
@@ -563,6 +575,27 @@ pub(crate) enum PaletteItem {
 }
 
 impl PaletteItem {
+    pub(crate) fn action(id: PaletteAction) -> Self {
+        let (title, hint) = match id {
+            PaletteAction::GoToPage => ("Ir para página…", Some("Digite o número")),
+            PaletteAction::ZoomIn => ("Aumentar zoom", Some("+")),
+            PaletteAction::ZoomOut => ("Diminuir zoom", Some("-")),
+            PaletteAction::RotateView => ("Girar vista (90°)", Some("R")),
+            PaletteAction::OpenPrintDialog => {
+                ("Imprimir…", shortcut_hint(&Message::OpenPrintDialog))
+            }
+            PaletteAction::SaveCopyRequested => (
+                "Salvar cópia com marcações…",
+                shortcut_hint(&Message::SaveCopyRequested),
+            ),
+            PaletteAction::TogglePages => ("Painel de páginas", None),
+            PaletteAction::FocusSearch => {
+                ("Buscar no documento", shortcut_hint(&Message::FocusSearch))
+            }
+        };
+        Self::Action { id, title, hint }
+    }
+
     pub(crate) fn title(&self) -> &str {
         match self {
             Self::Action { title, .. } => title,
@@ -605,11 +638,13 @@ pub(crate) struct PaletteState {
 
 impl PaletteState {
     pub(crate) fn fresh() -> Self {
-        Self {
+        let mut state = Self {
             query: String::new(),
             items: Vec::new(),
             selected: None,
-        }
+        };
+        state.retarget();
+        state
     }
 
     pub(crate) fn query(&self) -> &str {
@@ -624,7 +659,6 @@ impl PaletteState {
         self.selected
     }
 
-    #[allow(dead_code)] // fatia 1: funil único de confirm das fatias 2+
     pub(crate) fn selected_item(&self) -> Option<&PaletteItem> {
         self.selected.and_then(|index| self.items.get(index))
     }
@@ -643,15 +677,43 @@ impl PaletteState {
         self.selected = Some((cur + step).rem_euclid(len) as usize);
     }
 
-    /// Seam das fatias 2–5: as fontes preenchem `items`. Fatia 1 só esvazia.
+    /// Seam das fatias 2–5: serve as ações do catálogo. As fatias 3–5
+    /// acrescentam fontes que precisam de contexto (documento, outline, recents).
     pub(crate) fn refresh(&mut self) {
-        self.items.clear();
+        let query = self.query.as_str();
+        let mut scored: Vec<(u8, PaletteItem)> = PaletteAction::ALL
+            .into_iter()
+            .map(PaletteItem::action)
+            .filter_map(|item| palette_match(query, item.title()).map(|score| (score, item)))
+            .collect();
+        scored.sort_by_key(|(score, item)| (*score, item.title().to_lowercase()));
+        self.items = scored.into_iter().map(|(_, item)| item).collect();
     }
 
     fn retarget(&mut self) {
         self.refresh();
         self.selected = (!self.items.is_empty()).then_some(0);
     }
+}
+
+/// Casa `query` com `title` para a paleta: 0 = substring (ou query vazia),
+/// 1 = subsequência na ordem, `None` = sem casa.
+fn palette_match(query: &str, title: &str) -> Option<u8> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let title = title.to_lowercase();
+    if title.contains(&query) {
+        return Some(0);
+    }
+    let mut haystack = title.chars();
+    for needle in query.chars() {
+        if !haystack.any(|ch| ch == needle) {
+            return None;
+        }
+    }
+    Some(1)
 }
 
 /// Pilha de páginas visitadas, como um navegador: `current()` é onde o leitor
@@ -3387,9 +3449,48 @@ impl Session {
         Task::none()
     }
 
+    fn run_action(&mut self, id: PaletteAction) -> Task<Message> {
+        if let Session::Ready(tabs) = self {
+            tabs.palette = None;
+        }
+        match id {
+            PaletteAction::GoToPage => {
+                // Sem Id no campo de página da toolbar: o text_input em
+                // view.rs não tem `.id()` (só search_input_id / pages_scroll_id
+                // / palette_input_id). Fecha só — sem parse nem salto.
+                Task::none()
+            }
+            PaletteAction::ZoomIn => self.update(Message::ZoomIn),
+            PaletteAction::ZoomOut => self.update(Message::ZoomOut),
+            PaletteAction::RotateView => self.update(Message::RotateView),
+            PaletteAction::OpenPrintDialog => self.update(Message::OpenPrintDialog),
+            PaletteAction::SaveCopyRequested => self.update(Message::SaveCopyRequested),
+            PaletteAction::TogglePages => self.update(Message::TogglePages),
+            PaletteAction::FocusSearch => self.update(Message::FocusSearch),
+        }
+    }
+
     fn palette_confirm(&mut self) -> Task<Message> {
-        // Fatia 1: só fecha; o despacho chega nas fatias 2+.
-        self.palette_close()
+        let item = if let Session::Ready(tabs) = self {
+            tabs.palette
+                .as_ref()
+                .and_then(|palette| palette.selected_item().cloned())
+        } else {
+            None
+        };
+        match item {
+            None => self.palette_close(),
+            Some(PaletteItem::Action { id, .. }) => self.run_action(id),
+            Some(
+                PaletteItem::DocHit { .. }
+                | PaletteItem::OutlineRow { .. }
+                | PaletteItem::Recent { .. }
+                | PaletteItem::GlobalHit { .. },
+            ) => {
+                // Inalcançável até as fatias 3–5 (fontes com contexto).
+                self.palette_close()
+            }
+        }
     }
 
     fn palette_close(&mut self) -> Task<Message> {
@@ -10562,6 +10663,21 @@ mod tests {
         palette.items = items;
     }
 
+    fn select_palette_action(session: &mut Session, id: PaletteAction) {
+        let Session::Ready(tabs) = session else {
+            panic!("esperava Ready");
+        };
+        let palette = tabs.palette.as_mut().expect("paleta aberta");
+        let index = palette
+            .items
+            .iter()
+            .position(
+                |item| matches!(item, PaletteItem::Action { id: item_id, .. } if *item_id == id),
+            )
+            .expect("ação no catálogo");
+        palette.selected = Some(index);
+    }
+
     #[test]
     fn palette_query_resets_selection_via_retarget() {
         let mut palette = PaletteState::fresh();
@@ -10581,6 +10697,8 @@ mod tests {
     #[test]
     fn palette_move_wraps_and_noops_when_empty() {
         let mut palette = PaletteState::fresh();
+        // "foo" não casa nada: lista vazia, move é no-op.
+        palette.set_query("foo".into());
         palette.move_by(1);
         palette.move_by(-1);
         assert_eq!(palette.selected(), None);
@@ -10673,8 +10791,12 @@ mod tests {
                 assert!(tabs.palette_open());
                 let palette = tabs.palette().expect("aberta");
                 assert!(palette.query().is_empty());
-                assert!(palette.items().is_empty());
-                assert_eq!(palette.selected(), None);
+                assert_eq!(palette.items().len(), 8);
+                assert_eq!(palette.selected(), Some(0));
+                assert!(palette
+                    .items()
+                    .iter()
+                    .all(|item| matches!(item, PaletteItem::Action { .. })));
                 assert!(!tabs.overflow_open);
             }
             other => panic!("esperava Ready, veio {other:?}"),
@@ -10741,7 +10863,7 @@ mod tests {
         apply(&mut session, Message::OpenPalette);
         apply(&mut session, Message::PaletteMove(1));
         match &session {
-            Session::Ready(tabs) => assert_eq!(tabs.palette().unwrap().selected(), None),
+            Session::Ready(tabs) => assert_eq!(tabs.palette().unwrap().selected(), Some(1)),
             other => panic!("esperava Ready, veio {other:?}"),
         }
         fill_palette(
@@ -10821,6 +10943,155 @@ mod tests {
             Session::Ready(tabs) => {
                 assert!(!tabs.palette_open());
                 assert_eq!(tabs.outline_focus(), Some(vec![0, 0]));
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_all_eight_titles() {
+        use std::collections::HashSet;
+        let titles: HashSet<&str> = PaletteAction::ALL
+            .iter()
+            .map(|id| match PaletteItem::action(*id) {
+                PaletteItem::Action { title, .. } => title,
+                other => panic!("esperava Action, veio {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            HashSet::from([
+                "Ir para página…",
+                "Aumentar zoom",
+                "Diminuir zoom",
+                "Girar vista (90°)",
+                "Imprimir…",
+                "Salvar cópia com marcações…",
+                "Painel de páginas",
+                "Buscar no documento",
+            ])
+        );
+        assert_eq!(PaletteAction::ALL.len(), 8);
+        for id in PaletteAction::ALL {
+            match PaletteItem::action(id) {
+                PaletteItem::Action { id: got, hint, .. } => {
+                    assert_eq!(got, id);
+                    let expect = match id {
+                        PaletteAction::GoToPage => Some("Digite o número"),
+                        PaletteAction::ZoomIn => Some("+"),
+                        PaletteAction::ZoomOut => Some("-"),
+                        PaletteAction::RotateView => Some("R"),
+                        PaletteAction::OpenPrintDialog => shortcut_hint(&Message::OpenPrintDialog),
+                        PaletteAction::SaveCopyRequested => {
+                            shortcut_hint(&Message::SaveCopyRequested)
+                        }
+                        PaletteAction::TogglePages => None,
+                        PaletteAction::FocusSearch => shortcut_hint(&Message::FocusSearch),
+                    };
+                    assert_eq!(hint, expect, "{id:?}");
+                }
+                other => panic!("esperava Action, veio {other:?}"),
+            }
+        }
+        let mut palette = PaletteState::fresh();
+        let refreshed: HashSet<&str> = palette.items().iter().map(|item| item.title()).collect();
+        assert_eq!(refreshed, titles);
+        palette.set_query(String::new());
+        let again: HashSet<&str> = palette.items().iter().map(|item| item.title()).collect();
+        assert_eq!(again, titles);
+    }
+
+    #[test]
+    fn fuzzy_substring_before_subsequence() {
+        assert_eq!(palette_match("im", "Diminuir zoom"), Some(0));
+        assert_eq!(palette_match("im", "Imprimir…"), Some(0));
+        assert_eq!(palette_match("im", "Salvar cópia com marcações…"), Some(1));
+        assert_eq!(palette_match("amn", "Aumentar zoom"), Some(1));
+        assert_eq!(palette_match("  IM  ", "Diminuir zoom"), Some(0));
+        assert_eq!(palette_match("", "qualquer"), Some(0));
+        assert_eq!(palette_match("   ", "qualquer"), Some(0));
+        let mut palette = PaletteState::fresh();
+        palette.set_query("im".into());
+        let titles: Vec<&str> = palette.items().iter().map(|item| item.title()).collect();
+        assert_eq!(
+            titles,
+            vec!["Diminuir zoom", "Imprimir…", "Salvar cópia com marcações…",]
+        );
+        assert_eq!(palette.selected(), Some(0));
+    }
+
+    #[test]
+    fn fuzzy_no_match_empties() {
+        assert_eq!(palette_match("xyzzy", "Aumentar zoom"), None);
+        assert_eq!(palette_match("xyzzy", "Ir para página…"), None);
+        let mut palette = PaletteState::fresh();
+        palette.set_query("xyzzy".into());
+        assert!(palette.items().is_empty());
+        assert_eq!(palette.selected(), None);
+        assert!(palette.selected_item().is_none());
+    }
+
+    #[test]
+    fn confirm_dispatches_action() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(Tabs::single(ready));
+        let before = match &session {
+            Session::Ready(ready) => ready.zoom_step_factor(),
+            other => panic!("esperava Ready, veio {other:?}"),
+        };
+        apply(&mut session, Message::OpenPalette);
+        select_palette_action(&mut session, PaletteAction::ZoomIn);
+        apply(&mut session, Message::PaletteConfirm);
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(!tabs.palette_open());
+                let after = tabs.zoom_step_factor();
+                assert!((after - before * 1.1).abs() < 0.01, "{before} -> {after}");
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+
+        assert!(!active_ready(&session).pages_open);
+        apply(&mut session, Message::OpenPalette);
+        select_palette_action(&mut session, PaletteAction::TogglePages);
+        apply(&mut session, Message::PaletteConfirm);
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(!tabs.palette_open());
+                assert!(tabs.pages_open);
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+
+        apply(&mut session, Message::OpenPalette);
+        select_palette_action(&mut session, PaletteAction::FocusSearch);
+        apply(&mut session, Message::PaletteConfirm);
+        match &session {
+            Session::Ready(tabs) => assert!(!tabs.palette_open()),
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+
+        apply(&mut session, Message::OpenPalette);
+        select_palette_action(&mut session, PaletteAction::OpenPrintDialog);
+        apply(&mut session, Message::PaletteConfirm);
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(!tabs.palette_open());
+                assert!(tabs.print_dialog.is_some());
+            }
+            other => panic!("esperava Ready, veio {other:?}"),
+        }
+
+        let page_before = active_ready(&session).visible;
+        apply(&mut session, Message::OpenPalette);
+        select_palette_action(&mut session, PaletteAction::GoToPage);
+        apply(&mut session, Message::PaletteConfirm);
+        match &session {
+            Session::Ready(tabs) => {
+                assert!(!tabs.palette_open());
+                assert_eq!(tabs.visible, page_before);
             }
             other => panic!("esperava Ready, veio {other:?}"),
         }
