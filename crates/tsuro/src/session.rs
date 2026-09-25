@@ -10220,6 +10220,33 @@ mod tests {
     }
 
     #[test]
+    fn reload_clears_saved_marks_with_annotations() {
+        let Some(mut old) = sample_ready() else {
+            return;
+        };
+        let Some(fresh) = sample_ready() else {
+            return;
+        };
+        old.annotations.push(unsaved_mark());
+        old.saved_marks = old.annotations.clone();
+        assert!(!old.marks_dirty());
+        let file = std::env::temp_dir().join(format!(
+            "tsuro-positions-unit-{}-reload-probe",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        crate::positions::with_positions_path(file.clone(), || {
+            old.apply_reload(fresh);
+            assert!(old.annotations.is_empty());
+            assert!(
+                !old.marks_dirty(),
+                "reload zera saved junto com annotations"
+            );
+        });
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
     fn reload_rotates_gen_and_drops_stale_responses() {
         let Some((doc, dir)) = temp_copy_ready() else {
             return;
