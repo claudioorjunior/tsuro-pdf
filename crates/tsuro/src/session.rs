@@ -1439,6 +1439,8 @@ pub enum Message {
     LoadingTick,
     /// Poll de auto-reload (issue #46): compara cada aba com o disco.
     FileTick,
+    /// Recarrega a aba ativa do disco e descarta o trabalho da sessão.
+    ReloadDisk,
     /// Documento relido do disco; `identity` é a do tique que disparou.
     Reloaded {
         doc_gen: u64,
@@ -1694,6 +1696,8 @@ impl Session {
                 Task::none()
             }
             // Auto-reload (issue #46): cada aba que mudou no disco relê o arquivo.
+            // Com trabalho não salvo, ou depois que o aviso já apareceu, espera
+            // o botão Recarregar — a linha de status fica livre para "Cópia salva".
             Message::FileTick => {
                 let Session::Ready(tabs) = self else {
                     return Task::none();
@@ -1704,25 +1708,33 @@ impl Session {
                         continue;
                     }
                     let current = file_identity(doc.source.path());
-                    let has_unsaved = !doc.annotations.is_empty() || doc.note_draft.is_some();
-                    if should_reload(doc.disk_identity, current, has_unsaved) {
-                        doc.reload_inflight = true;
-                        let doc_gen = doc.open_gen;
-                        let source = doc.source.clone();
-                        tasks.push(Task::perform(open_ready(source), move |result| {
-                            Message::Reloaded {
-                                doc_gen,
-                                result,
-                                identity: current,
-                            }
-                        }));
-                    } else if doc.disk_identity != current && has_unsaved {
-                        // Marcações/rascunho: recarregar destruiria trabalho não
-                        // salvo; avisa e espera (re-set idempotente, não pisca).
-                        doc.save_status = Some("O arquivo mudou no disco.".into());
+                    if doc.disk_identity == current {
+                        doc.disk_stale = false;
+                        continue;
+                    }
+                    if doc.unsaved() {
+                        doc.disk_stale = true;
+                        continue;
+                    }
+                    if doc.disk_stale {
+                        continue;
+                    }
+                    if should_reload(doc.disk_identity, current, false) {
+                        tasks.push(schedule_reload(doc, current));
                     }
                 }
                 Task::batch(tasks)
+            }
+            Message::ReloadDisk => {
+                let Session::Ready(tabs) = self else {
+                    return Task::none();
+                };
+                let doc = tabs.active_mut();
+                if doc.reload_inflight {
+                    return Task::none();
+                }
+                let current = file_identity(doc.source.path());
+                Task::batch([schedule_reload(doc, current)])
             }
             Message::Reloaded {
                 doc_gen,
@@ -1758,6 +1770,7 @@ impl Session {
                         // Adota a identidade atual: sem retry infinito na mesma
                         // versão; qualquer escrita futura muda de novo e re-tenta.
                         doc.disk_identity = identity;
+                        doc.disk_stale = false;
                         doc.save_status = Some("Falha ao recarregar.".into());
                     }
                 }
@@ -4717,6 +4730,17 @@ fn should_reload(
     has_unsaved: bool,
 ) -> bool {
     !has_unsaved && stored != current
+}
+
+fn schedule_reload(doc: &mut Ready, current: Option<(u64, u64)>) -> Task<Message> {
+    doc.reload_inflight = true;
+    let doc_gen = doc.open_gen;
+    let source = doc.source.clone();
+    Task::perform(open_ready(source), move |result| Message::Reloaded {
+        doc_gen,
+        result,
+        identity: current,
+    })
 }
 
 async fn open_ready(source: OpenSource) -> Result<Ready, OpenError> {
@@ -9434,6 +9458,68 @@ mod tests {
         assert!(marked.save_status.is_none());
         assert!(marked.disk_stale());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_tick_reloads_when_marks_match_the_last_save() {
+        let Some((mut doc, dir)) = temp_copy_ready() else {
+            return;
+        };
+        doc.annotations.push(unsaved_mark());
+        doc.saved_marks = doc.annotations.clone();
+        let mut session = Session::Ready(Tabs::single(doc));
+        let path = active_ready(&session).source.path().to_path_buf();
+        std::fs::write(&path, b"novo").expect("reescreve a cópia");
+        apply(&mut session, Message::FileTick);
+        let ready = active_ready(&session);
+        assert!(ready.reload_inflight);
+        assert!(!ready.disk_stale());
+        assert!(ready.save_status.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_tick_after_save_keeps_confirmation_until_reload() {
+        isolated(|| {
+            let Some((mut doc, dir)) = temp_copy_ready() else {
+                return;
+            };
+            doc.annotations.push(unsaved_mark());
+            let saved = doc.annotations.clone();
+            let doc_gen = doc.open_gen;
+            let mut session = Session::Ready(Tabs::single(doc));
+            let path = active_ready(&session).source.path().to_path_buf();
+            std::fs::write(&path, b"novo").expect("reescreve a cópia");
+            apply(&mut session, Message::FileTick);
+            assert!(active_ready(&session).disk_stale());
+            apply(
+                &mut session,
+                Message::SaveCopyDone {
+                    doc_gen,
+                    path: std::env::temp_dir().join("guia (marcado).pdf"),
+                    saved,
+                    result: Ok(()),
+                },
+            );
+            let ready = active_ready(&session);
+            assert!(!ready.marks_dirty());
+            assert!(ready.disk_stale());
+            assert_eq!(
+                ready.save_status.as_deref(),
+                Some("Cópia salva em guia (marcado).pdf")
+            );
+            apply(&mut session, Message::FileTick);
+            let ready = active_ready(&session);
+            assert!(!ready.reload_inflight);
+            assert!(ready.disk_stale());
+            assert_eq!(
+                ready.save_status.as_deref(),
+                Some("Cópia salva em guia (marcado).pdf")
+            );
+            apply(&mut session, Message::ReloadDisk);
+            assert!(active_ready(&session).reload_inflight);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
