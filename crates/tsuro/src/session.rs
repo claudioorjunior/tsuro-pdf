@@ -1123,17 +1123,49 @@ fn needs_sign_warning(signatures: &PdfAnalysis) -> bool {
     !signatures.signatures.is_empty()
 }
 
-/// Puro: o destino é o próprio original? O original nunca é sobrescrito —
-/// canonicaliza quando dá (caminhos relativos, symlinks) e cai para a
-/// comparação direta quando não (arquivo ainda inexistente).
+/// Puro: o destino é o próprio original? O original nunca é sobrescrito.
+/// Hard links compartilham o inode e `canonicalize` não os une, então a
+/// identidade é o par (dispositivo, inode). O caminho canônico cobre
+/// symlinks e relativos; destino inexistente cai na comparação direta.
 fn is_same_file(dest: &std::path::Path, src: &std::path::Path) -> bool {
     if dest == src {
+        return true;
+    }
+    if same_inode(dest, src) {
         return true;
     }
     match (dest.canonicalize(), src.canonicalize()) {
         (Ok(dest), Ok(src)) => dest == src,
         _ => false,
     }
+}
+
+/// Mesmo arquivo no disco, inclusive hard links. `metadata` segue symlinks.
+fn same_inode(dest: &std::path::Path, src: &std::path::Path) -> bool {
+    let (Ok(dest_meta), Ok(src_meta)) = (std::fs::metadata(dest), std::fs::metadata(src)) else {
+        return false;
+    };
+    match (inode_key(&dest_meta), inode_key(&src_meta)) {
+        (Some(dest_id), Some(src_id)) => dest_id == src_id,
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn inode_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+fn inode_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    Some((u64::from(meta.volume_serial_number()), meta.file_index()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inode_key(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 /// Monta o PDF de impressão. Com marcações, rasteriza uma cópia marcada
@@ -8567,6 +8599,43 @@ mod tests {
         assert!(is_same_file(&dir.join(".").join("doc.pdf"), &src));
         // Destino novo (ainda inexistente) nunca é o original.
         assert!(!is_same_file(&dir.join("doc (marcado).pdf"), &src));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_file_detects_hard_link_of_the_original() {
+        let dir = std::env::temp_dir().join(format!(
+            "tsuro-save-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("doc.pdf");
+        let link = dir.join("doc-link.pdf");
+        std::fs::write(&src, b"%PDF-1.4 original").unwrap();
+        std::fs::hard_link(&src, &link).unwrap();
+
+        // `canonicalize` deixa os dois caminhos distintos; o inode não.
+        assert_ne!(src.canonicalize().unwrap(), link.canonicalize().unwrap());
+        assert!(is_same_file(&link, &src));
+
+        std::fs::write(&link, b"%PDF-1.4 copy").unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"%PDF-1.4 copy");
+
+        let other = dir.join("outro.pdf");
+        std::fs::write(&other, b"%PDF-1.4 other").unwrap();
+        assert!(!is_same_file(&other, &src));
+
+        #[cfg(unix)]
+        {
+            let symlink = dir.join("doc-symlink.pdf");
+            std::os::unix::fs::symlink(&src, &symlink).unwrap();
+            assert!(is_same_file(&symlink, &src));
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
