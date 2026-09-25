@@ -193,9 +193,9 @@ pub fn verify_cms(
         return Ok(info);
     };
     let Some(public) = parsed.public_key else {
-        info.status = SignatureStatus::IntactButUntrusted;
+        info.status = SignatureStatus::Invalid;
         info.status_detail =
-            "O documento coberto está íntegro, mas a chave pública RSA não pôde ser extraída."
+            "A assinatura não foi verificada porque a chave pública RSA não pôde ser extraída."
                 .into();
         return Ok(info);
     };
@@ -666,5 +666,183 @@ mod tests {
         let analysis = analyze_pdf(&nested).expect("a 10380-deep catalog array returns");
         assert!(analysis.signatures.is_empty());
         assert_eq!(analysis.page_count_hint, Some(0));
+    }
+
+    fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(value.len() + 4);
+        out.push(tag);
+        let len = value.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else if len <= 0xff {
+            out.push(0x81);
+            out.push(len as u8);
+        } else {
+            out.push(0x82);
+            out.push((len >> 8) as u8);
+            out.push(len as u8);
+        }
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn der_cat(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in parts {
+            out.extend_from_slice(part);
+        }
+        out
+    }
+
+    fn cms_sha256_without_certificate(digest: &[u8]) -> Vec<u8> {
+        let sha256 = der_tlv(
+            0x30,
+            &der_cat(&[
+                &der_tlv(
+                    0x06,
+                    &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
+                ),
+                &der_tlv(0x05, &[]),
+            ]),
+        );
+        let rsa = der_tlv(
+            0x30,
+            &der_cat(&[
+                &der_tlv(
+                    0x06,
+                    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01],
+                ),
+                &der_tlv(0x05, &[]),
+            ]),
+        );
+        let attr = der_tlv(
+            0x30,
+            &der_cat(&[
+                &der_tlv(
+                    0x06,
+                    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04],
+                ),
+                &der_tlv(0x31, &der_tlv(0x04, digest)),
+            ]),
+        );
+        let sid = der_tlv(
+            0x30,
+            &der_cat(&[
+                &der_tlv(
+                    0x30,
+                    &der_tlv(
+                        0x31,
+                        &der_tlv(
+                            0x30,
+                            &der_cat(&[&der_tlv(0x06, &[0x55, 0x04, 0x06]), &der_tlv(0x13, b"BR")]),
+                        ),
+                    ),
+                ),
+                &der_tlv(0x02, &[1]),
+            ]),
+        );
+        let signer = der_tlv(
+            0x30,
+            &der_cat(&[
+                &der_tlv(0x02, &[1]),
+                &sid,
+                &sha256,
+                &der_tlv(0xa0, &attr),
+                &rsa,
+                &der_tlv(0x04, &[0x00]),
+            ]),
+        );
+        let signed_data = der_tlv(
+            0x30,
+            &der_cat(&[
+                &der_tlv(0x02, &[1]),
+                &der_tlv(0x31, &sha256),
+                &der_tlv(
+                    0x30,
+                    &der_tlv(
+                        0x06,
+                        &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01],
+                    ),
+                ),
+                &der_tlv(0x31, &signer),
+            ]),
+        );
+        der_tlv(
+            0x30,
+            &der_cat(&[
+                &der_tlv(
+                    0x06,
+                    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02],
+                ),
+                &der_tlv(0xa0, &signed_data),
+            ]),
+        )
+    }
+
+    fn pdf_named_banco_with_matching_digest() -> Vec<u8> {
+        let probe = cms_sha256_without_certificate(&[0u8; 32]);
+        let placeholder = format!("<{}>", "0".repeat(probe.len() * 2));
+        let mut file = Vec::new();
+        file.extend_from_slice(b"%PDF-1.4\n");
+        let obj1 = file.len();
+        file.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let obj2 = file.len();
+        file.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let obj3 = file.len();
+        file.extend_from_slice(
+            b"3 0 obj\n<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /Name (Banco) /ByteRange ",
+        );
+        let br_at = file.len();
+        file.extend_from_slice(b"[0000000000 0000000000 0000000000 0000000000]");
+        file.extend_from_slice(b" /Contents ");
+        let gap_at = file.len();
+        file.extend_from_slice(placeholder.as_bytes());
+        let after_gap = file.len();
+        file.extend_from_slice(b" >>\nendobj\n");
+        let xref_at = file.len();
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{obj1:010} 00000 n \n{obj2:010} 00000 n \n{obj3:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_at:010}\n%%EOF\n"
+        );
+        file.extend_from_slice(xref.as_bytes());
+
+        let tail = file.len() - after_gap;
+        let br = format!("[{:010} {:010} {:010} {:010}]", 0, gap_at, after_gap, tail);
+        assert_eq!(br.len(), 45);
+        file[br_at..br_at + br.len()].copy_from_slice(br.as_bytes());
+
+        let mut hasher = Sha256::new();
+        hasher.update(&file[..gap_at]);
+        hasher.update(&file[after_gap..]);
+        let digest = hasher.finalize().to_vec();
+        let cms = cms_sha256_without_certificate(&digest);
+        let hex: String = cms.iter().map(|b| format!("{b:02X}")).collect();
+        let contents = format!("<{hex}>");
+        assert_eq!(contents.len(), placeholder.len());
+        file[gap_at..after_gap].copy_from_slice(contents.as_bytes());
+        file
+    }
+
+    #[test]
+    fn matching_digest_without_rsa_key_is_invalid() {
+        let digest = [0x11u8; 32];
+        let cms = cms_sha256_without_certificate(&digest);
+        let info = verify_cms(&cms, Some(&digest), None).expect("cms parses");
+        assert_eq!(info.status, SignatureStatus::Invalid);
+        assert_eq!(
+            info.status_detail,
+            "A assinatura não foi verificada porque a chave pública RSA não pôde ser extraída."
+        );
+
+        let pdf = pdf_named_banco_with_matching_digest();
+        let analysis = analyze_pdf(&pdf).expect("pdf parses");
+        assert_eq!(analysis.signatures.len(), 1, "{analysis:?}");
+        let sig = &analysis.signatures[0];
+        assert!(sig.covers_whole_document, "{}", sig.status_detail);
+        assert_eq!(sig.signer_name.as_deref(), Some("Banco"));
+        assert_eq!(sig.status, SignatureStatus::Invalid);
+        assert_eq!(
+            sig.status_detail,
+            "A assinatura não foi verificada porque a chave pública RSA não pôde ser extraída."
+        );
     }
 }
