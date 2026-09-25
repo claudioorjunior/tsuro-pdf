@@ -193,9 +193,9 @@ pub fn verify_cms(
         return Ok(info);
     };
     let Some(public) = parsed.public_key else {
-        info.status = SignatureStatus::IntactButUntrusted;
+        info.status = SignatureStatus::Invalid;
         info.status_detail =
-            "O documento coberto está íntegro, mas a chave pública RSA não pôde ser extraída."
+            "A assinatura não foi verificada porque a chave pública RSA não pôde ser extraída."
                 .into();
         return Ok(info);
     };
