@@ -992,17 +992,102 @@ fn needs_sign_warning(signatures: &PdfAnalysis) -> bool {
     !signatures.signatures.is_empty()
 }
 
-/// Puro: o destino é o próprio original? O original nunca é sobrescrito —
-/// canonicaliza quando dá (caminhos relativos, symlinks) e cai para a
-/// comparação direta quando não (arquivo ainda inexistente).
+/// Puro: o destino é o próprio original? O original nunca é sobrescrito.
+/// Hard links compartilham o inode e `canonicalize` não os une, então a
+/// identidade é o par (dispositivo, inode). O caminho canônico cobre
+/// symlinks e relativos; destino inexistente cai na comparação direta.
 fn is_same_file(dest: &std::path::Path, src: &std::path::Path) -> bool {
     if dest == src {
+        return true;
+    }
+    if same_inode(dest, src) {
         return true;
     }
     match (dest.canonicalize(), src.canonicalize()) {
         (Ok(dest), Ok(src)) => dest == src,
         _ => false,
     }
+}
+
+/// Mesmo arquivo no disco, inclusive hard links. `metadata` segue symlinks.
+fn same_inode(dest: &std::path::Path, src: &std::path::Path) -> bool {
+    match (inode_key(dest), inode_key(src)) {
+        (Some(dest_id), Some(src_id)) => dest_id == src_id,
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn inode_key(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// `MetadataExt::file_index` é nightly (`windows_by_handle`). O índice
+/// estável sai de `GetFileInformationByHandle`: volume + nFileIndex.
+#[cfg(windows)]
+fn inode_key(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    let file = std::fs::File::open(path).ok()?;
+    windows_file_id(file.as_raw_handle())
+}
+
+#[cfg(windows)]
+fn windows_file_id(handle: std::os::windows::io::RawHandle) -> Option<(u64, u64)> {
+    #[repr(C)]
+    struct Filetime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: Filetime,
+        last_access_time: Filetime,
+        last_write_time: Filetime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: std::os::windows::io::RawHandle,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut info = ByHandleFileInformation {
+        file_attributes: 0,
+        creation_time: Filetime { low: 0, high: 0 },
+        last_access_time: Filetime { low: 0, high: 0 },
+        last_write_time: Filetime { low: 0, high: 0 },
+        volume_serial_number: 0,
+        file_size_high: 0,
+        file_size_low: 0,
+        number_of_links: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    };
+    // Safety: `handle` é um arquivo aberto e `info` tem o layout Win32 de
+    // `BY_HANDLE_FILE_INFORMATION`.
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    if ok == 0 {
+        return None;
+    }
+    let index = (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low);
+    Some((u64::from(info.volume_serial_number), index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inode_key(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// Monta o PDF de impressão. Com marcações, rasteriza uma cópia marcada
@@ -8793,6 +8878,43 @@ mod tests {
         assert!(is_same_file(&dir.join(".").join("doc.pdf"), &src));
         // Destino novo (ainda inexistente) nunca é o original.
         assert!(!is_same_file(&dir.join("doc (marcado).pdf"), &src));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_file_detects_hard_link_of_the_original() {
+        let dir = std::env::temp_dir().join(format!(
+            "tsuro-save-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("doc.pdf");
+        let link = dir.join("doc-link.pdf");
+        std::fs::write(&src, b"%PDF-1.4 original").unwrap();
+        std::fs::hard_link(&src, &link).unwrap();
+
+        // `canonicalize` deixa os dois caminhos distintos; o inode não.
+        assert_ne!(src.canonicalize().unwrap(), link.canonicalize().unwrap());
+        assert!(is_same_file(&link, &src));
+
+        std::fs::write(&link, b"%PDF-1.4 copy").unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"%PDF-1.4 copy");
+
+        let other = dir.join("outro.pdf");
+        std::fs::write(&other, b"%PDF-1.4 other").unwrap();
+        assert!(!is_same_file(&other, &src));
+
+        #[cfg(unix)]
+        {
+            let symlink = dir.join("doc-symlink.pdf");
+            std::os::unix::fs::symlink(&src, &symlink).unwrap();
+            assert!(is_same_file(&symlink, &src));
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
