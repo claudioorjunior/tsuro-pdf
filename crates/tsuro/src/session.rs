@@ -1142,29 +1142,82 @@ fn is_same_file(dest: &std::path::Path, src: &std::path::Path) -> bool {
 
 /// Mesmo arquivo no disco, inclusive hard links. `metadata` segue symlinks.
 fn same_inode(dest: &std::path::Path, src: &std::path::Path) -> bool {
-    let (Ok(dest_meta), Ok(src_meta)) = (std::fs::metadata(dest), std::fs::metadata(src)) else {
-        return false;
-    };
-    match (inode_key(&dest_meta), inode_key(&src_meta)) {
+    match (inode_key(dest), inode_key(src)) {
         (Some(dest_id), Some(src_id)) => dest_id == src_id,
         _ => false,
     }
 }
 
 #[cfg(unix)]
-fn inode_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+fn inode_key(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
     Some((meta.dev(), meta.ino()))
 }
 
+/// `MetadataExt::file_index` é nightly (`windows_by_handle`). O índice
+/// estável sai de `GetFileInformationByHandle`: volume + nFileIndex.
 #[cfg(windows)]
-fn inode_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    Some((u64::from(meta.volume_serial_number()), meta.file_index()))
+fn inode_key(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    let file = std::fs::File::open(path).ok()?;
+    windows_file_id(file.as_raw_handle())
+}
+
+#[cfg(windows)]
+fn windows_file_id(handle: std::os::windows::io::RawHandle) -> Option<(u64, u64)> {
+    #[repr(C)]
+    struct Filetime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: Filetime,
+        last_access_time: Filetime,
+        last_write_time: Filetime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: std::os::windows::io::RawHandle,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut info = ByHandleFileInformation {
+        file_attributes: 0,
+        creation_time: Filetime { low: 0, high: 0 },
+        last_access_time: Filetime { low: 0, high: 0 },
+        last_write_time: Filetime { low: 0, high: 0 },
+        volume_serial_number: 0,
+        file_size_high: 0,
+        file_size_low: 0,
+        number_of_links: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    };
+    // Safety: `handle` é um arquivo aberto e `info` tem o layout Win32 de
+    // `BY_HANDLE_FILE_INFORMATION`.
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    if ok == 0 {
+        return None;
+    }
+    let index = (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low);
+    Some((u64::from(info.volume_serial_number), index))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn inode_key(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+fn inode_key(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
