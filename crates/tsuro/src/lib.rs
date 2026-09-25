@@ -3,6 +3,7 @@ pub mod kiri;
 pub mod page;
 pub mod positions;
 pub mod prefs;
+pub mod search;
 pub mod session;
 pub mod view;
 
