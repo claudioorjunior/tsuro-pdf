@@ -252,6 +252,20 @@ fn tip<'a>(content: impl Into<Element<'a, Message>>, label: &'static str) -> Ele
     tooltip::Tooltip::new(content, text(label).size(13), tooltip::Position::Bottom).into()
 }
 
+/// Dica com texto dinâmico (nome/caminho do documento): mesma posição da `tip`.
+fn tip_owned<'a>(content: impl Into<Element<'a, Message>>, label: String) -> Element<'a, Message> {
+    tooltip::Tooltip::new(content, text(label).size(13), tooltip::Position::Bottom).into()
+}
+
+/// Texto da dica de identidade: nome inteiro + caminho (abas e pílula).
+fn identity_tip(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    format!("{}\n{}", name, path.display())
+}
+
 fn open_button(t: Tokens) -> Element<'static, Message> {
     tip(
         control(t, button(kiri::ori!("folder")).on_press(Message::PickFile)),
@@ -361,7 +375,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                     .style(kiri::bar_dot_style(t)),
             );
         }
-        let doc_pill = tip(
+        let doc_pill = tip_owned(
             container(doc_row.push(text(middle_truncate(&name, 24)).size(13).color(t.ink)))
                 .padding(Padding {
                     top: 4.0,
@@ -370,7 +384,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
                     left: 8.0,
                 })
                 .style(kiri::bar_doc_style(t)),
-            "Documento aberto",
+            identity_tip(ready.source.path()),
         );
         let pill = container(
             row![
@@ -1748,13 +1762,13 @@ fn tab_strip(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
         let active = index == tabs.active_index();
         strip = strip.push(
             row![
-                tip(
+                tip_owned(
                     control_active(
                         t,
                         button(text(label).size(13)).on_press(Message::SelectTab(index)),
                         active,
                     ),
-                    "Trocar para este documento",
+                    identity_tip(doc.source.path()),
                 ),
                 tip(
                     control(
@@ -1762,7 +1776,11 @@ fn tab_strip(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
                         button(text("×").size(14).color(t.muted))
                             .on_press(Message::CloseTab(index)),
                     ),
-                    "Fechar aba (⌘W)",
+                    if cfg!(target_os = "macos") {
+                        "Fechar aba (⌘W)"
+                    } else {
+                        "Fechar aba (Ctrl+W)"
+                    },
                 ),
             ]
             .spacing(0)
@@ -1780,19 +1798,14 @@ fn tab_strip(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
         .into()
 }
 
-/// Nome na aba: cortado para caber na faixa (uma linha; um nome inteiro de
-/// caminho longo empurraria as outras abas para fora da janela).
+/// Nome na aba: elipse no meio como a pílula do documento (o fim — onde
+/// mora o `.pdf` e a versão — continua legível).
 fn short_name(path: &std::path::Path) -> String {
-    const MAX: usize = 24;
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    if name.chars().count() <= MAX {
-        return name;
-    }
-    let head: String = name.chars().take(MAX - 1).collect();
-    format!("{head}…")
+    middle_truncate(&name, 24)
 }
 
 /// Painel de navegação (Stitch sidebar): cabeçalho `Navegação`, abas segmentadas
@@ -2727,6 +2740,21 @@ mod tests {
         assert!(short.chars().count() <= 30);
         assert!(short.contains('…'));
         assert!(short.ends_with(".pdf"), "elipse no meio, fim intacto");
+    }
+
+    #[test]
+    fn tab_label_keeps_ending_and_tip_has_path() {
+        use super::{identity_tip, short_name};
+        use std::path::Path;
+        assert_eq!(short_name(Path::new("/a/curto.pdf")), "curto.pdf");
+        let long = "Contrato_de_Locacao_Comercial_v12_final_assinado.pdf";
+        let label = short_name(Path::new(&format!("/docs/{long}")));
+        assert!(label.chars().count() <= 24);
+        assert!(label.contains('…'), "elipse no meio, não no fim");
+        assert!(label.ends_with(".pdf"), "terminação intacta: {label}");
+        let tip = identity_tip(Path::new(&format!("/docs/sub/{long}")));
+        assert!(tip.starts_with(long), "nome inteiro primeiro");
+        assert!(tip.contains("/docs/sub/"), "caminho distingue homônimos");
     }
 
     #[test]
