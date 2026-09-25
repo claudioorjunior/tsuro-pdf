@@ -1537,20 +1537,46 @@ fn ready_body(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
         panes = panes.push(signatures_panel(ready, t));
     }
     // Status pós-ação ("Enviado para …", "Cópia salva em …", falha ao abrir
-    // outra aba): 1 linha no topo.
+    // outra aba): 1 linha no topo. O aviso de disco é outra linha, com ação.
     let status = ready
         .save_status
         .as_deref()
         .or(ready.print_status.as_deref())
         .or(tabs.open_error());
-    if let Some(status) = status {
-        column![text(status).size(13).color(t.muted), panes,]
+    let warn = ready.disk_stale().then(|| disk_stale_row(ready, t));
+    match (warn, status) {
+        (None, None) => panes.into(),
+        (Some(warn), None) => column![warn, panes].spacing(8).height(Length::Fill).into(),
+        (None, Some(status)) => column![text(status).size(13).color(t.muted), panes]
             .spacing(8)
             .height(Length::Fill)
-            .into()
-    } else {
-        panes.into()
+            .into(),
+        (Some(warn), Some(status)) => column![warn, text(status).size(13).color(t.muted), panes]
+            .spacing(8)
+            .height(Length::Fill)
+            .into(),
     }
+}
+
+fn disk_stale_row(ready: &Ready, t: Tokens) -> Element<'static, Message> {
+    let mut row = row![text("O arquivo mudou no disco.").size(13).color(t.muted)]
+        .spacing(8)
+        .align_y(Alignment::Center);
+    if ready.marks_dirty() || ready.note_draft.is_some() {
+        row = row.push(
+            button(text("Salvar cópia").size(13))
+                .padding(Padding::from([4, 10]))
+                .style(kiri::hud_ghost_style(t))
+                .on_press(Message::SaveCopyRequested),
+        );
+    }
+    row.push(
+        button(text("Recarregar").size(13))
+            .padding(Padding::from([4, 10]))
+            .style(kiri::hud_primary_style(t))
+            .on_press(Message::ReloadDisk),
+    )
+    .into()
 }
 
 /// Faixa de abas sob a toolbar (issue #40): um botão por documento — o ativo
