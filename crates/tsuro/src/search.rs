@@ -12,6 +12,7 @@ use crate::session::TextRange;
 pub struct Search {
     query: String,
     hits: Vec<Hit>,
+    current: Option<usize>,
 }
 
 impl Search {
@@ -23,11 +24,36 @@ impl Search {
         &self.hits
     }
 
+    /// Índice do hit atual (Enter/F3); `None` = digitando, sem seleção.
+    pub fn current(&self) -> Option<usize> {
+        self.current
+    }
+
+    pub fn current_hit(&self) -> Option<&Hit> {
+        self.current.and_then(|i| self.hits.get(i))
+    }
+
+    /// Passo com wrap: do vazio, +1 vai ao primeiro e −1 ao último.
+    pub(crate) fn step(&mut self, delta: i32) {
+        if self.hits.is_empty() {
+            self.current = None;
+            return;
+        }
+        let len = self.hits.len() as i32;
+        let next = match self.current {
+            None if delta >= 0 => 0,
+            None => len - 1,
+            Some(i) => (i as i32 + delta).rem_euclid(len),
+        };
+        self.current = Some(next as usize);
+    }
+
     pub(crate) fn derive(query: &str, pages: &[Option<TextLayer>]) -> Self {
         if query.is_empty() {
             return Search {
                 query: query.to_string(),
                 hits: Vec::new(),
+                current: None,
             };
         }
         let mut hits = Vec::new();
@@ -38,6 +64,7 @@ impl Search {
         Search {
             query: query.to_string(),
             hits,
+            current: None,
         }
     }
 
@@ -46,6 +73,7 @@ impl Search {
             return;
         }
         let page_idx = layer.page.index();
+        let cur = self.current_hit().map(|hit| (hit.page, hit.range));
         self.hits.retain(|hit| hit.page != layer.page);
         let mut page_hits = find_hits(&self.query, layer);
         page_hits.sort_by_key(|hit| hit.range.start);
@@ -53,6 +81,11 @@ impl Search {
             .hits
             .partition_point(|hit| (hit.page.index(), hit.range.start) < (page_idx, 0));
         self.hits.splice(pos..pos, page_hits);
+        self.current = cur.and_then(|(page, range)| {
+            self.hits
+                .iter()
+                .position(|hit| hit.page == page && hit.range == range)
+        });
     }
 }
 
@@ -240,5 +273,119 @@ mod tests {
         let hits = find_hits("aa", &layer);
         assert_eq!(hits.len(), 1);
         assert!(hits[0].quad.x1 > 1.0);
+    }
+
+    #[test]
+    fn step_wraps_and_first_prev_goes_last() {
+        let layer = TextLayer {
+            page: PageNo::first(),
+            plain: "a a a".into(),
+            glyphs: vec![Glyph {
+                cluster: "a a a".into(),
+                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+            }],
+        };
+        let mut search = Search::derive("a", &[Some(layer)]);
+        assert_eq!(search.hits().len(), 3);
+        assert_eq!(search.current(), None);
+        search.step(1);
+        assert_eq!(search.current(), Some(0));
+        search.step(1);
+        assert_eq!(search.current(), Some(1));
+        search.step(1);
+        assert_eq!(search.current(), Some(2));
+        search.step(1);
+        assert_eq!(search.current(), Some(0), "wrap no fim");
+        search.step(-1);
+        assert_eq!(search.current(), Some(2), "wrap no início");
+        let mut fresh = Search::derive(
+            "a",
+            &[Some(TextLayer {
+                page: PageNo::first(),
+                plain: "a a".into(),
+                glyphs: vec![Glyph {
+                    cluster: "a a".into(),
+                    quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+                }],
+            })],
+        );
+        fresh.step(-1);
+        assert_eq!(fresh.current(), Some(1), "Shift+Enter abre no último");
+        let mut empty = Search::derive("", &[]);
+        empty.step(1);
+        assert_eq!(empty.current(), None);
+    }
+
+    #[test]
+    fn extend_page_preserves_current_hit() {
+        let first = TextLayer {
+            page: PageNo::first(),
+            plain: "nada aqui".into(),
+            glyphs: vec![Glyph {
+                cluster: "nada aqui".into(),
+                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+            }],
+        };
+        let mut search = Search::derive("alvo", &[Some(first)]);
+        assert!(search.hits().is_empty());
+        let second = TextLayer {
+            page: PageNo::from_index(1),
+            plain: "um alvo só".into(),
+            glyphs: vec![Glyph {
+                cluster: "um alvo só".into(),
+                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+            }],
+        };
+        search.extend_page(&second);
+        assert_eq!(search.hits().len(), 1);
+        search.step(1);
+        assert_eq!(search.current(), Some(0));
+        // Página anterior chega depois: o hit atual segue o mesmo trecho.
+        let zero = TextLayer {
+            page: PageNo::first(),
+            plain: "alvo no início".into(),
+            glyphs: vec![Glyph {
+                cluster: "alvo no início".into(),
+                quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+            }],
+        };
+        search.extend_page(&zero);
+        assert_eq!(search.hits().len(), 2);
+        assert_eq!(search.current(), Some(1));
+        assert_eq!(
+            search.current_hit().map(|hit| hit.page),
+            Some(PageNo::from_index(1))
+        );
+    }
+
+    #[test]
+    fn decomposed_acute_keeps_x_quad_on_x() {
+        // #79: `e` + combining + `x` sem a segunda NFC — o `x` cai no glifo
+        // do `x`, nunca no acento.
+        let e = Quad::from_rect(0.0, 0.0, 10.0, 10.0);
+        let accent = Quad::from_rect(10.0, 0.0, 20.0, 10.0);
+        let x = Quad::from_rect(20.0, 0.0, 30.0, 10.0);
+        let layer = TextLayer {
+            page: PageNo::first(),
+            plain: "e\u{301}x".into(),
+            glyphs: vec![
+                Glyph {
+                    cluster: "e".into(),
+                    quad: e,
+                },
+                Glyph {
+                    cluster: "\u{301}".into(),
+                    quad: accent,
+                },
+                Glyph {
+                    cluster: "x".into(),
+                    quad: x,
+                },
+            ],
+        };
+        assert_eq!(layer.plain.len(), 4, "sem NFC o plain soma os clusters");
+        let hits = find_hits("x", &layer);
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].quad.x0, hits[0].quad.x1), (20.0, 30.0));
     }
 }
