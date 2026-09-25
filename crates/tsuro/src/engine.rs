@@ -79,9 +79,8 @@ enum Request {
         doc_id: u64,
         reply: mpsc::Sender<Result<Option<Outline>, EngineError>>,
     },
-    /// Aplica as marcações da sessão ao documento vivo e devolve uma cópia
-    /// em bytes (`FPDF_SaveAsCopy`). O documento em memória passa a conter as
-    /// anotações; o mesmo motor continua servindo as páginas marcadas.
+    /// Grava as marcações numa carga nova dos bytes originais e devolve
+    /// essa cópia. O `PdfDocument` aberto da aba não muda.
     SaveCopy {
         doc_id: u64,
         annotations: Vec<Annotation>,
@@ -136,10 +135,17 @@ fn worker() -> Arc<Shared> {
     WORKER.clone()
 }
 
+/// Documento aberto mais os bytes com que ele foi carregado. `save_copy`
+/// relê `bytes` num documento temporário para não gravar no vivo.
+struct LiveDoc {
+    document: PdfDocument<'static>,
+    bytes: Vec<u8>,
+}
+
 /// Corpo da worker: a `Pdfium` do processo (static) e um `PdfDocument` por
 /// aba, identificado pelo `doc_id` que a worker mesma distribui.
 fn serve(incoming: mpsc::Receiver<Request>) {
-    let mut documents: HashMap<u64, PdfDocument<'static>> = HashMap::new();
+    let mut documents: HashMap<u64, LiveDoc> = HashMap::new();
     let mut next_id = 1u64;
     for request in incoming {
         match request {
@@ -151,12 +157,12 @@ fn serve(incoming: mpsc::Receiver<Request>) {
                         continue;
                     }
                 };
-                match pdfium.load_pdf_from_byte_vec(bytes, None) {
+                match pdfium.load_pdf_from_byte_vec(bytes.clone(), None) {
                     Ok(document) => {
                         let doc_id = next_id;
                         next_id += 1;
                         let count = u32::from(document.pages().len());
-                        documents.insert(doc_id, document);
+                        documents.insert(doc_id, LiveDoc { document, bytes });
                         let _ = reply.send(Ok((doc_id, count)));
                     }
                     Err(e) => {
@@ -197,9 +203,22 @@ fn serve(incoming: mpsc::Receiver<Request>) {
                 annotations,
                 reply,
             } => {
-                let _ = reply.send(with_doc(&documents, doc_id, |doc| {
-                    save_copy_from_doc(doc, &annotations)
-                }));
+                let Some(bytes) = documents.get(&doc_id).map(|live| live.bytes.clone()) else {
+                    let _ = reply.send(Err(EngineError(DOC_GONE.into())));
+                    continue;
+                };
+                let pdfium = match LIBRARY.as_ref() {
+                    Ok(library) => &library.0,
+                    Err(err) => {
+                        let _ = reply.send(Err(EngineError(err.clone())));
+                        continue;
+                    }
+                };
+                let result = match pdfium.load_pdf_from_byte_vec(bytes, None) {
+                    Ok(scratch) => save_copy_from_doc(&scratch, &annotations),
+                    Err(e) => Err(EngineError(format!("{ANNOT_SAVE_FAILED}: {e}"))),
+                };
+                let _ = reply.send(result);
             }
             #[cfg(test)]
             Request::Annotations {
@@ -218,12 +237,12 @@ fn serve(incoming: mpsc::Receiver<Request>) {
 /// Roda `f` no documento `doc_id`; sem ele (aba fechada no meio do caminho) o
 /// pedido falha, nunca entra em pânico.
 fn with_doc<T>(
-    documents: &HashMap<u64, PdfDocument<'static>>,
+    documents: &HashMap<u64, LiveDoc>,
     doc_id: u64,
     f: impl FnOnce(&PdfDocument<'_>) -> Result<T, EngineError>,
 ) -> Result<T, EngineError> {
     match documents.get(&doc_id) {
-        Some(document) => f(document),
+        Some(live) => f(&live.document),
         None => Err(EngineError(DOC_GONE.into())),
     }
 }
@@ -283,13 +302,10 @@ impl PdfiumEngine {
         })
     }
 
-    /// Grava uma cópia do documento aberto com as marcações da sessão
-    /// aplicadas, devolvendo os bytes do PDF resultante.
+    /// Grava uma cópia com as marcações da sessão e devolve os bytes.
     ///
-    /// As anotações entram no documento vivo da worker (sem reload), então o
-    /// próprio motor passa a servir a cópia marcada. O `PdfDocument` continua
-    /// compartilhado por referência: só a `PdfPage` emprestada é mutável para
-    /// criar anotações, e `save_to_bytes` recebe `&self`.
+    /// Cada chamada relê os bytes originais da abertura. O documento que a
+    /// worker serve para render e texto não recebe essas anotações.
     pub fn save_copy(&self, annotations: &[Annotation]) -> Result<Vec<u8>, EngineError> {
         self.call(|reply| Request::SaveCopy {
             doc_id: self.doc_id,
@@ -544,14 +560,14 @@ fn page_index(page: PageNo) -> Result<u16, EngineError> {
     u16::try_from(page.index()).map_err(|_| EngineError("página fora do intervalo".into()))
 }
 
-/// Aplica as marcações da sessão ao documento e devolve a cópia em bytes.
+/// Aplica as marcações a `document` e devolve a cópia em bytes.
 ///
-/// Roda na worker thread, sobre o `PdfDocument` vivo: cada `Annotation` vira
-/// uma anotação real do Pdfium (`/Highlight`, `/Underline`, `/Strikeout` ou
-/// `/Text`), no mesmo user space do texto — os `Quad` da sessão vêm dos
-/// `tight_bounds()` dos chars lidos do próprio Pdfium, então entram como
-/// estão, sem flip de Y. Página fora do intervalo aborta antes de qualquer
-/// alteração (falha total, nunca cópia parcial).
+/// `document` é uma carga nova dos bytes da abertura, não o documento da
+/// aba. Cada `Annotation` vira uma anotação do Pdfium (`/Highlight`,
+/// `/Underline`, `/Strikeout` ou `/Text`), no mesmo user space do texto.
+/// Os `Quad` da sessão vêm dos `tight_bounds()` dos chars lidos do Pdfium,
+/// então entram como estão, sem flip de Y. Página fora do intervalo aborta
+/// antes de qualquer alteração (falha total, nunca cópia parcial).
 fn save_copy_from_doc(
     document: &PdfDocument<'_>,
     annotations: &[Annotation],
@@ -1135,8 +1151,6 @@ mod tests {
         assert_eq!(err.0, ANNOT_PAGE_OUT_OF_RANGE);
     }
 
-    /// Segunda cópia na mesma sessão grava o mesmo conjunto. O documento vivo
-    /// da worker não recebe as marcações.
     #[test]
     fn save_copy_twice_keeps_one_mark_and_leaves_the_open_document() {
         let Some(bytes) = sample_pdf_bytes() else {
@@ -1167,7 +1181,10 @@ mod tests {
 
         let first = engine.save_copy(&annotations).expect("primeira cópia");
         assert_eq!(
-            engine.annotations(page).expect("vivo após a primeira").len(),
+            engine
+                .annotations(page)
+                .expect("vivo após a primeira")
+                .len(),
             live_before,
             "a primeira cópia não pode gravar no documento aberto"
         );
