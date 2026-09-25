@@ -1136,8 +1136,27 @@ fn is_same_file(dest: &std::path::Path, src: &std::path::Path) -> bool {
     }
 }
 
-/// Aplica as marcações ao documento aberto na worker e grava a cópia em
-/// `dest`. `PdfiumEngine` é `Clone + Send + Sync` (só um `Arc<Shared>` com
+/// Monta o PDF de impressão. Com marcações, rasteriza uma cópia marcada
+/// para o destaque entrar na página. Sem marcações, usa o documento aberto.
+fn print_job_pdf(
+    engine: &PdfiumEngine,
+    annotations: &[Annotation],
+    selection: PrintSelection,
+) -> Result<Vec<u8>, String> {
+    if annotations.is_empty() {
+        return print_selection_pdf(engine, selection).map_err(|err| err.to_string());
+    }
+    let bytes = engine
+        .save_copy(annotations)
+        .map_err(|err| err.to_string())?;
+    let marked = PdfiumEngine::open(Arc::from(bytes)).map_err(|err| err.to_string())?;
+    let pdf = print_selection_pdf(&marked, selection).map_err(|err| err.to_string());
+    marked.close();
+    pdf
+}
+
+/// Grava a cópia marcada em `dest`. O documento aberto não muda.
+/// `PdfiumEngine` é `Clone + Send + Sync` (só um `Arc<Shared>` com
 /// canal `mpsc`), então atravessa o `spawn_blocking` como na impressão.
 async fn save_copy_file(
     engine: PdfiumEngine,
@@ -2384,6 +2403,7 @@ impl Session {
                 let doc_gen = ready.open_gen;
                 let title = print_job_title(ready);
                 let engine = ready.engine.clone();
+                let annotations = ready.annotations.clone();
                 let Some(dialog) = ready.print_dialog.as_mut() else {
                     return Task::none();
                 };
@@ -2404,7 +2424,7 @@ impl Session {
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            match print_selection_pdf(&engine, selection) {
+                            match print_job_pdf(&engine, &annotations, selection) {
                                 Ok(pdf) => {
                                     spool_pdf(&printer, &pdf, &title).map_err(|err| err.to_string())
                                 }
@@ -2458,6 +2478,7 @@ impl Session {
                 let doc_gen = ready.open_gen;
                 let source = ready.source.path().to_path_buf();
                 let engine = ready.engine.clone();
+                let annotations = ready.annotations.clone();
                 let Some(dialog) = ready.print_dialog.as_mut() else {
                     return Task::none();
                 };
@@ -2473,7 +2494,7 @@ impl Session {
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            match print_selection_pdf(&engine, selection) {
+                            match print_job_pdf(&engine, &annotations, selection) {
                                 Ok(pdf) => write_and_open_print_pdf(&pdf, &source)
                                     .map(|path| path.display().to_string())
                                     .map_err(|err| err.to_string()),
@@ -8595,6 +8616,81 @@ mod tests {
             assert_eq!(read_recents().first(), Some(&dest));
             assert!(!ready.marks_dirty());
         });
+    }
+
+    #[test]
+    fn print_job_pdf_raster_includes_session_highlight() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let page = PageNo::first();
+        let Some(Some(text)) = ready.pages.text.get(page.index() as usize) else {
+            return;
+        };
+        let quads: Vec<Quad> = text
+            .glyphs
+            .iter()
+            .take(40)
+            .map(|glyph| glyph.quad)
+            .collect();
+        if quads.is_empty() {
+            return;
+        }
+        let mark = Annotation {
+            id: 1,
+            page,
+            range: TextRange {
+                start: 0,
+                end: quads.len(),
+            },
+            quads,
+            kind: AnnotKind::Highlight,
+            text: String::new(),
+            marker: None,
+        };
+        let selection = PrintSelection {
+            range: PrintRange::Current(page),
+            copies: 1,
+            orientation: PrintOrientation::Auto,
+        };
+        let live_before = ready
+            .engine
+            .annotations(page)
+            .expect("anotações do aberto")
+            .len();
+        let clean = print_job_pdf(&ready.engine, &[], selection).expect("print limpo");
+        let marked = print_job_pdf(&ready.engine, &[mark], selection).expect("print marcado");
+        assert_eq!(
+            ready
+                .engine
+                .annotations(page)
+                .expect("aberto após imprimir")
+                .len(),
+            live_before,
+            "imprimir não grava no documento aberto"
+        );
+        let clean_px = first_page_rgba(&clean);
+        let marked_px = first_page_rgba(&marked);
+        assert_eq!(clean_px.len(), marked_px.len());
+        let diff = clean_px
+            .iter()
+            .zip(&marked_px)
+            .filter(|(left, right)| left != right)
+            .count();
+        assert!(
+            diff > 100,
+            "destaque ausente no raster da impressão, {diff} pixels"
+        );
+    }
+
+    fn first_page_rgba(bytes: &[u8]) -> Vec<u8> {
+        let engine =
+            PdfiumEngine::open(Arc::from(bytes.to_vec())).expect("abrir o PDF de impressão");
+        let surface =
+            crate::page::PageEngine::render(&engine, PageNo::first(), Scale::from_factor(1.0), 0)
+                .expect("render da página impressa");
+        engine.close();
+        surface.bitmap.rgba
     }
 
     #[test]
