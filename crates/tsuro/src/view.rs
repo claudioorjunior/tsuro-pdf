@@ -91,6 +91,8 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
         _ => main,
     };
     match session {
+        // Fechar com marcações sujas fica por cima dos outros modais.
+        Session::Ready(ready) if ready.close_prompt() => stack![main, close_prompt_layer(t)].into(),
         // Modal de impressão captura tudo; menu ⋯ nunca abre junto (fecha ao abrir).
         Session::Ready(ready) if ready.print_dialog.is_some() => {
             let dialog = ready.print_dialog.as_ref().expect("checked above");
@@ -1190,6 +1192,54 @@ fn save_warning_layer(t: Tokens) -> Element<'static, Message> {
     stack![mouse_area(dim).on_press(Message::SaveCopyCancelled), card,].into()
 }
 
+/// Fechar aba, Home ou a janela com marcações não salvas.
+fn close_prompt_layer(t: Tokens) -> Element<'static, Message> {
+    let dim = container(Space::with_width(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.25))),
+            ..container::Style::default()
+        });
+    let card = container(mouse_area(close_prompt_card(t)).on_press(Message::PrintNop))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center);
+    stack![mouse_area(dim).on_press(Message::CloseCancel), card,].into()
+}
+
+fn close_prompt_card(t: Tokens) -> Element<'static, Message> {
+    container(
+        column![
+            text("Marcações não salvas").size(16),
+            text("Fechar descarta as marcações desta sessão.").size(13),
+            row![
+                Space::with_width(Length::Fill),
+                button(text("Cancelar").size(13))
+                    .padding(Padding::from([8, 12]))
+                    .style(kiri::hud_ghost_style(t))
+                    .on_press(Message::CloseCancel),
+                button(text("Descartar").size(13))
+                    .padding(Padding::from([8, 12]))
+                    .style(kiri::hud_ghost_style(t))
+                    .on_press(Message::CloseDiscard),
+                button(text("Salvar cópia").size(13))
+                    .padding(Padding::from([8, 12]))
+                    .style(kiri::hud_primary_style(t))
+                    .on_press(Message::CloseSave),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(12),
+    )
+    .width(Length::Fixed(440.0))
+    .padding(16)
+    .style(kiri::menu_style(t))
+    .into()
+}
+
 /// Pergunta sim/não do aviso de assinatura; "Salvar mesmo assim" segue para o
 /// diálogo de destino.
 fn save_warning_card(t: Tokens) -> Element<'static, Message> {
@@ -1896,6 +1946,7 @@ struct DrawMark {
     /// Candidato do arrasto de nota: contorno claro pontilhado (o original
     /// segue sólido até o soltar).
     ghost: bool,
+    selected: bool,
 }
 
 /// Camada transparente sobre a folha (issue #30): desenha marcações/seleção
@@ -2035,6 +2086,9 @@ impl Program<Message> for MarkLayer {
                         ..Stroke::default()
                     },
                 );
+                if m.selected {
+                    stroke_selected(&mut frame, &rect);
+                }
                 continue;
             }
             match m.kind {
@@ -2076,6 +2130,9 @@ impl Program<Message> for MarkLayer {
                         ..Stroke::default()
                     },
                 ),
+            }
+            if m.selected {
+                stroke_selected(&mut frame, &rect);
             }
         }
         vec![frame.into_geometry()]
@@ -2145,11 +2202,13 @@ fn with_marks<'a>(
                     kind: None,
                     marker: false,
                     ghost: false,
+                    selected: false,
                 });
             }
         }
     }
     for a in ready.annotations.iter().filter(|a| a.page == page) {
+        let selected = ready.selected_annot() == Some(a.id);
         for (i, quad) in a.quads.iter().enumerate() {
             let [x, y, w, h] = display_rect(*quad, media, ready.view_rotation, cw, ch);
             marks.push(DrawMark {
@@ -2160,6 +2219,7 @@ fn with_marks<'a>(
                 kind: Some(a.kind),
                 marker: false,
                 ghost: false,
+                selected,
             });
             // Nota: marcador compacto — na origem do primeiro quad ou onde o
             // arrasto o deixou (`Annotation::marker`); o trecho não se move.
@@ -2174,6 +2234,7 @@ fn with_marks<'a>(
                     kind: Some(AnnotKind::Note),
                     marker: true,
                     ghost: false,
+                    selected,
                 });
             }
         }
@@ -2192,6 +2253,7 @@ fn with_marks<'a>(
                 kind: Some(AnnotKind::Note),
                 marker: true,
                 ghost: true,
+                selected: false,
             });
         }
     }
@@ -2209,6 +2271,17 @@ fn with_marks<'a>(
             .height(Length::Fixed(ch)),
     ]
     .into()
+}
+
+fn stroke_selected(frame: &mut Frame, rect: &Path) {
+    frame.stroke(
+        rect,
+        Stroke {
+            style: Style::Solid(Color::from_rgb(0.15, 0.45, 0.95)),
+            width: 1.5,
+            ..Stroke::default()
+        },
+    );
 }
 
 fn signatures_panel(ready: &Ready, t: Tokens) -> Element<'_, Message> {
