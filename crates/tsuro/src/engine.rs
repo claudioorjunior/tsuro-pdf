@@ -65,6 +65,12 @@ enum Request {
         page: PageNo,
         reply: mpsc::Sender<Result<(MediaBox, TextLayer), EngineError>>,
     },
+    /// Caixas de todas as páginas, sem camada de texto. O contínuo mede a
+    /// coluna com isto; `PageData` continua preguiçoso.
+    MediaBoxes {
+        doc_id: u64,
+        reply: mpsc::Sender<Result<Vec<MediaBox>, EngineError>>,
+    },
     Render {
         doc_id: u64,
         page: PageNo,
@@ -184,6 +190,9 @@ fn serve(incoming: mpsc::Receiver<Request>) {
                     page_data_from_doc(doc, page)
                 }));
             }
+            Request::MediaBoxes { doc_id, reply } => {
+                let _ = reply.send(with_doc(&documents, doc_id, media_boxes_from_doc));
+            }
             Request::Render {
                 doc_id,
                 page,
@@ -278,6 +287,14 @@ impl PdfiumEngine {
         self.call(|reply| Request::PageData {
             doc_id: self.doc_id,
             page,
+            reply,
+        })
+    }
+
+    /// Largura e altura de cada página, sem extrair texto.
+    pub fn media_boxes(&self) -> Result<Vec<MediaBox>, EngineError> {
+        self.call(|reply| Request::MediaBoxes {
+            doc_id: self.doc_id,
             reply,
         })
     }
@@ -379,12 +396,29 @@ fn page_data_from_doc(
         .pages()
         .get(page_index(page)?)
         .map_err(|e| EngineError(e.to_string()))?;
-    let media = MediaBox {
-        width: pdf_page.width().value,
-        height: pdf_page.height().value,
-    };
+    let media = media_of(&pdf_page);
     let text = text_layer_from_page(&pdf_page, page)?;
     Ok((media, text))
+}
+
+fn media_boxes_from_doc(document: &PdfDocument<'_>) -> Result<Vec<MediaBox>, EngineError> {
+    let total = u32::from(document.pages().len());
+    let mut boxes = Vec::with_capacity(total as usize);
+    for index in 0..total {
+        let page = document
+            .pages()
+            .get(page_index(PageNo::from_index(index))?)
+            .map_err(|e| EngineError(e.to_string()))?;
+        boxes.push(media_of(&page));
+    }
+    Ok(boxes)
+}
+
+fn media_of(page: &PdfPage<'_>) -> MediaBox {
+    MediaBox {
+        width: page.width().value,
+        height: page.height().value,
+    }
 }
 
 /// Percorre recursivamente a árvore de bookmarks do Pdfium e produz
@@ -882,6 +916,24 @@ mod tests {
             .join(name);
         let bytes = std::fs::read(path).ok()?;
         PdfiumEngine::open(Arc::from(bytes.as_slice())).ok()
+    }
+
+    #[test]
+    fn media_boxes_match_each_page_without_text() {
+        let Some(engine) = sample_engine("sumario-folio.pdf") else {
+            return;
+        };
+        let boxes = engine.media_boxes().expect("caixas");
+        assert!(engine.page_count() > 1);
+        assert_eq!(boxes.len() as u32, engine.page_count());
+        for (index, box_) in boxes.iter().enumerate() {
+            let (media, _) = engine
+                .page_data(PageNo::from_index(index as u32))
+                .expect("page data");
+            assert!((box_.width - media.width).abs() < 0.01);
+            assert!((box_.height - media.height).abs() < 0.01);
+            assert!(box_.width > 1.0 && box_.height > 1.0);
+        }
     }
 
     #[test]
