@@ -562,7 +562,7 @@ pub enum AnnotKind {
 
 /// Marcação sobre um trecho: um retângulo por linha do texto (nunca um
 /// bloco único — padrão dos leitores), em espaço da mídia original.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Annotation {
     pub id: u64,
     pub page: PageNo,
@@ -959,6 +959,9 @@ pub struct Ready {
     pub selection: Option<Selection>,
     /// Marcações da sessão (issue #30); zera ao abrir. Sem persistência na v1.
     pub annotations: Vec<Annotation>,
+    /// Cópia de `annotations` no último save bem-sucedido. O ponto da pílula
+    /// acende quando as duas listas divergem.
+    saved_marks: Vec<Annotation>,
     next_annot_id: u64,
     /// Âncora do press (click-vs-drag no PointerUp); zera ao trocar de documento.
     press_anchor: Option<PressAnchor>,
@@ -1168,11 +1171,13 @@ fn start_save_dialog(ready: &mut Ready) -> Task<Message> {
     let annotations = ready.annotations.clone();
     let doc_gen = ready.open_gen;
     let engine = ready.engine.clone();
+    let saved = annotations.clone();
     Task::perform(
         save_copy_file(engine, annotations, dest.clone()),
         move |result| Message::SaveCopyDone {
             doc_gen,
             path: dest.clone(),
+            saved: saved.clone(),
             result,
         },
     )
@@ -1523,6 +1528,7 @@ pub enum Message {
     SaveCopyDone {
         doc_gen: u64,
         path: PathBuf,
+        saved: Vec<Annotation>,
         result: Result<(), String>,
     },
     SetTheme(Theme),
@@ -2528,6 +2534,7 @@ impl Session {
             Message::SaveCopyDone {
                 doc_gen,
                 path,
+                saved,
                 result,
             } => {
                 if let Session::Ready(tabs) = self {
@@ -2540,6 +2547,7 @@ impl Session {
                                 let recents = push_recent(recents, path.clone());
                                 let _ = save_recents(&recents);
                                 ready.recents = recents;
+                                ready.saved_marks = saved;
                                 let name = path
                                     .file_name()
                                     .map(|name| name.to_string_lossy().into_owned())
@@ -3194,6 +3202,10 @@ pub fn thumbnail_scale(media: MediaBox) -> Scale {
 impl Ready {
     pub fn page_count(&self) -> u32 {
         self.pages.total
+    }
+
+    pub(crate) fn marks_dirty(&self) -> bool {
+        self.annotations != self.saved_marks
     }
 
     /// Solta o documento na worker do motor (aba fechada, issue #40). Os
@@ -4428,6 +4440,7 @@ impl Document {
             print_status: None,
             save_status: None,
             save_warning: false,
+            saved_marks: Vec::new(),
             open_gen: 0,
             disk_identity: None,
             reload_inflight: false,
@@ -8567,6 +8580,7 @@ mod tests {
                 Message::SaveCopyDone {
                     doc_gen,
                     path: dest.clone(),
+                    saved: Vec::new(),
                     result: Ok(()),
                 },
             );
@@ -8579,14 +8593,43 @@ mod tests {
             );
             assert_eq!(ready.recents.first(), Some(&dest));
             assert_eq!(read_recents().first(), Some(&dest));
+            assert!(!ready.marks_dirty());
         });
     }
 
     #[test]
-    fn save_done_err_sets_failure_status() {
-        let Some(ready) = sample_ready() else {
+    fn save_done_clears_dirty_until_the_marks_change() {
+        let Some(mut ready) = sample_ready() else {
             return;
         };
+        ready.annotations.push(unsaved_mark());
+        assert!(ready.marks_dirty());
+        let saved = ready.annotations.clone();
+        let doc_gen = ready.open_gen;
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(
+            &mut session,
+            Message::SaveCopyDone {
+                doc_gen,
+                path: std::env::temp_dir().join("guia (marcado).pdf"),
+                saved,
+                result: Ok(()),
+            },
+        );
+        let Session::Ready(ready) = &mut session else {
+            panic!("expected Ready");
+        };
+        assert!(!ready.marks_dirty());
+        ready.annotations.push(unsaved_mark());
+        assert!(ready.marks_dirty());
+    }
+
+    #[test]
+    fn save_done_err_sets_failure_status() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        ready.annotations.push(unsaved_mark());
         let doc_gen = ready.open_gen;
         let mut session = Session::Ready(Tabs::single(ready));
         apply(
@@ -8594,6 +8637,7 @@ mod tests {
             Message::SaveCopyDone {
                 doc_gen,
                 path: std::env::temp_dir().join("x.pdf"),
+                saved: vec![unsaved_mark()],
                 result: Err("disco cheio".into()),
             },
         );
@@ -8604,6 +8648,7 @@ mod tests {
             ready.save_status.as_deref(),
             Some("Falha ao salvar: disco cheio")
         );
+        assert!(ready.marks_dirty());
     }
 
     #[test]
@@ -8618,6 +8663,7 @@ mod tests {
             Message::SaveCopyDone {
                 doc_gen: stale,
                 path: std::env::temp_dir().join("x.pdf"),
+                saved: Vec::new(),
                 result: Ok(()),
             },
         );
