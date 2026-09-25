@@ -8218,6 +8218,111 @@ mod tests {
         assert!(ready.render_inflight.contains(&key));
     }
 
+    fn grow_pages(ready: &mut Ready, total: u32) {
+        if ready.pages.total >= total {
+            return;
+        }
+        let media = ready.loaded_media(PageNo::first()).unwrap_or(MediaBox {
+            width: 100.0,
+            height: 200.0,
+        });
+        ready.pages.total = total;
+        ready.pages.media.resize(total as usize, Some(media));
+        ready.pages.text.resize(total as usize, None);
+    }
+
+    #[test]
+    fn thumb_page_window_starts_at_zero_and_scrolls_with_prefetch() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        grow_pages(&mut ready, 10 + THUMB_VISIBLE + THUMB_PREFETCH * 2);
+        ready.pages_scroll_y = 0.0;
+        let top = ready.thumb_page_window();
+        assert_eq!(top.first().map(|page| page.index()), Some(0));
+        assert_eq!(
+            top.len() as u32,
+            (THUMB_VISIBLE + 2 * THUMB_PREFETCH).min(ready.page_count())
+        );
+
+        ready.pages_scroll_y = 10.0 * THUMB_ROW;
+        let deep = ready.thumb_page_window();
+        assert_eq!(
+            deep.first().map(|page| page.index()),
+            Some(10 - THUMB_PREFETCH)
+        );
+    }
+
+    #[test]
+    fn thumb_render_is_scheduled_for_scrolled_window() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        grow_pages(&mut ready, 10 + THUMB_VISIBLE + THUMB_PREFETCH * 2);
+        ready.pages_open = true;
+        let visible = ready.visible;
+        let scale = ready.page_scale(visible);
+        ready
+            .surfaces
+            .insert(visible, scale, 0, fake_surface(visible, scale));
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::PagesScrolled(10.0 * THUMB_ROW));
+        let Session::Ready(ready) = &mut session else {
+            panic!("expected Ready");
+        };
+        ready.render_inflight.clear();
+        ready.page_data_inflight.clear();
+        let start = PageNo::from_index(10 - THUMB_PREFETCH);
+        let media = ready.loaded_media(start).expect("media");
+        let key = render_key(start, ready.thumb_scale_for(media), 0);
+        let _ = ready.request_thumb_render();
+        assert!(ready.render_inflight.contains(&key));
+    }
+
+    #[test]
+    fn rendered_drops_out_of_window_thumbs() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        grow_pages(&mut ready, THUMB_VISIBLE + THUMB_PREFETCH * 2 + 1);
+        ready.pages_open = true;
+        ready.pages_scroll_y = 0.0;
+        let window = ready.thumb_page_window();
+        let inside = window[0];
+        let outside = PageNo::from_index(window.last().expect("window").index() + 1);
+        let media = ready.loaded_media(outside).expect("media");
+        let thumb_scale = ready.thumb_scale_for(media);
+        let (doc_gen, render_gen) = (ready.open_gen, ready.render_gen);
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(
+            &mut session,
+            Message::Rendered {
+                page: outside,
+                scale: thumb_scale,
+                rotation: 0,
+                doc_gen,
+                render_gen,
+                surface: Some(fake_surface(outside, thumb_scale)),
+            },
+        );
+        apply(
+            &mut session,
+            Message::Rendered {
+                page: inside,
+                scale: thumb_scale,
+                rotation: 0,
+                doc_gen,
+                render_gen,
+                surface: Some(fake_surface(inside, thumb_scale)),
+            },
+        );
+        let Session::Ready(ready) = &session else {
+            panic!("expected Ready");
+        };
+        assert!(ready.thumb_surface(inside).is_some());
+        assert!(ready.thumb_surface(outside).is_none());
+    }
+
     #[test]
     fn suggested_marked_name_replaces_only_the_last_extension() {
         use std::path::Path;

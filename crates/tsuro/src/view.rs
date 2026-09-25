@@ -1610,7 +1610,7 @@ fn panel_tabs(ready: &Ready, t: Tokens) -> Element<'_, Message> {
 fn outline_tab(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let active = ready.outline_active();
     let focus = ready.outline_focus();
-    let mut col = column![panel_tabs(ready, t)].spacing(8);
+    let mut col = column![].spacing(8);
     for (path, depth, title, page, has_children) in ready.outline_rows() {
         let is_active = active.as_ref() == Some(&path);
         // O cursor do teclado é a pílula; a página ativa, o texto em accent.
