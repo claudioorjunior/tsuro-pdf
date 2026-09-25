@@ -49,7 +49,7 @@ impl Scale {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quad {
     pub x0: f32,
     pub y0: f32,

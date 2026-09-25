@@ -305,7 +305,7 @@ fn topbar(session: &Session, t: Tokens) -> Element<'_, Message> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut doc_row = row![].spacing(6).align_y(Alignment::Center);
-        if !ready.annotations.is_empty() {
+        if ready.marks_dirty() {
             doc_row = doc_row.push(
                 container(Space::with_width(Length::Fixed(6.0)))
                     .width(Length::Fixed(6.0))
