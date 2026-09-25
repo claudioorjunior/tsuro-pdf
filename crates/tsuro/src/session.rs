@@ -873,7 +873,7 @@ pub struct Ready {
     /// DPR da janela: bitmap sai em px físicos (zoom CSS × isto).
     pub render_scale: f32,
     open_gen: u64,
-    /// Identidade (tamanho+mtime) na última leitura; o poll compara com o disco.
+    /// Identidade (tamanho + mtime em nanos) na última leitura; o poll compara com o disco.
     disk_identity: Option<(u64, u64)>,
     /// O arquivo no disco divergiu e a sessão tem (ou teve) trabalho não salvo.
     /// O aviso fica fora de `save_status`. Recarregar é explícito.
@@ -9203,6 +9203,47 @@ mod tests {
         // Em voo: o tique seguinte não dispara de novo.
         apply(&mut session, Message::FileTick);
         assert!(active_ready(&session).reload_inflight);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pin_mtime(path: &std::path::Path, secs: u64, subsec_nanos: u32) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("abre para mtime");
+        let when = std::time::UNIX_EPOCH + std::time::Duration::new(secs, subsec_nanos);
+        file.set_modified(when).expect("define mtime");
+    }
+
+    /// O poll (2s) pode cair no mesmo segundo da escrita. Mesmo tamanho e
+    /// mtime truncado escondem a troca; o tique precisa recarregar.
+    #[test]
+    fn file_tick_reloads_same_size_edit_within_one_second() {
+        let Some((mut doc, dir)) = temp_copy_ready() else {
+            return;
+        };
+        let path = doc.source.path().to_path_buf();
+        let mut bytes = std::fs::read(&path).expect("lê a cópia");
+        let secs = 1_790_305_504u64;
+        pin_mtime(&path, secs, 157_899_200);
+        doc.disk_identity = crate::positions::file_identity(&path);
+        let stored = doc.disk_identity;
+        let mut session = Session::Ready(Tabs::single(doc));
+        bytes[0] ^= 0xff;
+        std::fs::write(&path, &bytes).expect("reescreve o mesmo tamanho");
+        pin_mtime(&path, secs, 161_899_200);
+        let current = crate::positions::file_identity(&path);
+        assert_eq!(
+            stored.map(|id| id.0),
+            current.map(|id| id.0),
+            "mesmo tamanho"
+        );
+        assert_ne!(stored, current, "o mesmo segundo ainda é outra versão");
+        apply(&mut session, Message::FileTick);
+        assert!(
+            active_ready(&session).reload_inflight,
+            "poll dentro do segundo recarrega"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

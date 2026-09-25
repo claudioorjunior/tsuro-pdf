@@ -7,8 +7,10 @@
 //!
 //! Formato (uma entrada por linha, mais recente primeiro, máx 50):
 //! `página\tzoom\ttamanho\tmtime\tmodo\tcaminho` com `\`/`\t`/`\n` escapados
-//! no caminho. Linha no formato antigo (sem o campo `modo`) é lida como
-//! `Single`; linha malformada é ignorada, nunca derruba a leitura.
+//! no caminho. `mtime` é nanossegundos desde o epoch; uma linha antiga com
+//! segundos Unix ainda casa com o arquivo intocado. Linha no formato antigo
+//! (sem o campo `modo`) é lida como `Single`; linha malformada é ignorada,
+//! nunca derruba a leitura.
 
 use std::path::{Path, PathBuf};
 
@@ -72,16 +74,28 @@ pub fn positions_file() -> PathBuf {
     std::env::temp_dir().join("tsuro-positions")
 }
 
-/// Tamanho + mtime (segundos) do arquivo; `None` se ilegível.
+/// Tamanho + mtime (nanossegundos desde o epoch) do arquivo; `None` se ilegível.
+///
+/// Segundos inteiros colapsam duas escritas do mesmo tamanho no mesmo segundo
+/// Unix. O poll e a posição salva passam a ver o arquivo como outro.
 pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
     let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta
+    let mtime_ns = meta
         .modified()
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
-        .as_secs();
+        .as_nanos();
+    let mtime = u64::try_from(mtime_ns).ok()?;
     Some((meta.len(), mtime))
+}
+
+/// `stored` gravado agora é nanos. Linha antiga guarda segundos Unix
+/// (`as_secs`); um valor abaixo disto não é nanos de um arquivo real.
+const LEGACY_MTIME_SECS_MAX: u64 = 10_000_000_000;
+
+fn mtime_matches(stored: u64, current_ns: u64) -> bool {
+    stored == current_ns || (stored < LEGACY_MTIME_SECS_MAX && stored == current_ns / 1_000_000_000)
 }
 
 fn escape_path(path: &Path) -> String {
@@ -225,7 +239,7 @@ pub fn find_position(entries: &[(PathBuf, DocPosition)], path: &Path) -> Option<
         .iter()
         .find(|(p, _)| p == path)
         .map(|(_, pos)| *pos)
-        .filter(|pos| pos.size == size && pos.mtime == mtime)
+        .filter(|pos| pos.size == size && mtime_matches(pos.mtime, mtime))
 }
 
 #[cfg(test)]
@@ -360,6 +374,80 @@ mod tests {
         assert_eq!(find_position(&entries, &pdf).map(|p| p.page), Some(5));
         std::fs::write(&pdf, b"0123456789abcdef").unwrap();
         assert!(find_position(&entries, &pdf).is_none());
+        let _ = std::fs::remove_file(&pdf);
+    }
+
+    fn pin_mtime(path: &Path, secs: u64, subsec_nanos: u32) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::new(secs, subsec_nanos);
+        file.set_modified(when).unwrap();
+    }
+
+    /// Duas escritas do mesmo tamanho no mesmo segundo Unix são arquivos
+    /// diferentes. O mtime em segundos inteiros as trata como iguais.
+    #[test]
+    fn same_size_edit_inside_one_second_changes_identity() {
+        let pdf = std::env::temp_dir().join(format!(
+            "tsuro-positions-unit-{}-same-sec.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&pdf, b"AAAA").unwrap();
+        let secs = 1_790_305_504u64;
+        pin_mtime(&pdf, secs, 157_899_200);
+        let first = file_identity(&pdf).unwrap();
+        let entries = vec![(
+            pdf.clone(),
+            DocPosition {
+                page: 2,
+                zoom: Zoom::Width,
+                mode: ViewMode::Single,
+                size: first.0,
+                mtime: first.1,
+            },
+        )];
+        assert_eq!(find_position(&entries, &pdf).map(|p| p.page), Some(2));
+        std::fs::write(&pdf, b"BBBB").unwrap();
+        pin_mtime(&pdf, secs, 161_899_200);
+        let second = file_identity(&pdf).unwrap();
+        assert_eq!(first.0, second.0, "mesmo tamanho");
+        let whole = |mtime: u64| {
+            if mtime < LEGACY_MTIME_SECS_MAX {
+                mtime
+            } else {
+                mtime / 1_000_000_000
+            }
+        };
+        assert_eq!(whole(first.1), whole(second.1), "mesmo segundo Unix");
+        assert_ne!(first, second, "nanos distinguem a edição");
+        assert!(
+            find_position(&entries, &pdf).is_none(),
+            "posição salva não vale para os bytes novos"
+        );
+        let _ = std::fs::remove_file(&pdf);
+    }
+
+    /// Linha gravada com mtime em segundos ainda retoma um arquivo intocado.
+    #[test]
+    fn legacy_second_mtime_matches_unchanged_file() {
+        let pdf = std::env::temp_dir().join(format!(
+            "tsuro-positions-unit-{}-legacy-sec.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&pdf, b"AAAA").unwrap();
+        let secs = 1_790_305_504u64;
+        pin_mtime(&pdf, secs, 157_899_200);
+        let (size, _) = file_identity(&pdf).unwrap();
+        let entries = vec![(
+            pdf.clone(),
+            DocPosition {
+                page: 4,
+                zoom: Zoom::Page,
+                mode: ViewMode::Single,
+                size,
+                mtime: secs,
+            },
+        )];
+        assert_eq!(find_position(&entries, &pdf).map(|p| p.page), Some(4));
         let _ = std::fs::remove_file(&pdf);
     }
 }
