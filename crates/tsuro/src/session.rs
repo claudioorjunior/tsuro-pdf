@@ -965,6 +965,8 @@ pub struct Ready {
     next_annot_id: u64,
     /// Âncora do press (click-vs-drag no PointerUp); zera ao trocar de documento.
     press_anchor: Option<PressAnchor>,
+    /// Marcação escolhida pelo clique. Delete/Backspace remove. Clique não apaga.
+    selected_annot: Option<u64>,
     annot_undo: Vec<AnnotAction>,
     annot_redo: Vec<AnnotAction>,
     /// Rascunho de nota aberto (issue #30); zera ao abrir. Sem persistência na v1.
@@ -4438,6 +4440,7 @@ impl Document {
             annotations: Vec::new(),
             next_annot_id: 0,
             press_anchor: None,
+            selected_annot: None,
             annot_undo: Vec::new(),
             annot_redo: Vec::new(),
             note_draft: None,
@@ -5752,7 +5755,7 @@ mod tests {
         ];
         assert_eq!(ready.annotation_at(annot.page, center), Some(annot.id));
         assert_eq!(ready.annotation_at(annot.page, [-1000.0, -1000.0]), None);
-        // PointerUp sem arrasto remove via mensagens.
+        // PointerUp sem arrasto seleciona. Delete apaga.
         ready.press_anchor = Some(PressAnchor { sel, exact: true });
         let mut session = Session::Ready(Tabs::single(ready));
         apply(
@@ -5763,7 +5766,10 @@ mod tests {
             },
         );
         match &session {
-            Session::Ready(ready) => assert!(ready.annotations.is_empty()),
+            Session::Ready(ready) => {
+                assert_eq!(ready.annotations.len(), 1);
+                assert_eq!(ready.selected_annot, Some(annot.id));
+            }
             _ => unreachable!(),
         }
     }
