@@ -1029,6 +1029,9 @@ pub struct Ready {
     open_gen: u64,
     /// Identidade (tamanho+mtime) na última leitura; o poll compara com o disco.
     disk_identity: Option<(u64, u64)>,
+    /// O arquivo no disco divergiu e a sessão tem (ou teve) trabalho não salvo.
+    /// O aviso fica fora de `save_status`. Recarregar é explícito.
+    disk_stale: bool,
     /// Reload do disco em voo (um por aba; a resposta chega em `Reloaded`).
     reload_inflight: bool,
     /// Invalidates in-flight renders on nav/zoom/DPI changes.
@@ -3430,6 +3433,10 @@ impl Ready {
         self.selected_annot
     }
 
+    pub(crate) fn disk_stale(&self) -> bool {
+        self.disk_stale
+    }
+
     /// Solta o documento na worker do motor (aba fechada, issue #40). Os
     /// clones deste `Ready` compartilham o mesmo documento — depois disto os
     /// pedidos deles falham.
@@ -4680,6 +4687,7 @@ impl Document {
             saved_marks: Vec::new(),
             open_gen: 0,
             disk_identity: None,
+            disk_stale: false,
             reload_inflight: false,
             render_gen: 1,
             surfaces: SurfaceCache::default(),
@@ -9414,18 +9422,17 @@ mod tests {
         apply(&mut session, Message::FileTick);
         let marked = active_ready(&session);
         assert!(!marked.reload_inflight);
-        assert_eq!(
-            marked.save_status.as_deref(),
-            Some("O arquivo mudou no disco.")
+        assert!(
+            marked.save_status.is_none(),
+            "aviso de disco não pode ocupar a linha de status"
         );
-        // Re-tique: idempotente, segue sem inflight.
+        assert!(marked.disk_stale());
+        // Re-tique: idempotente, segue sem inflight e sem status.
         apply(&mut session, Message::FileTick);
         let marked = active_ready(&session);
         assert!(!marked.reload_inflight);
-        assert_eq!(
-            marked.save_status.as_deref(),
-            Some("O arquivo mudou no disco.")
-        );
+        assert!(marked.save_status.is_none());
+        assert!(marked.disk_stale());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
