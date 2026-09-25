@@ -852,6 +852,9 @@ pub struct Ready {
     outline_cursor: Option<Vec<usize>>,
     /// Evita disparar mais de um task de carregamento de outline por documento.
     outline_load_issued: bool,
+    /// Catálogo de caixas já pedido (uma vez). O contínuo não espera `PageData`
+    /// para saber a altura de cada página.
+    media_boxes_issued: bool,
     /// Tema Kiri — sobrevive a `begin_open`/`finish_open`/`close_document`.
     pub theme: Theme,
     /// Menu ⋯ aberto. Só existe em `Ready`; zera ao trocar de documento.
@@ -1293,6 +1296,11 @@ pub enum Message {
         doc_gen: u64,
         result: Result<(MediaBox, TextLayer), String>,
     },
+    /// Caixas de todas as páginas (sem texto). `doc_gen` casa a aba.
+    MediaBoxes {
+        doc_gen: u64,
+        result: Result<Vec<MediaBox>, String>,
+    },
     Close,
     /// Fecha a aba ativa (⌘W); se for a última, fecha a janela (→ `Empty`).
     CloseTabActive,
@@ -1630,6 +1638,22 @@ impl Session {
                         }
                         Err(_) => {
                             ready.page_data_failed.insert(page.index());
+                        }
+                    }
+                }
+                self.schedule_work()
+            }
+            Message::MediaBoxes { doc_gen, result } => {
+                if let Session::Ready(tabs) = self {
+                    let Some(ready) = tabs.by_gen(doc_gen) else {
+                        return Task::none();
+                    };
+                    if let Ok(boxes) = result {
+                        let n = ready.pages.media.len().min(boxes.len());
+                        for i in 0..n {
+                            if ready.pages.media[i].is_none() {
+                                ready.pages.media[i] = Some(boxes[i]);
+                            }
                         }
                     }
                 }
@@ -3073,6 +3097,11 @@ impl Session {
         if let Some(task) = ready.request_visible_render() {
             return task;
         }
+        if ready.needs_media_boxes() {
+            ready.media_boxes_issued = true;
+            let doc_gen = ready.open_gen;
+            return media_boxes_task(ready.engine.clone(), doc_gen);
+        }
         if let Some(page) = ready.next_page_data_target() {
             let doc_gen = ready.open_gen;
             ready.page_data_inflight.insert(page.index());
@@ -3107,6 +3136,17 @@ fn page_data_task(engine: PdfiumEngine, page: PageNo, doc_gen: u64) -> Task<Mess
             doc_gen,
             result,
         },
+    )
+}
+
+fn media_boxes_task(engine: PdfiumEngine, doc_gen: u64) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || engine.media_boxes().map_err(|e| e.to_string()))
+                .await
+                .map_err(|e| e.to_string())?
+        },
+        move |result| Message::MediaBoxes { doc_gen, result },
     )
 }
 
@@ -3284,10 +3324,18 @@ impl Ready {
     }
 
     pub fn media(&self, page: PageNo) -> MediaBox {
-        self.loaded_media(page).unwrap_or(MediaBox {
-            width: 1.0,
-            height: 1.0,
-        })
+        self.loaded_media(page)
+            .or_else(|| self.stand_in_media())
+            .unwrap_or(MediaBox {
+                width: 1.0,
+                height: 1.0,
+            })
+    }
+
+    /// Primeira caixa já lida. Página sem `PageData` herda isto no layout:
+    /// 1×1 pt, no ajuste à largura, vira um quadrado da largura do painel.
+    fn stand_in_media(&self) -> Option<MediaBox> {
+        self.pages.media.iter().find_map(|slot| *slot)
     }
 
     /// Escala de render em px físicos: zoom CSS × DPR da janela.
@@ -4286,19 +4334,33 @@ impl Ready {
     }
 
     fn page_data_priority(&self) -> Vec<PageNo> {
-        let mut pages = vec![self.visible];
+        let mut pages: Vec<PageNo> = Vec::new();
+        let mut push = |page: PageNo| {
+            if !pages.iter().any(|p: &PageNo| p.index() == page.index()) {
+                pages.push(page);
+            }
+        };
+        push(self.visible);
         let v = self.visible.index();
         if v + 1 < self.pages.total {
-            pages.push(PageNo::from_index(v + 1));
+            push(PageNo::from_index(v + 1));
+        }
+        if self.view_mode == ViewMode::Continuous {
+            let (start, end) = self.doc_window();
+            for index in start..end {
+                push(PageNo::from_index(index));
+            }
         }
         if self.pages_open {
             for page in self.thumb_page_window() {
-                if !pages.iter().any(|p| p.index() == page.index()) {
-                    pages.push(page);
-                }
+                push(page);
             }
         }
         pages
+    }
+
+    fn needs_media_boxes(&self) -> bool {
+        !self.media_boxes_issued && self.pages.media.iter().any(Option::is_none)
     }
 
     fn prefetch_target(&self) -> Option<(PageNo, Scale, u8)> {
@@ -4513,6 +4575,7 @@ impl Document {
             outline_collapsed: HashSet::new(),
             outline_cursor: None,
             outline_load_issued: false,
+            media_boxes_issued: false,
             pages_scroll_y: 0.0,
             doc_scroll_y: 0.0,
             recents: Vec::new(),
@@ -5101,6 +5164,134 @@ mod tests {
         }
         let last = PageNo::from_index(n - 1);
         assert_eq!(ready.doc_total_height(), ready.page_offset(last) + cell);
+    }
+
+    /// Página sem `PageData` não pode medir 1×1 pt: no ajuste à largura isso
+    /// vira um quadrado da largura do painel e a coluna contínua (offset,
+    /// scrollbar, `page_at_offset`) persegue a geometria errada.
+    #[test]
+    fn continuous_unloaded_page_uses_known_media_not_unit_box() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let known = ready.loaded_media(PageNo::first()).expect("page 0");
+        assert!(known.width > 2.0 && known.height > 2.0);
+        let total = 4.max(ready.page_count());
+        ready.pages.total = total;
+        let text0 = ready.pages.text.first().cloned().flatten();
+        ready.pages.media = vec![None; total as usize];
+        ready.pages.text = vec![None; total as usize];
+        ready.pages.media[0] = Some(known);
+        ready.pages.text[0] = text0;
+        ready.view_mode = ViewMode::Continuous;
+        ready.zoom = Zoom::Width;
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.pages_open = false;
+        ready.signatures_open = false;
+
+        let tail = PageNo::from_index(total - 1);
+        assert!(ready.loaded_media(tail).is_none());
+        let got = ready.media(tail);
+        assert!((got.width - known.width).abs() < 0.01);
+        assert!((got.height - known.height).abs() < 0.01);
+
+        let h0 = ready.doc_cell_height(PageNo::first(), ready.sheet_width(PageNo::first()));
+        let ht = ready.doc_cell_height(tail, ready.sheet_width(tail));
+        assert!((h0 - ht).abs() < 0.01);
+
+        let square = DOC_PAD_TOP + ready.doc_content_width() + DOC_PAD_BOTTOM;
+        let aspect = known.height / known.width;
+        if (aspect - 1.0).abs() > 0.05 {
+            assert!(
+                (ht - square).abs() > 1.0,
+                "unloaded cell {ht} collapsed to the 1×1 square {square}"
+            );
+        }
+
+        let step = h0 + DOC_GAP;
+        assert_eq!(ready.page_offset(tail), (total - 1) as f32 * step);
+        assert_eq!(ready.page_at_offset(2.0 * step + 1.0).index(), 2);
+    }
+
+    /// A janela montada pede `PageData` além de visível+1. Sem isso o bitmap
+    /// da célula nunca chega e o prefetch persegue a página errada.
+    #[test]
+    fn continuous_page_data_includes_pages_past_the_next() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let known = ready.loaded_media(PageNo::first()).expect("page 0");
+        let text0 = ready.pages.text.first().cloned().flatten();
+        assert!(text0.is_some());
+        let total = 8.max(ready.page_count());
+        ready.pages.total = total;
+        ready.pages.media = vec![Some(known); total as usize];
+        ready.pages.text = vec![None; total as usize];
+        ready.pages.text[0] = text0.clone();
+        ready.pages.text[1] = text0;
+        ready.view_mode = ViewMode::Continuous;
+        ready.zoom = Zoom::Width;
+        ready.viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        ready.pages_open = false;
+        ready.signatures_open = false;
+        ready.visible = PageNo::first();
+        ready.doc_scroll_y = 0.0;
+        let (start, end) = ready.doc_window();
+        assert!(end > 2, "window {start}..{end} should pass the next page");
+        let target = ready.next_page_data_target().expect("page in the window");
+        assert!(target.index() >= 2);
+        assert!(target.index() >= start && target.index() < end);
+    }
+
+    #[test]
+    fn media_boxes_fill_unloaded_slots_without_clobbering() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        if ready.page_count() < 2 {
+            return;
+        }
+        let known = ready.loaded_media(PageNo::first()).expect("page 0");
+        let gen = ready.open_gen;
+        let mut session = Session::Ready(Tabs::single(ready));
+        {
+            let Session::Ready(ready) = &mut session else {
+                unreachable!();
+            };
+            ready.pages.media[1] = None;
+        }
+        let distinct = MediaBox {
+            width: known.width + 10.0,
+            height: known.height + 20.0,
+        };
+        apply(
+            &mut session,
+            Message::MediaBoxes {
+                doc_gen: gen,
+                result: Ok(vec![
+                    MediaBox {
+                        width: 9.0,
+                        height: 9.0,
+                    },
+                    distinct,
+                ]),
+            },
+        );
+        let Session::Ready(ready) = &session else {
+            unreachable!();
+        };
+        let kept = ready.loaded_media(PageNo::first()).expect("page 0");
+        assert!((kept.width - known.width).abs() < 0.01);
+        assert!((kept.height - known.height).abs() < 0.01);
+        let filled = ready.loaded_media(PageNo::from_index(1)).expect("page 1");
+        assert!((filled.width - distinct.width).abs() < 0.01);
+        assert!((filled.height - distinct.height).abs() < 0.01);
     }
 
     #[test]
