@@ -7,7 +7,7 @@ description = "Reconhecimento e verificação de assinaturas digitais em PDF"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-lopdf = "0.34"
+lopdf = "0.42"
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 sha1 = "0.10"
