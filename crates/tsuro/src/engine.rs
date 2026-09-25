@@ -832,7 +832,8 @@ fn text_layer_from_page(page: &PdfPage<'_>, page_no: PageNo) -> Result<TextLayer
         plain.push_str(&cluster);
         glyphs.push(Glyph { cluster, quad });
     }
-    let plain: String = plain.nfc().collect();
+    // Sem segunda NFC no `plain` (#79): compor aqui encolheria os bytes
+    // contra os clusters e o quad do hit cairia no glifo errado em NFD.
     Ok(TextLayer {
         page: page_no,
         plain,

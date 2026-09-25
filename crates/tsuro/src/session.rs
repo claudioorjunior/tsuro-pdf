@@ -628,6 +628,8 @@ pub struct Tabs {
     open_error: Option<String>,
     /// Fechar com marcações não salvas espera Cancelar, Descartar ou Salvar.
     close_ask: Option<CloseTarget>,
+    /// Shift segurado agora (janela, não aba): decide Enter vs Shift+Enter.
+    shift_held: bool,
 }
 
 /// Fechamento que ainda precisa de confirmação.
@@ -660,6 +662,7 @@ impl Tabs {
             pending: None,
             open_error: None,
             close_ask: None,
+            shift_held: false,
         }
     }
 
@@ -1318,6 +1321,13 @@ pub enum Message {
     RotateView,
     SetViewport(Viewport),
     SearchChanged(String),
+    /// Enter no campo de busca: próximo hit (Shift+Enter volta um).
+    SearchSubmit,
+    /// Botões/F3: anda um hit para frente ou para trás, com wrap.
+    SearchNext,
+    SearchPrev,
+    /// Shift segurado (para o Shift+Enter saber a direção no submit).
+    ModifiersChanged(keyboard::Modifiers),
     PointerDown {
         page: PageNo,
         page_pt: [f32; 2],
@@ -1770,18 +1780,23 @@ impl Session {
                 self.schedule_work()
             }
             Message::SearchChanged(query) => {
-                let follow = if let Session::Ready(tabs) = self {
-                    let ready = tabs.active_mut();
-                    ready.set_query(query);
-                    // Primeiro hit, sem segurar o empréstimo da busca.
-                    if let Some(page) = ready.search.hits().first().map(|hit| hit.page) {
-                        ready.navigate_to(page);
-                    }
-                    nav_follow(ready)
-                } else {
-                    Task::none()
-                };
-                Task::batch([self.schedule_work(), follow])
+                // #74: digitar só recalcula os highlights — o salto é no Enter.
+                if let Session::Ready(tabs) = self {
+                    tabs.active_mut().set_query(query);
+                }
+                self.schedule_work()
+            }
+            Message::SearchSubmit => {
+                let back = matches!(self, Session::Ready(tabs) if tabs.shift_held);
+                self.search_step(if back { -1 } else { 1 })
+            }
+            Message::SearchNext => self.search_step(1),
+            Message::SearchPrev => self.search_step(-1),
+            Message::ModifiersChanged(modifiers) => {
+                if let Session::Ready(tabs) = self {
+                    tabs.shift_held = modifiers.shift();
+                }
+                Task::none()
             }
             Message::PointerDown {
                 page,
@@ -2610,6 +2625,10 @@ impl Session {
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 keyboard_message(key, modifiers, status)
             }
+            // Shift para o Shift+Enter: vale com foco ou sem (o submit lê).
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                Some(Message::ModifiersChanged(modifiers))
+            }
             _ => None,
         });
         // Tique só enquanto a primeira aba carrega: a barra indeterminada
@@ -3056,6 +3075,19 @@ impl Session {
         Task::batch([self.schedule_work(), self.nav_follow_active()])
     }
 
+    /// Passo da busca (#43): anda o índice, salta para a página do hit atual
+    /// e alinha a rolagem no contínuo. Sem hits é no-op.
+    fn search_step(&mut self, delta: i32) -> Task<Message> {
+        if let Session::Ready(tabs) = self {
+            let ready = tabs.active_mut();
+            ready.search.step(delta);
+            if let Some(page) = ready.search.current_hit().map(|hit| hit.page) {
+                ready.navigate_to(page);
+            }
+        }
+        Task::batch([self.schedule_work(), self.nav_follow_active()])
+    }
+
     fn schedule_work(&mut self) -> Task<Message> {
         let Session::Ready(ready) = self else {
             return Task::none();
@@ -3177,6 +3209,17 @@ pub(crate) fn keyboard_message(
     if (modifiers.logo() || modifiers.control()) && !modifiers.alt() {
         if let Key::Named(Named::Enter) = key.as_ref() {
             return Some(Message::NoteSave);
+        }
+    }
+    // F3/Shift+F3 andam na busca com o campo focado ou não: o text_input
+    // não consome F3, então o atalho vale antes da guarda de foco.
+    if let Key::Named(Named::F3) = key.as_ref() {
+        if !modifiers.control() && !modifiers.logo() && !modifiers.alt() {
+            return Some(if modifiers.shift() {
+                Message::SearchPrev
+            } else {
+                Message::SearchNext
+            });
         }
     }
     if status != event::Status::Ignored {
@@ -5397,6 +5440,12 @@ mod tests {
                 _ => unreachable!(),
             };
             apply(&mut session, Message::SearchChanged("cláusula".into()));
+            assert_eq!(
+                visible(&session),
+                PageNo::first(),
+                "digitar não salta (#74)"
+            );
+            apply(&mut session, Message::SearchSubmit);
             assert_eq!(visible(&session), hit_page);
             apply(&mut session, Message::HistoryBack);
             assert_eq!(visible(&session), PageNo::first());
@@ -5404,6 +5453,115 @@ mod tests {
             assert_eq!(visible(&session), hit_page);
         });
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn search_submit_steps_through_hits_with_wrap() {
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let last = ready.page_count().saturating_sub(1);
+        if last < 1 {
+            return;
+        }
+        for idx in [0, last] {
+            let page = PageNo::from_index(idx);
+            ready.pages.text[idx as usize] = Some(TextLayer {
+                page,
+                plain: "alvo".into(),
+                glyphs: vec![Glyph {
+                    cluster: "alvo".into(),
+                    quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+                }],
+            });
+        }
+        let mut session = Session::Ready(Tabs::single(ready));
+        let state = |s: &Session| match s {
+            Session::Ready(r) => (r.visible, r.search.current()),
+            _ => unreachable!(),
+        };
+        apply(&mut session, Message::SearchChanged("alvo".into()));
+        assert_eq!(state(&session), (PageNo::first(), None));
+        apply(&mut session, Message::SearchSubmit);
+        assert_eq!(state(&session), (PageNo::first(), Some(0)));
+        apply(&mut session, Message::SearchNext);
+        assert_eq!(state(&session), (PageNo::from_index(last), Some(1)));
+        apply(&mut session, Message::SearchNext);
+        assert_eq!(state(&session), (PageNo::first(), Some(0)), "wrap");
+        apply(&mut session, Message::SearchPrev);
+        assert_eq!(
+            state(&session),
+            (PageNo::from_index(last), Some(1)),
+            "wrap reverso"
+        );
+    }
+
+    #[test]
+    fn shift_submit_opens_on_last_hit() {
+        use iced::keyboard::Modifiers;
+        let Some(mut ready) = sample_ready() else {
+            return;
+        };
+        let last = ready.page_count().saturating_sub(1);
+        if last < 1 {
+            return;
+        }
+        for idx in [0, last] {
+            let page = PageNo::from_index(idx);
+            ready.pages.text[idx as usize] = Some(TextLayer {
+                page,
+                plain: "alvo".into(),
+                glyphs: vec![Glyph {
+                    cluster: "alvo".into(),
+                    quad: Quad::from_rect(0.0, 0.0, 10.0, 10.0),
+                }],
+            });
+        }
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::SearchChanged("alvo".into()));
+        apply(&mut session, Message::ModifiersChanged(Modifiers::SHIFT));
+        apply(&mut session, Message::SearchSubmit);
+        match &session {
+            Session::Ready(r) => {
+                assert_eq!(r.search.current(), Some(1));
+                assert_eq!(r.visible, PageNo::from_index(last));
+            }
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::ModifiersChanged(Modifiers::empty()));
+        apply(&mut session, Message::SearchSubmit);
+        match &session {
+            Session::Ready(r) => assert_eq!(r.search.current(), Some(0)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn f3_maps_to_search_nav_before_focus_guard() {
+        use iced::event::Status;
+        use iced::keyboard::Modifiers;
+        let f3 = Key::Named(Named::F3);
+        assert!(matches!(
+            keyboard_message(f3.clone(), Modifiers::empty(), Status::Ignored),
+            Some(Message::SearchNext)
+        ));
+        assert!(matches!(
+            keyboard_message(f3.clone(), Modifiers::SHIFT, Status::Ignored),
+            Some(Message::SearchPrev)
+        ));
+        // Com o campo focado o atalho continua valendo (pré-guarda).
+        assert!(matches!(
+            keyboard_message(f3.clone(), Modifiers::empty(), Status::Captured),
+            Some(Message::SearchNext)
+        ));
+        assert!(matches!(
+            keyboard_message(f3.clone(), Modifiers::SHIFT, Status::Captured),
+            Some(Message::SearchPrev)
+        ));
+        assert!(matches!(
+            keyboard_message(f3, Modifiers::CTRL, Status::Ignored),
+            None
+        ));
     }
 
     #[test]

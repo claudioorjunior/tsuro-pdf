@@ -21,7 +21,7 @@ impl Theme {
     }
 }
 
-/// Tokens nomeados do Kiri. 14 campos — não mapeiam 1:1 ao `Seed` do
+/// Tokens nomeados do Kiri. 15 campos — não mapeiam 1:1 ao `Seed` do
 /// `iced::Theme::custom`, por isso vivem aqui + closures `.style()`.
 #[derive(Debug, Clone, Copy)]
 pub struct Tokens {
@@ -43,6 +43,8 @@ pub struct Tokens {
     pub page: Color,
     /// Highlight de busca.
     pub mark: Color,
+    /// Hit atual da busca (Enter/F3) — âmbar cheio sobre o amarelo claro.
+    pub mark_current: Color,
 }
 
 impl Tokens {
@@ -65,6 +67,7 @@ impl Tokens {
                 danger: hex(0xc0, 0x39, 0x2b),
                 page: Color::WHITE,
                 mark: hex(0xfd, 0xe6, 0x8a),
+                mark_current: hex(0xf5, 0x9e, 0x0b),
             },
             Theme::Light => Self {
                 is_dark: false,
@@ -83,6 +86,7 @@ impl Tokens {
                 danger: hex(0xc0, 0x39, 0x2b),
                 page: Color::WHITE,
                 mark: hex(0xfd, 0xe6, 0x8a),
+                mark_current: hex(0xf5, 0x9e, 0x0b),
             },
         }
     }
@@ -724,5 +728,14 @@ mod tests {
             Some(t.danger)
         );
         assert_eq!(status_dot_color(t, [S::DocumentModified]), Some(t.danger));
+    }
+
+    #[test]
+    fn search_current_differs_from_mark_in_both_themes() {
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = Tokens::for_theme(theme);
+            assert_ne!(t.mark_current, t.mark);
+            assert_ne!(t.mark_current, t.page);
+        }
     }
 }
