@@ -9,5 +9,6 @@ fn main() -> iced::Result {
     };
     iced::application("TsuroPDF", Session::update, Session::view)
         .subscription(Session::subscription)
+        .exit_on_close_request(false)
         .run_with(move || boot(session))
 }
