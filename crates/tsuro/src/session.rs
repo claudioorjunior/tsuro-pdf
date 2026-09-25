@@ -862,6 +862,8 @@ pub struct Ready {
     pub theme: Theme,
     /// Menu ⋯ aberto. Só existe em `Ready`; zera ao trocar de documento.
     pub overflow_open: bool,
+    /// Cartão Sobre aberto (Ajuda). Fecha no fundo, no botão e no Esc.
+    pub about_open: bool,
     /// Diálogo de impressão aberto (`None` = fechado). Só existe em `Ready`.
     pub print_dialog: Option<PrintDialog>,
     /// Linha de status pós-envio ("Enviado para …"); limpa ao reabrir o diálogo.
@@ -1475,6 +1477,8 @@ pub enum Message {
     ToggleSignatures,
     TogglePages,
     ToggleOverflow,
+    /// Ajuda → Sobre: cartão com nome/versão; fundo e Esc fecham.
+    ToggleAbout,
     /// Aba Sumário no painel de Páginas (`true` = sumário, `false` = miniaturas).
     OutlineTab(bool),
     /// Expande/colapsa um nó da árvore (caminho de índices desde a raiz).
@@ -1612,7 +1616,10 @@ impl Session {
         match message {
             Message::PickFile => match OpenSource::from_dialog() {
                 None => Task::none(),
-                Some(source) => self.begin_open(source),
+                Some(source) => {
+                    self.close_overflow();
+                    self.begin_open(source)
+                }
             },
             Message::FileDropped(path) => {
                 if !is_pdf(&path) {
@@ -1625,6 +1632,7 @@ impl Session {
                 if !is_pdf(&path) {
                     Task::none()
                 } else {
+                    self.close_overflow();
                     self.begin_open(OpenSource::Path(path))
                 }
             }
@@ -2092,6 +2100,7 @@ impl Session {
             }
             Message::DeleteSelectedAnnot => {
                 if let Session::Ready(ready) = self {
+                    ready.overflow_open = false;
                     if ready.note_draft.is_none() {
                         if let Some(id) = ready.selected_annot {
                             ready.remove_annotation(id);
@@ -2223,6 +2232,16 @@ impl Session {
                 }
                 Task::none()
             }
+            Message::ToggleAbout => {
+                if let Session::Ready(ready) = self {
+                    ready.about_open = !ready.about_open;
+                    // Sobre abre por cima: o ⋯ fecha junto.
+                    if ready.about_open {
+                        ready.overflow_open = false;
+                    }
+                }
+                Task::none()
+            }
             Message::OutlineLoaded { doc_gen, outline } => {
                 if let Session::Ready(tabs) = self {
                     if let Some(ready) = tabs.by_gen(doc_gen) {
@@ -2335,6 +2354,7 @@ impl Session {
                     ready.note_drag = None;
                     ready.save_warning = false;
                     ready.overflow_open = false;
+                    ready.about_open = false;
                     // Enviando: ignora (Esc) para não perder o resultado na volta.
                     if ready
                         .print_dialog
@@ -3430,6 +3450,40 @@ pub(crate) fn keyboard_message(
         Key::Named(Named::ArrowUp) => Some(Message::OutlineKey(OutlineKey::Prev)),
         Key::Named(Named::ArrowDown) => Some(Message::OutlineKey(OutlineKey::Next)),
         Key::Named(Named::Enter) => Some(Message::OutlineKey(OutlineKey::Activate)),
+        _ => None,
+    }
+}
+
+/// Rótulo do atalho no menu ⋯ (#42): `None` = sem tecla ou com a dica na
+/// toolbar (H/U/S/N, setas de página). Cobertura travada em
+/// `every_keyboard_shortcut_has_a_menu_hint_or_exemption` — atalho novo no
+/// `keyboard_message` sem rótulo aqui (ou isenção) quebra o teste.
+pub(crate) fn shortcut_hint(msg: &Message) -> Option<&'static str> {
+    match msg {
+        Message::PickFile => Some("T"),
+        Message::RotateView => Some("R"),
+        Message::CopyAnnotations => Some("M"),
+        Message::DeleteSelectedAnnot => Some("Del"),
+        Message::AnnotUndo => Some(if cfg!(target_os = "macos") {
+            "⌘Z"
+        } else {
+            "Ctrl+Z"
+        }),
+        Message::AnnotRedo => Some(if cfg!(target_os = "macos") {
+            "⌘⇧Z"
+        } else {
+            "Ctrl+Shift+Z"
+        }),
+        Message::HistoryBack => Some(if cfg!(target_os = "macos") {
+            "⌘←"
+        } else {
+            "Alt+←"
+        }),
+        Message::HistoryForward => Some(if cfg!(target_os = "macos") {
+            "⌘→"
+        } else {
+            "Alt+→"
+        }),
         _ => None,
     }
 }
@@ -4730,6 +4784,7 @@ impl Document {
             render_scale: 1.0,
             theme: Theme::Dark,
             overflow_open: false,
+            about_open: false,
             print_dialog: None,
             print_status: None,
             save_status: None,
@@ -5947,6 +6002,115 @@ mod tests {
         ));
         // Com foco em campo o iced captura antes (guarda de foco).
         assert!(keyboard_message(Key::Character("h".into()), plain, Status::Captured).is_none());
+    }
+
+    #[test]
+    fn every_keyboard_shortcut_has_a_menu_hint_or_exemption() {
+        use iced::event::Status;
+        use iced::keyboard::Modifiers;
+        // Isentos: dica na toolbar/painéis, não no ⋯.
+        fn exempt(msg: &Message) -> bool {
+            matches!(
+                msg,
+                Message::Nav(_)
+                    | Message::Annotate(_)
+                    | Message::OutlineKey(_)
+                    | Message::CycleTab(_)
+                    | Message::CloseTabActive
+                    | Message::NoteSave
+                    | Message::ClosePrintDialog
+                    | Message::SearchNext
+                    | Message::SearchPrev
+            )
+        }
+        #[cfg(target_os = "macos")]
+        let cmd = Modifiers::LOGO;
+        #[cfg(not(target_os = "macos"))]
+        let cmd = Modifiers::CTRL;
+        #[cfg(target_os = "macos")]
+        let hist = Modifiers::LOGO;
+        #[cfg(not(target_os = "macos"))]
+        let hist = Modifiers::ALT;
+        let combos = [
+            Modifiers::empty(),
+            Modifiers::SHIFT,
+            Modifiers::CTRL,
+            Modifiers::LOGO,
+            Modifiers::ALT,
+            cmd | Modifiers::SHIFT,
+        ];
+        let mut checked = 0;
+        let mut probe = |key: Key, modifiers: Modifiers| {
+            if let Some(msg) = keyboard_message(key, modifiers, Status::Ignored) {
+                if !exempt(&msg) {
+                    assert!(
+                        shortcut_hint(&msg).is_some(),
+                        "atalho sem rótulo no menu: {msg:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        };
+        // Letras minúsculas e maiúsculas (o iced entrega conforme o Shift).
+        for ch in 'a'..='z' {
+            let lower: String = ch.to_string();
+            let upper: String = ch.to_ascii_uppercase().to_string();
+            for mods in combos {
+                probe(Key::Character(lower.clone().into()), mods);
+                probe(Key::Character(upper.clone().into()), mods);
+            }
+        }
+        // Símbolos de zoom (#72) e teclas nomeadas.
+        for sym in ["+", "-", "="] {
+            for mods in combos {
+                probe(Key::Character(sym.into()), mods);
+            }
+        }
+        for named in [
+            Named::F3,
+            Named::ArrowLeft,
+            Named::ArrowRight,
+            Named::ArrowUp,
+            Named::ArrowDown,
+            Named::Enter,
+            Named::Escape,
+            Named::Tab,
+            Named::Delete,
+            Named::Backspace,
+            Named::Home,
+            Named::End,
+            Named::PageUp,
+            Named::PageDown,
+        ] {
+            for mods in combos {
+                probe(Key::Named(named), mods);
+            }
+            // Histórico usa Alt (Ctrl no mac só para Z/T/W).
+            probe(Key::Named(named), hist);
+        }
+        assert!(checked >= 7, "esperava T/R/M/Del/Z/⌘←/⌘→, viu {checked}");
+    }
+
+    #[test]
+    fn toggle_about_opens_and_esc_closes() {
+        let Some(ready) = sample_ready() else {
+            return;
+        };
+        let mut session = Session::Ready(Tabs::single(ready));
+        apply(&mut session, Message::ToggleOverflow);
+        apply(&mut session, Message::ToggleAbout);
+        match &session {
+            Session::Ready(r) => {
+                assert!(r.about_open);
+                assert!(!r.overflow_open, "Sobre fecha o ⋯");
+            }
+            _ => unreachable!(),
+        }
+        apply(&mut session, Message::ClosePrintDialog);
+        match &session {
+            Session::Ready(r) => assert!(!r.about_open),
+            _ => unreachable!(),
+        }
     }
 
     /// Anotação fake direta (a função pura não precisa de fixture).
