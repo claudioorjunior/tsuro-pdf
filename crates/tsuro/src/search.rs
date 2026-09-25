@@ -7,6 +7,7 @@
 
 use crate::page::{Glyph, PageNo, Quad, TextLayer};
 use crate::session::TextRange;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone)]
 pub struct Search {
@@ -104,9 +105,27 @@ struct LowerChar {
 }
 
 fn lower_plain_map(plain: &str) -> Vec<LowerChar> {
+    // NFC antes de minusculizar (#79b): o Pdfium entrega um `char` por
+    // `unicode_string`, então o `plain` pode guardar NFD (`e` + combining)
+    // enquanto o teclado entrega NFC (`é`). Compor aqui alinha os dois
+    // lados sem mexer nos bytes — `byte_start/end` continuam no `plain`.
     let mut mapped = Vec::new();
-    for (byte_start, ch) in plain.char_indices() {
-        let byte_end = byte_start + ch.len_utf8();
+    let mut cursor = plain;
+    for ch in plain.chars().nfc() {
+        // Consome do `plain` os chars que compõem `ch`: 1 em NFC, 2+ em
+        // NFD (`e` + combining). O range cobre os bytes originais.
+        let mut width = 0usize;
+        let mut composed: String = String::new();
+        for raw in cursor.chars() {
+            width += raw.len_utf8();
+            composed.push(raw);
+            if composed.chars().nfc().collect::<String>() == ch.to_string() {
+                break;
+            }
+        }
+        let byte_start = plain.len() - cursor.len();
+        cursor = &cursor[width.min(cursor.len())..];
+        let byte_end = byte_start + width;
         for lower in ch.to_lowercase() {
             mapped.push(LowerChar {
                 lower,
@@ -119,7 +138,11 @@ fn lower_plain_map(plain: &str) -> Vec<LowerChar> {
 }
 
 fn case_insensitive_byte_ranges(plain: &str, needle: &str) -> Vec<(usize, usize)> {
-    let needle_chars: Vec<char> = needle.chars().flat_map(|ch| ch.to_lowercase()).collect();
+    let needle_nfc: String = needle.chars().nfc().collect();
+    let needle_chars: Vec<char> = needle_nfc
+        .chars()
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
     if needle_chars.is_empty() {
         return Vec::new();
     }
@@ -387,5 +410,33 @@ mod tests {
         let hits = find_hits("x", &layer);
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].quad.x0, hits[0].quad.x1), (20.0, 30.0));
+    }
+
+    #[test]
+    fn nfc_query_matches_nfd_text() {
+        let layer = TextLayer {
+            page: PageNo::first(),
+            plain: "e\u{301}x".into(),
+            glyphs: vec![Glyph {
+                cluster: "e\u{301}x".into(),
+                quad: Quad::from_rect(0.0, 0.0, 30.0, 10.0),
+            }],
+        };
+        let hits = find_hits("\u{e9}", &layer);
+        assert_eq!(hits.len(), 1, "NFC é vs NFD e+combining");
+    }
+
+    #[test]
+    fn nfd_query_matches_nfc_text() {
+        let layer = TextLayer {
+            page: PageNo::first(),
+            plain: "\u{e9}x".into(),
+            glyphs: vec![Glyph {
+                cluster: "\u{e9}x".into(),
+                quad: Quad::from_rect(0.0, 0.0, 30.0, 10.0),
+            }],
+        };
+        let hits = find_hits("e\u{301}", &layer);
+        assert_eq!(hits.len(), 1, "NFD e+combining vs NFC é");
     }
 }
