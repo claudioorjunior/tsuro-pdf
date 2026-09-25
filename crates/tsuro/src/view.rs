@@ -106,6 +106,8 @@ pub fn chrome(session: &Session, theme: Theme) -> Element<'_, Message> {
         }
         // Aviso de documento assinado (⋯ → Salvar cópia): captura tudo.
         Session::Ready(ready) if ready.save_warning => stack![main, save_warning_layer(t)].into(),
+        // Sobre (Ajuda): cartão de versão; fundo e Esc fecham.
+        Session::Ready(ready) if ready.about_open => stack![main, about_layer(t)].into(),
         // Overlay visual: só os botões capturam clique, o resto atravessa.
         Session::Ready(ready) if ready.overflow_open => {
             stack![main, overflow_layer(ready, t)].into()
@@ -612,14 +614,103 @@ fn overflow_layer(tabs: &Tabs, t: Tokens) -> Element<'_, Message> {
     stack![mouse_area(dim).on_press(Message::ToggleOverflow), card].into()
 }
 
-/// Menu ⋯ (PR 4): zoom, girar, imprimir, histórico, modo, copiar,
-/// desfazer/refazer, salvar, fechar, aparência.
-/// Ícones Ori nas linhas acionáveis: fit-page, rotate, print,
-/// chevron-left, chevron-right, page-single, continuous, copy, undo,
-/// redo, save, x. O modo vigente leva destaque `accent` (sem ●/○ —
-/// faltam na fonte e viram `?`). Headers e Escuro/Claro sem ícone.
+/// Menu ⋯ (#42): grupos Arquivo/Editar/Ver/Ir/Ajuda com dicas de atalho.
+/// Recentes na mesma lista da tela vazia; Sobre abre o cartão de versão.
 fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
     let mut items = column![].spacing(2).width(Length::Fill);
+    items = items.push(section_title("Arquivo", t));
+    items = items.push(menu_item(
+        t,
+        "folder-open",
+        "Abrir…",
+        Message::PickFile,
+        false,
+    ));
+    let recents: Vec<_> = ready.recents().iter().take(5).collect();
+    if recents.is_empty() {
+        items = items.push(menu_disabled(t, "Nenhum arquivo recente"));
+    } else {
+        for path in recents {
+            items = items.push(menu_item(
+                t,
+                "file-text",
+                recent_label(path),
+                Message::OpenRecent(path.clone()),
+                false,
+            ));
+        }
+    }
+    items = items.push(menu_item(
+        t,
+        "print",
+        "Imprimir",
+        Message::OpenPrintDialog,
+        false,
+    ));
+    if !ready.annotations.is_empty() {
+        items = items.push(menu_item(
+            t,
+            "save",
+            "Salvar cópia com marcações…",
+            Message::SaveCopyRequested,
+            false,
+        ));
+    }
+    items = items.push(menu_item(t, "x", "Fechar documento", Message::Close, false));
+    let can_edit = ready.selection_plain_text().is_some()
+        || !ready.annotations.is_empty()
+        || ready.can_annot_undo()
+        || ready.can_annot_redo()
+        || ready.selected_annot().is_some();
+    if can_edit {
+        items = items.push(section_title("Editar", t));
+        if ready.selection_plain_text().is_some() {
+            items = items.push(menu_item(
+                t,
+                "copy",
+                "Copiar seleção",
+                Message::CopySelection,
+                false,
+            ));
+        }
+        if !ready.annotations.is_empty() {
+            items = items.push(menu_item(
+                t,
+                "copy",
+                "Copiar destaques como Markdown",
+                Message::CopyAnnotations,
+                false,
+            ));
+        }
+        if ready.selected_annot().is_some() {
+            items = items.push(menu_item(
+                t,
+                "x",
+                "Apagar marcação",
+                Message::DeleteSelectedAnnot,
+                false,
+            ));
+        }
+        if ready.can_annot_undo() {
+            items = items.push(menu_item(
+                t,
+                "undo",
+                "Desfazer marcação",
+                Message::AnnotUndo,
+                false,
+            ));
+        }
+        if ready.can_annot_redo() {
+            items = items.push(menu_item(
+                t,
+                "redo",
+                "Refazer marcação",
+                Message::AnnotRedo,
+                false,
+            ));
+        }
+    }
+    items = items.push(section_title("Ver", t));
     items = items.push(menu_item(
         t,
         "fit-page",
@@ -634,32 +725,6 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         Message::RotateView,
         false,
     ));
-    items = items.push(menu_item(
-        t,
-        "print",
-        "Imprimir",
-        Message::OpenPrintDialog,
-        false,
-    ));
-    if ready.can_history_back() {
-        items = items.push(menu_item(
-            t,
-            "chevron-left",
-            "Voltar",
-            Message::HistoryBack,
-            false,
-        ));
-    }
-    if ready.can_history_forward() {
-        items = items.push(menu_item(
-            t,
-            "chevron-right",
-            "Avançar",
-            Message::HistoryForward,
-            false,
-        ));
-    }
-    items = items.push(text("Modo de página").size(12).color(t.muted));
     let single = ready.view_mode == ViewMode::Single;
     items = items.push(menu_item(
         t,
@@ -675,61 +740,6 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         Message::SetViewMode(ViewMode::Continuous),
         !single,
     ));
-    if ready.selection_plain_text().is_some() {
-        items = items.push(menu_item(
-            t,
-            "copy",
-            "Copiar seleção",
-            Message::CopySelection,
-            false,
-        ));
-    }
-    if !ready.annotations.is_empty() {
-        items = items.push(menu_item(
-            t,
-            "copy",
-            "Copiar destaques como Markdown",
-            Message::CopyAnnotations,
-            false,
-        ));
-    }
-    if ready.can_annot_undo() {
-        items = items.push(menu_item(
-            t,
-            "undo",
-            "Desfazer marcação",
-            Message::AnnotUndo,
-            false,
-        ));
-    }
-    if ready.can_annot_redo() {
-        items = items.push(menu_item(
-            t,
-            "redo",
-            "Refazer marcação",
-            Message::AnnotRedo,
-            false,
-        ));
-    }
-    if !ready.annotations.is_empty() {
-        items = items.push(menu_item(
-            t,
-            "save",
-            "Salvar cópia com marcações…",
-            Message::SaveCopyRequested,
-            false,
-        ));
-    }
-    items = items.push(menu_item(t, "x", "Fechar documento", Message::Close, false));
-    items = items.push(
-        container(Space::with_height(Length::Fixed(1.0)))
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(Background::Color(t.line)),
-                ..container::Style::default()
-            }),
-    );
-    items = items.push(text("Aparência").size(12).color(t.muted));
     let dark = ready.theme.is_dark();
     items = items.push(
         row![
@@ -738,31 +748,94 @@ fn overflow_menu(ready: &Ready, t: Tokens) -> Element<'_, Message> {
         ]
         .spacing(4),
     );
+    if ready.can_history_back() || ready.can_history_forward() {
+        items = items.push(section_title("Ir", t));
+        if ready.can_history_back() {
+            items = items.push(menu_item(
+                t,
+                "chevron-left",
+                "Voltar",
+                Message::HistoryBack,
+                false,
+            ));
+        }
+        if ready.can_history_forward() {
+            items = items.push(menu_item(
+                t,
+                "chevron-right",
+                "Avançar",
+                Message::HistoryForward,
+                false,
+            ));
+        }
+    }
+    items = items.push(section_title("Ajuda", t));
+    items = items.push(menu_item(
+        t,
+        "file-text",
+        "Sobre o Tsuro PDF",
+        Message::ToggleAbout,
+        false,
+    ));
     container(items)
-        .width(Length::Fixed(232.0))
+        .width(Length::Fixed(264.0))
         .padding(6)
         .style(kiri::menu_style(t))
         .into()
 }
 
-/// Linha do menu ⋯: ícone Ori + rótulo; `active` pinta o modo vigente
-/// (`accent_bg` + texto `accent`, via `panel_seg_style`).
+/// Rótulo de recente no menu: `pasta/arquivo.pdf` (como o cartão da tela
+/// vazia, numa linha só), com elipse no meio se passar de 30.
+fn recent_label(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let full = match path.parent().and_then(|p| p.file_name()) {
+        Some(parent) => format!("{}/{}", parent.to_string_lossy(), name),
+        None => name,
+    };
+    middle_truncate(&full, 30)
+}
+
+/// Linha do menu ⋯: ícone Ori + rótulo + dica do atalho à direita;
+/// `active` pinta o modo vigente (`accent_bg` + texto `accent`).
 fn menu_item(
     t: Tokens,
     icon: &str,
-    label: &'static str,
+    label: impl Into<String>,
     message: Message,
     active: bool,
 ) -> Element<'static, Message> {
-    button(
-        row![kiri::ori_icon(icon, 16.0), text(label).size(13)]
-            .spacing(8)
-            .align_y(Alignment::Center),
+    let hint = crate::session::shortcut_hint(&message);
+    let mut content = row![kiri::ori_icon(icon, 16.0), text(label.into()).size(13)]
+        .spacing(8)
+        .align_y(Alignment::Center);
+    if let Some(hint) = hint {
+        content = content
+            .push(Space::with_width(Length::Fill))
+            .push(text(hint).size(12).color(t.muted));
+    }
+    button(content)
+        .width(Length::Fill)
+        .padding(Padding::from([8, 10]))
+        .style(kiri::panel_seg_style(t, active))
+        .on_press(message)
+        .into()
+}
+
+/// Linha desabilitada do menu (sem ação): rótulo `muted`, alinhado aos demais.
+fn menu_disabled(t: Tokens, label: &'static str) -> Element<'static, Message> {
+    container(
+        row![
+            Space::with_width(Length::Fixed(16.0)),
+            text(label).size(13).color(t.muted),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
     )
     .width(Length::Fill)
     .padding(Padding::from([8, 10]))
-    .style(kiri::panel_seg_style(t, active))
-    .on_press(message)
     .into()
 }
 
@@ -1190,6 +1263,47 @@ fn save_warning_layer(t: Tokens) -> Element<'static, Message> {
         .align_x(Alignment::Center)
         .align_y(Alignment::Center);
     stack![mouse_area(dim).on_press(Message::SaveCopyCancelled), card,].into()
+}
+
+/// Sobre (Ajuda → Sobre o Tsuro PDF): nome, versão e missão — mesmo padrão
+/// do aviso de assinado (fundo fecha, cartão engole o clique).
+fn about_layer(t: Tokens) -> Element<'static, Message> {
+    let dim = container(Space::with_width(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.25))),
+            ..container::Style::default()
+        });
+    let card = container(mouse_area(about_card(t)).on_press(Message::PrintNop))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center);
+    stack![mouse_area(dim).on_press(Message::ToggleAbout), card,].into()
+}
+
+fn about_card(t: Tokens) -> Element<'static, Message> {
+    let body = column![
+        text("Tsuro PDF").size(16).color(t.ink),
+        text(format!("Versão {}", env!("CARGO_PKG_VERSION")))
+            .size(13)
+            .color(t.muted),
+        text("Ler, anotar, marcar, imprimir. Nada além disso.")
+            .size(13)
+            .color(t.ink),
+        button(text("Fechar").size(13))
+            .padding(Padding::from([8, 12]))
+            .style(kiri::menu_item_style(t))
+            .on_press(Message::ToggleAbout),
+    ]
+    .spacing(8)
+    .align_x(Alignment::Center);
+    container(body)
+        .width(Length::Fixed(320.0))
+        .padding(16)
+        .style(kiri::menu_style(t))
+        .into()
 }
 
 /// Fechar aba, Home ou a janela com marcações não salvas.
@@ -2501,5 +2615,21 @@ mod tests {
         // Exatos 24 caracteres passam intactos.
         let exact: String = "a".repeat(24);
         assert_eq!(outline_title(&exact), exact);
+    }
+
+    #[test]
+    fn recent_label_shows_parent_and_truncates() {
+        use super::recent_label;
+        use std::path::Path;
+        assert_eq!(
+            recent_label(Path::new("/docs/contratos/termo.pdf")),
+            "contratos/termo.pdf"
+        );
+        assert_eq!(recent_label(Path::new("solto.pdf")), "solto.pdf");
+        let deep = "/docs/um-nome-de-pasta-bem-longo/outro-nome-longo/arquivo-final.pdf";
+        let short = recent_label(Path::new(deep));
+        assert!(short.chars().count() <= 30);
+        assert!(short.contains('…'));
+        assert!(short.ends_with(".pdf"), "elipse no meio, fim intacto");
     }
 }
